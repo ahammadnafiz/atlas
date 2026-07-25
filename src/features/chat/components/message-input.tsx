@@ -53,6 +53,7 @@ import type { ImageAttachment } from "@/types/agents";
 import type {
   MentionFile,
   MentionSkill,
+  MentionWorkspace,
   MentionRepo,
   MentionPastSession,
   PastSessionRef,
@@ -898,6 +899,11 @@ export function MessageInput({
     requestAnimationFrame(() => inputRef.current?.focus());
   }, []);
 
+  const handlePickWorkspace = useCallback((workspace: MentionWorkspace) => {
+    inputRef.current?.insertMention(workspace);
+    requestAnimationFrame(() => inputRef.current?.focus());
+  }, []);
+
   // "+" menu → "Attach media". Same routing as the files picker, but the OS
   // dialog is filtered to image/video extensions. Images ride along as inline
   // base64 (when the agent supports it); video and anything unreadable become
@@ -1467,6 +1473,7 @@ export function MessageInput({
                 onPickSkill={handlePickSkill}
                 onCloneRepo={(repo) => void handleCloneRepo(repo)}
                 onPickSession={handlePickSession}
+                onPickWorkspace={handlePickWorkspace}
                 currentAgent={switchableAgent}
                 onSwitchAgent={handleSwitchAgent}
               />

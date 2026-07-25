@@ -11,6 +11,7 @@ import { useEffect, useMemo, useState } from "react";
 import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
 import { invoke } from "@tauri-apps/api/core";
 import {
+  Boxes,
   Camera,
   Check,
   ChevronRight,
@@ -37,6 +38,7 @@ import {
   searchMentions,
   listPastSessions,
   type MentionSkill,
+  type MentionWorkspace,
   type PastSessionRef,
 } from "../lib/mentions";
 
@@ -55,6 +57,9 @@ interface ComposerAddMenuProps {
   onPickSkill: (skill: MentionSkill) => void;
   onCloneRepo: (repo: GithubRepo) => void;
   onPickSession: (session: PastSessionRef) => void;
+  /** Reference another project in the active org — inserts a `@workspace`
+   *  mention that hands the agent that project's path. */
+  onPickWorkspace: (workspace: MentionWorkspace) => void;
   /** The chat's current coding agent (footer switcher highlights it). */
   currentAgent: SwitchableAgent;
   /** Switch the chat to a specific coding agent (mirrors the ⌥/ cycle). */
@@ -119,6 +124,7 @@ export function ComposerAddMenu({
   onPickSkill,
   onCloneRepo,
   onPickSession,
+  onPickWorkspace,
   currentAgent,
   onSwitchAgent,
 }: ComposerAddMenuProps) {
@@ -260,6 +266,12 @@ export function ComposerAddMenu({
           </DropdownMenu.Sub>
 
           <SessionsSubmenu projectPath={projectPath} agentId={agentId} onPickSession={onPickSession} />
+
+          <WorkspaceSubmenu
+            projectPath={projectPath}
+            agentId={agentId}
+            onPickWorkspace={onPickWorkspace}
+          />
 
           {/* Footer — agent switcher: circular brand icons on the left, the ⌥/
               cycle shortcut on the right. Plain buttons (not menu items) so a
@@ -546,6 +558,90 @@ function SessionsSubmenu({
               </div>
             </>
           )}
+        </DropdownMenu.SubContent>
+      </DropdownMenu.Portal>
+    </DropdownMenu.Sub>
+  );
+}
+
+// ── Reference workspace — hand the agent another project's path ───────────────
+// Mirrors `SessionsSubmenu`, but lists the OTHER workspaces in the active org
+// (the same set the `@workspace` reference-picker rail surfaces). Picking one
+// inserts a `@workspace` mention; at send time Rust expands it into that
+// project's absolute path so an agent in p1 can be told to go inspect p3.
+function WorkspaceSubmenu({
+  projectPath,
+  agentId,
+  onPickWorkspace,
+}: {
+  projectPath: string | null;
+  agentId?: string;
+  onPickWorkspace: (workspace: MentionWorkspace) => void;
+}) {
+  const [query, setQuery] = useState("");
+  const [workspaces, setWorkspaces] = useState<MentionWorkspace[] | null>(null);
+
+  // `searchMentions("workspace")` reads the workspace + org stores synchronously
+  // and filters to the active org, so this is effectively instant — but it stays
+  // async to match the mention API and to re-run per keystroke for free.
+  useEffect(() => {
+    let cancelled = false;
+    void searchMentions(query, "workspace", { projectPath, agentId })
+      .then((rows) => {
+        if (cancelled) return;
+        setWorkspaces(rows.filter((m): m is MentionWorkspace => m.kind === "workspace"));
+      })
+      .catch(() => {
+        if (!cancelled) setWorkspaces([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [query, projectPath, agentId]);
+
+  return (
+    <DropdownMenu.Sub>
+      <DropdownMenu.SubTrigger className={ITEM_CLASS}>
+        <Boxes size={11} />
+        <span>Reference workspace</span>
+        <ChevronRight size={11} className="ml-auto text-[var(--text-tertiary)]" />
+      </DropdownMenu.SubTrigger>
+      <DropdownMenu.Portal>
+        <DropdownMenu.SubContent
+          sideOffset={6}
+          className={cn(CONTENT_CLASS, "w-[300px]")}
+          style={{ zIndex: 9999 }}
+        >
+          <SearchBox value={query} onChange={setQuery} placeholder="Search workspaces…" />
+          <div className="max-h-[300px] overflow-y-auto">
+            {workspaces === null ? (
+              <div className="flex items-center gap-2 px-3 h-[26px] text-[11px] text-[var(--text-tertiary)]">
+                <Loader2 size={11} className="animate-spin" />
+                Loading workspaces…
+              </div>
+            ) : workspaces.length === 0 ? (
+              <div className="px-3 py-1.5 text-[11px] text-[var(--text-tertiary)]">
+                {query ? "No matches." : "No other projects in this organisation."}
+              </div>
+            ) : (
+              workspaces.map((w) => (
+                <DropdownMenu.Item
+                  key={w.id}
+                  className={cn(ITEM_CLASS, "h-auto items-start py-1.5")}
+                  onSelect={() => onPickWorkspace(w)}
+                  title={w.absPath}
+                >
+                  <Boxes size={11} className="mt-0.5 shrink-0 text-[var(--text-tertiary)]" />
+                  <div className="min-w-0 flex-1">
+                    <div className="truncate text-[var(--text-primary)]">{w.displayName}</div>
+                    <div className="truncate text-[10px] text-[var(--text-tertiary)]">
+                      {w.absPath}
+                    </div>
+                  </div>
+                </DropdownMenu.Item>
+              ))
+            )}
+          </div>
         </DropdownMenu.SubContent>
       </DropdownMenu.Portal>
     </DropdownMenu.Sub>
