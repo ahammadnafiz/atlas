@@ -2,10 +2,10 @@ import { useState, memo } from "react";
 import * as Dialog from "@radix-ui/react-dialog";
 import { cn } from "@/lib/utils";
 import type { ChatMessage } from "@/types/agent";
+import { AGENT_LABEL } from "@/types/agent";
 import { isBashToolCall } from "../lib/tool-calls";
 import {
   User,
-  Sparkles,
   CheckCircle2,
   XCircle,
   Loader2,
@@ -25,6 +25,9 @@ import { invoke } from "@tauri-apps/api/core";
 import { toast } from "sonner";
 import { useLayoutStore } from "@/features/layout/stores/layout-store";
 import { useProjectStore } from "@/features/project/stores/project-store";
+import { useChatStore } from "@/features/chat/stores/chat-store";
+import { AgentIcons } from "@/components/agent-icons";
+import { AtlasIcon } from "@/components/atlas-icon";
 import { CachedMarkdown } from "@/lib/markdown-cache";
 import { StreamingMarkdown } from "./streaming-markdown";
 
@@ -113,6 +116,11 @@ export const MessageItem = memo(function MessageItem({
 }) {
   const isUser = message.role === "user";
   const isAssistant = message.role === "assistant";
+  const agentType = useChatStore((s) =>
+    tabId ? (s.sessions[tabId]?.agentType ?? "claude-code") : "claude-code",
+  );
+  const agentLabel =
+    AGENT_LABEL[agentType === "codex" ? "codex" : agentType === "cersei" ? "cersei" : "claude-code"];
 
   // Only user messages carry the @-mention "Atlas context" suffix.
   // `getAtlasSplit` reads from precomputed fields when present (set by
@@ -163,18 +171,15 @@ export const MessageItem = memo(function MessageItem({
             <div className="w-px h-full bg-[var(--border-subtle)]" />
           </div>
         ) : (
-          <div
-            className={cn(
-              "w-8 h-8 rounded-full flex items-center justify-center shrink-0 mt-0.5",
-              isUser
-                ? "bg-[var(--accent-primary-muted)]"
-                : "bg-[var(--bg-elevated)] border border-[var(--border-default)]",
-            )}
-          >
+          <div className="w-8 flex items-start justify-center shrink-0">
             {isUser ? (
-              <User size={14} className="text-[var(--accent-primary)]" />
+              <User size={20} className="text-[var(--accent-primary)]" />
+            ) : agentType === "codex" ? (
+              <AgentIcons.Codex className="size-5" />
+            ) : agentType === "cersei" ? (
+              <AtlasIcon size={20} />
             ) : (
-              <Sparkles size={14} className="text-[var(--text-secondary)]" />
+              <AgentIcons.Claude className="size-5" />
             )}
           </div>
         )}
@@ -195,7 +200,7 @@ export const MessageItem = memo(function MessageItem({
             {!compact && (
               <div className="flex items-center gap-2">
                 <span className="text-[11px] font-semibold text-[var(--text-secondary)] uppercase tracking-wide">
-                  {isUser ? "You" : isAssistant ? "Assistant" : message.role}
+                  {isUser ? "You" : isAssistant ? agentLabel : message.role}
                 </span>
                 <span className="text-[10px] text-[var(--text-tertiary)] font-mono">
                   {new Date(message.timestamp).toLocaleTimeString([], {
