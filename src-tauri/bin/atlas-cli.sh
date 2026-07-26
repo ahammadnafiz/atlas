@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
 # atlas-cli-version: {{VERSION}}
+# {{VERSION}} is substituted at install time from CARGO_PKG_VERSION
+# (src-tauri/Cargo.toml), not tauri.conf.json's `version` field —
+# the two can drift.
 #
 # Atlas CLI helper. Installed (and refreshed on every launch) by the
 # Atlas IDE at `~/.local/bin/atlas`. Mirrors the `code` (VS Code) and
@@ -48,6 +51,8 @@ abs="$(cd "$target" && pwd)"
 # Find Atlas.app. macOS first looks in /Applications, then
 # ~/Applications, then PATH-y locations via `mdfind`. The latter
 # covers DMG drag-installs to unusual locations.
+# "Atlas.app" (below and in the LaunchServices fallback) must match
+# `productName` in src-tauri/tauri.conf.json.
 app=""
 for candidate in \
   "/Applications/Atlas.app" \
@@ -58,6 +63,7 @@ for candidate in \
   fi
 done
 if [ -z "$app" ] && command -v mdfind >/dev/null 2>&1; then
+  # Identifier must match `identifier` in src-tauri/tauri.conf.json.
   app="$(mdfind "kMDItemCFBundleIdentifier == 'dev.atlas.ide'" 2>/dev/null | head -n 1)"
 fi
 if [ -z "$app" ]; then

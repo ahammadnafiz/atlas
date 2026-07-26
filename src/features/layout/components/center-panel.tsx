@@ -150,11 +150,12 @@ export function CenterPanel() {
 
   if (!currentProject) return <WelcomeScreen />;
 
-  // Render EVERY open workspace's column-set in its own stable container
-  // (key=ws.id), only the active one visible. Background workspaces keep their
-  // editor/terminal/chat subtrees MOUNTED (display:none) so switching back is
-  // instant (no CodeMirror/xterm rebuild). A workspace with no view yet (never
-  // visited this session) renders nothing until its first cold load.
+  // Render every mounted workspace's shell in a stable container (key=ws.id),
+  // but only the ACTIVE workspace keeps heavyweight tab contents mounted. The
+  // old "display:none but still mounted" model left terminals, browser embeds,
+  // Pixi graphs, PDFs, and chat virtualizers alive across background
+  // workspaces, which could keep CPU/GPU busy even when those workspaces were
+  // completely hidden.
   return (
     <div className="h-full w-full bg-bg-surface relative">
       {workspaces.map((ws) => {
@@ -465,9 +466,13 @@ const TabContentContainer = memo(function TabContentContainer({
     return <div ref={ref} style={{ flex: "1 1 0%", minHeight: 0, overflow: "hidden" }} />;
   }
 
-  // Keep editor/terminal/browser/knowledge-graph/pdf mounted across tab
-  // switches *within this column* (expensive to rebuild).
-  const persistentTabs = tabs.filter((t) => PERSISTENT_TYPES.has(t.type));
+  // Keep expensive tabs mounted only for the ACTIVE workspace. Persisting them
+  // across tab switches is still valuable, but persisting them across hidden
+  // workspaces lets off-screen terminals/browser embeds/graphs keep running and
+  // is a major source of idle heat.
+  const persistentTabs = isActive
+    ? tabs.filter((t) => PERSISTENT_TYPES.has(t.type))
+    : [];
   const activeIsNonPersistent = !persistentTabs.find((t) => t.id === activeTab.id);
 
   return (
