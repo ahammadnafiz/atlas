@@ -100,6 +100,12 @@ enum Job {
         /// The patch an edit-shaped call applied, when the arguments carry one.
         patch: Option<String>,
     },
+    /// Import any on-disk transcripts for this Workspace that are not yet
+    /// recorded — the historical backfill and the ongoing terminal-gap scan,
+    /// which are the same operation run at different times.
+    ImportTranscripts {
+        workspace_root: PathBuf,
+    },
     /// Walk from the last-seen commit to HEAD and link what it finds.
     ///
     /// Not tied to a Session — it is driven by the repository moving, and the
@@ -200,6 +206,18 @@ impl CaptureState {
         self.submit(Job::Prompt {
             binding,
             prompt: prompt.to_string(),
+        });
+    }
+
+    /// Import on-disk transcripts for a Workspace.
+    ///
+    /// The same call serves the one-time backfill (on enable) and the ongoing
+    /// watch (on the worker's interval), because they are the same reconciling
+    /// scan — a file that has not grown is skipped by a size check, which is
+    /// what makes running it repeatedly affordable.
+    pub fn note_import(&self, workspace_root: &std::path::Path) {
+        self.submit(Job::ImportTranscripts {
+            workspace_root: workspace_root.to_path_buf(),
         });
     }
 
@@ -317,6 +335,7 @@ pub fn capture_binding(project_path: String) -> Result<Option<atlas_checkpoint::
 pub fn capture_enable(
     project_path: String,
     mode: String,
+    app: AppHandle,
 ) -> Result<atlas_checkpoint::Binding, String> {
     let mode = WorkspaceMode::parse(&mode)
         .ok_or_else(|| format!("unknown workspace mode: {mode}"))?;
@@ -329,7 +348,49 @@ pub fn capture_enable(
     // Establish the commit cursor immediately, so the first commit after
     // enabling is linked rather than waiting for a walk that has no baseline.
     let _ = atlas_checkpoint::walk_new_commits(&store, &project_path, root, mode);
+
+    // Backfill this project's existing transcripts, so the timeline is
+    // populated now rather than months from now. Handed to the worker rather
+    // than done here, because a multi-hundred-megabyte corpus must never block
+    // the click that started it.
+    //
+    // Local imports without ceremony — nothing leaves the machine. A Cloud
+    // Workspace is a bulk disclosure and waits for `capture_import_confirm`,
+    // after the developer has seen the real numbers.
+    if mode == WorkspaceMode::Local {
+        app.state::<CaptureState>().note_import(root);
+    }
     Ok(binding)
+}
+
+/// What importing this Workspace's transcripts would disclose.
+///
+/// Real numbers, before the decision — how many Sessions, over what dates, how
+/// much data. A developer cannot otherwise know what they are about to publish,
+/// and this is one of only two bulk-disclosure moments in the whole feature.
+#[tauri::command]
+pub fn capture_import_preview(
+    project_path: String,
+) -> Result<atlas_checkpoint::ImportPreview, String> {
+    let store = open_store(&project_path)?;
+    let mode = store
+        .binding()
+        .map_err(|e| e.to_string())?
+        .map(|b| b.mode)
+        .unwrap_or(WorkspaceMode::Local);
+    let root = std::path::Path::new(&project_path);
+    let Some(source) = transcript_source_for(root) else {
+        return Ok(atlas_checkpoint::ImportPreview::default());
+    };
+    Ok(atlas_checkpoint::import_preview(&source, mode))
+}
+
+/// Start the import, after the developer has confirmed it.
+#[tauri::command]
+pub fn capture_import_confirm(project_path: String, app: AppHandle) -> Result<(), String> {
+    app.state::<CaptureState>()
+        .note_import(std::path::Path::new(&project_path));
+    Ok(())
 }
 
 /// Re-read the identity signals for an already-bound Workspace.
@@ -426,11 +487,31 @@ fn worker(rx: mpsc::Receiver<Job>) {
     // Session ids are assigned by the store on first write and reused after.
     let mut session_ids: HashMap<String, String> = HashMap::new();
 
-    while let Ok(job) = rx.recv() {
+    loop {
+        // A timeout rather than a blocking receive, so the ongoing transcript
+        // scan reaches **every bound Workspace** — including backgrounded ones.
+        // The existing sessions watcher is a global singleton pointed at the
+        // active workspace, so inheriting it would miss exactly the terminal
+        // Sessions this is meant to catch.
+        let job = match rx.recv_timeout(IMPORT_SCAN_INTERVAL) {
+            Ok(job) => job,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                for root in stores.keys().cloned().collect::<Vec<_>>() {
+                    if let Some(Some(store)) = stores.get_mut(&root) {
+                        import_for(store, &root);
+                    }
+                }
+                continue;
+            }
+            // The app is shutting down.
+            Err(mpsc::RecvTimeoutError::Disconnected) => return,
+        };
+
         // A commit walk is not tied to a Session, so it carries its own root
         // rather than a binding.
         let (session_binding, root) = match &job {
-            Job::WalkCommits { workspace_root, .. } => (None, workspace_root.clone()),
+            Job::WalkCommits { workspace_root, .. }
+            | Job::ImportTranscripts { workspace_root, .. } => (None, workspace_root.clone()),
             Job::Prompt { binding, .. }
             | Job::Turn { binding, .. }
             | Job::ToolCall { binding, .. }
@@ -527,6 +608,11 @@ fn worker(rx: mpsc::Receiver<Job>) {
             continue;
         }
 
+        if let Job::ImportTranscripts { .. } = &job {
+            import_for(store, &root);
+            continue;
+        }
+
         let Some(binding) = session_binding else { continue };
         let key = SessionKey {
             // The Workspace binding proper arrives with the enable popover; until
@@ -539,8 +625,8 @@ fn worker(rx: mpsc::Receiver<Job>) {
 
         let mut capture = Capture::new(store, mode);
         let outcome = match job {
-            // Already handled above; it needs no Session.
-            Job::WalkCommits { .. } => Ok(()),
+            // Already handled above; neither needs a Session.
+            Job::WalkCommits { .. } | Job::ImportTranscripts { .. } => Ok(()),
             Job::Prompt { prompt, .. } => capture
                 .record_prompt(
                     &key,
@@ -626,6 +712,49 @@ fn worker(rx: mpsc::Receiver<Job>) {
             tracing::warn!(target: "atlas::capture", "capture failed: {e}");
         }
     }
+}
+
+/// How often every bound Workspace is re-scanned for new transcripts.
+///
+/// This is the ongoing half of the importer — the terminal-gap scan. Cheap
+/// enough to run on a timer because a file that has not grown is skipped by a
+/// size comparison before it is opened.
+const IMPORT_SCAN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Import a Workspace's transcripts, best-effort.
+///
+/// Never fails the caller: a missing transcript directory (the developer has
+/// never run this agent) is the ordinary case, not an error.
+fn import_for(store: &mut Store, root: &std::path::Path) {
+    let Ok(Some(binding)) = store.binding() else { return };
+    if !binding.is_capturing() {
+        return;
+    }
+    let Some(source) = transcript_source_for(root) else { return };
+
+    let workspace_id = root.to_string_lossy().to_string();
+    match atlas_checkpoint::import_all(store, &workspace_id, &source, binding.mode) {
+        Ok(outcome) if outcome.sessions_imported > 0 => tracing::info!(
+            target: "atlas::capture",
+            sessions = outcome.sessions_imported,
+            messages = outcome.messages_imported,
+            malformed = outcome.malformed_lines,
+            "imported on-disk transcripts"
+        ),
+        Ok(_) => {}
+        Err(e) => tracing::warn!(target: "atlas::capture", "transcript import failed: {e}"),
+    }
+}
+
+/// Where this Workspace's agent transcripts live.
+///
+/// Claude Code encodes the project directory into a folder name under
+/// `~/.claude/projects/`; the encoding already exists in `atlas-agents`, so it
+/// is reused rather than reproduced.
+fn transcript_source_for(root: &std::path::Path) -> Option<atlas_checkpoint::TranscriptSource> {
+    let projects = dirs::home_dir()?.join(".claude").join("projects");
+    let encoded = atlas_agents::transcript::encode_cwd(&root.to_string_lossy());
+    Some(atlas_checkpoint::TranscriptSource::new(projects.join(encoded)))
 }
 
 /// The worker's view of one tool call.

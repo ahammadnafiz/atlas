@@ -145,6 +145,44 @@ impl<'a> Capture<'a> {
         Ok(session_id)
     }
 
+    /// Find or create a Session without recording a turn.
+    ///
+    /// The importer needs this because it must record *every* line — the first
+    /// prompt included — through [`Capture::record_turn`] with the agent's own
+    /// message id attached. [`Capture::record_prompt`] stores the prompt with no
+    /// such id, which is right for live capture (Atlas's own send has no agent
+    /// id to use) and wrong for a transcript that may be re-read as it grows:
+    /// without the id, the second read duplicates the first turn.
+    pub fn ensure_session(
+        &mut self,
+        key: &SessionKey,
+        agent: Option<&str>,
+        model: Option<&str>,
+        cwd: Option<&str>,
+    ) -> Result<String> {
+        self.store.upsert_session(
+            &key.workspace_id,
+            key.source,
+            &key.native_session_id,
+            agent,
+            model,
+            cwd,
+            self.mode,
+        )
+    }
+
+    /// Derive and set a Session's title from a prompt, if it has none yet.
+    ///
+    /// Redacted like every other stored string — the title is the most visible
+    /// one in the product, and an imported prompt is exactly as likely to
+    /// contain a pasted key as a live one.
+    pub fn set_title_from_prompt(&mut self, session_id: &str, prompt: &str) -> Result<()> {
+        if let Some(title) = title::from_prompt(prompt) {
+            self.store.set_title_if_absent(session_id, &title)?;
+        }
+        Ok(())
+    }
+
     /// Record one finalized turn.
     ///
     /// Finalized, not streaming: live token chunks are a UI concern and never

@@ -816,6 +816,36 @@ impl Store {
         Ok(())
     }
 
+    // ── Import progress ─────────────────────────────────────────────────────
+
+    /// How many bytes of this transcript have already been imported.
+    pub fn import_progress(&self, path: &str) -> Result<Option<u64>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT imported_size FROM import_progress WHERE path = ?1",
+                [path],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .map(|size| size as u64))
+    }
+
+    /// Record how far a transcript has been imported.
+    ///
+    /// Written only after the content is durably stored, so an interrupted
+    /// import resumes rather than skipping the part it had not finished.
+    pub fn set_import_progress(&self, path: &str, size: u64) -> Result<()> {
+        self.require_writer()?;
+        self.conn.execute(
+            "INSERT INTO import_progress (path, imported_size, updated_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT (path) DO UPDATE SET imported_size = ?2, updated_at = ?3",
+            rusqlite::params![path, size as i64, Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
     // ── Checkpoints and the commit cursor ───────────────────────────────────
 
     /// Create a Checkpoint, or leave the existing one alone.

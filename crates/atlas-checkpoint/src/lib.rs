@@ -55,6 +55,7 @@ pub mod capture;
 pub mod checkpoint;
 pub mod git;
 pub mod health;
+pub mod import;
 mod error;
 mod lock;
 pub mod model;
@@ -71,6 +72,7 @@ pub use error::{Error, Result};
 pub use checkpoint::{reconcile_rewrites, walk_new_commits, ReconcileOutcome, WalkOutcome};
 pub use binding::{bind, detect, disable, enable, refresh_detection};
 pub use health::{evaluate as evaluate_health, CaptureHealth, HealthState, HostSignals};
+pub use import::{import_all, preview as import_preview, ImportOutcome, ImportPreview, TranscriptSource};
 pub use model::{
     AgentEdit, Binding, Checkpoint, LinkState, WorkspaceDetection, FileTouch, Message, Mode, Role, Session, Source, SyncState, TokenTotals, ToolCall,
     ToolStatus, TurnState, WorkspaceMode,

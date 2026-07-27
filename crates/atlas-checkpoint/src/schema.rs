@@ -16,7 +16,7 @@ use rusqlite::Connection;
 use crate::error::{Error, Result};
 
 /// Bump when adding a migration, and add the matching arm in [`migrate`].
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 5;
 
 pub fn migrate(conn: &Connection) -> Result<()> {
     let found: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
@@ -42,6 +42,9 @@ pub fn migrate(conn: &Connection) -> Result<()> {
     }
     if found < 4 {
         conn.execute_batch(V4)?;
+    }
+    if found < 5 {
+        conn.execute_batch(V5)?;
     }
 
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -356,6 +359,22 @@ CREATE TABLE IF NOT EXISTS binding (
     enabled         INTEGER NOT NULL DEFAULT 1,
     created_at      TEXT NOT NULL,
     updated_at      TEXT NOT NULL
+);
+"#;
+
+const V5: &str = r#"
+-- Per-file import progress, so a multi-hundred-megabyte backfill resumes rather
+-- than restarts when Atlas is closed mid-import.
+--
+-- Keyed on size rather than a line offset: a transcript that has not grown has
+-- nothing new, which is the cheap check that makes the ongoing watch affordable
+-- to run on every tick. A file that HAS grown is re-read from the start, which
+-- is safe because every turn carries the agent's own message id and re-recording
+-- one is a no-op.
+CREATE TABLE IF NOT EXISTS import_progress (
+    path          TEXT PRIMARY KEY,
+    imported_size INTEGER NOT NULL,
+    updated_at    TEXT NOT NULL
 );
 "#;
 
