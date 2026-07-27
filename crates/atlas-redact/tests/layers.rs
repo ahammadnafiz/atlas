@@ -202,3 +202,47 @@ fn a_realistic_env_file_dump_is_scrubbed_but_still_readable() {
     );
     assert!(out.text.contains("DATABASE_URL="), "key name lost");
 }
+
+#[test]
+fn a_credential_nested_inside_another_assignment_is_still_found() {
+    // Regression: the scan used to consume the whole assignment including its
+    // value, and regex iteration is non-overlapping — so an outer assignment
+    // whose key is innocuous hid the credential sitting inside its value. Every
+    // shape below leaked, and all of them are shapes agents record routinely.
+    for input in [
+        r#"out = f("API_KEY=hunter2xyz")"#,
+        "x=API_KEY=hunter2xyz",
+        "url=https://api.example.com/v1?api_key=hunter2xyz",
+        "deploy --env=API_KEY=hunter2xyz",
+        "ARGS=--token=hunter2xyz",
+        r#"{"command":"export DB_PASSWORD=hunter2xyz"}"#,
+    ] {
+        assert_scrubbed(input, "hunter2xyz");
+    }
+}
+
+#[test]
+fn replacing_a_value_leaves_the_syntax_around_it_intact() {
+    // The other half of the same bug: an unquoted value ends at whitespace, so
+    // it swallowed the closing delimiters and left a corrupted line behind.
+    for (input, expected) in [
+        (
+            r#"f("API_KEY=hunter2xyz")"#,
+            format!(r#"f("API_KEY={PLACEHOLDER}")"#),
+        ),
+        (
+            r#"{"k": "API_KEY=hunter2xyz"}"#,
+            format!(r#"{{"k": "API_KEY={PLACEHOLDER}"}}"#),
+        ),
+        (
+            "[API_KEY=hunter2xyz]",
+            format!("[API_KEY={PLACEHOLDER}]"),
+        ),
+        (
+            "call(token=hunter2xyz);",
+            format!("call(token={PLACEHOLDER});"),
+        ),
+    ] {
+        assert_eq!(redact(input).text, expected, "input: {input}");
+    }
+}

@@ -630,7 +630,12 @@ function Checkpoint({ entry }: { entry: TimelineEntry }) {
         {entry.commitSha?.slice(0, 7)}
       </span>
 
-      <span className="min-w-0 flex-1 truncate text-[12px] text-[var(--text-primary)]">
+      <span
+        className={cn(
+          "min-w-0 flex-1 truncate text-[12px]",
+          orphaned ? "text-[var(--text-secondary)]" : "text-[var(--text-primary)]",
+        )}
+      >
         {entry.commitSubject ?? (
           // The Checkpoint is a real record even when git can no longer resolve
           // it — a moved repository or a pruned commit must not erase it.
@@ -640,7 +645,22 @@ function Checkpoint({ entry }: { entry: TimelineEntry }) {
         )}
       </span>
 
-      {entry.branch && (
+      {/* A squash or a conflict-resolved rebase leaves the subject and the diff
+       *  stat intact, so without saying so outright an orphaned Checkpoint reads
+       *  exactly like a live one — the "wrong link" this whole subsystem exists
+       *  to avoid. The state is named on the row, not inferred from a border. */}
+      {orphaned && (
+        <span
+          className="shrink-0 rounded bg-[var(--status-warning-muted)] px-1.5 py-px text-[10px] text-[var(--status-warning)]"
+          title="This commit is no longer in history — rewritten or squashed. The Session record is kept."
+        >
+          orphaned
+        </span>
+      )}
+
+      {/* Suppressed when orphaned: the branch no longer contains this commit,
+       *  so showing it would assert exactly the link that was lost. */}
+      {entry.branch && !orphaned && (
         <span className="hidden shrink-0 font-mono text-[10px] text-[var(--text-tertiary)] md:block">
           {entry.branch}
         </span>
@@ -935,6 +955,10 @@ function JumpTo({
               checkpoint.files.length > 0
                 ? `${checkpoint.files.length} file${checkpoint.files.length === 1 ? "" : "s"}`
                 : null,
+              // Same reason as the row itself: an orphaned Checkpoint keeps its
+              // subject, so the jump list must say so rather than let it pass
+              // for a commit that is still in history.
+              checkpoint.linkState === "orphaned" ? "orphaned" : null,
             ]
               .filter((part): part is string => part !== null)
               .join(" · ");

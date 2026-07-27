@@ -56,18 +56,62 @@ const KEY_QUALIFIERS: &[&str] = &[
     "service", "license", "subscription", "consumer", "publishable",
 ];
 
-/// Any assignment at all. Which of them is a credential is decided in code
-/// below, because the deciding rule — *the key must end in a credential word* —
-/// is not something a single regex expresses without becoming unreadable and
-/// unmaintainable.
-fn assignment() -> &'static Regex {
+/// Any assignment's *key and separator* — deliberately not its value. Which of
+/// them is a credential is decided in code below, because the deciding rule —
+/// *the key must end in a credential word* — is not something a single regex
+/// expresses without becoming unreadable and unmaintainable.
+///
+/// Two things are deliberately left out of this pattern, both for the same
+/// reason: regex iteration is non-overlapping, so anything a match consumes is
+/// hidden from every later match.
+///
+/// * **The value.** Consuming it made the scan blind to nested assignments:
+///   `out = f("API_KEY=hunter2xyz")` matched as one assignment whose key is
+///   `out`, and because `out` is not a credential the whole thing was skipped —
+///   `API_KEY=` inside it was never examined. That silently leaked the shapes
+///   agents record most often, `url=https://h/p?api_key=…` among them.
+/// * **The character before the key.** Consuming it ate the separator the *next*
+///   key needs: in `x=API_KEY=hunter2xyz` the `=` belongs to both. The boundary
+///   is checked in code by [`starts_a_token`] instead.
+///
+/// What is left is short enough that a nested assignment is always still ahead
+/// of the cursor.
+fn key_separator() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
-        Regex::new(
-            r#"(?:^|[^A-Za-z0-9_])([A-Za-z0-9_.-]{1,64})[ \t]*(=|:)[ \t]*("[^"]*"|'[^']*'|[^\s,;&]+)"#,
-        )
-        .expect("static pattern")
+        Regex::new(r#"([A-Za-z0-9_.-]{1,64})[ \t]*(=|:)[ \t]*"#).expect("static pattern")
     })
+}
+
+/// The value, anchored at the offset the separator left off.
+fn value_at_start() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r#"^("[^"]*"|'[^']*'|[^\s,;&]+)"#).expect("static pattern"))
+}
+
+/// The value form for a quoted key, which stops at a JSON closing bracket too.
+fn quoted_value_at_start() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r#"^("[^"]*"|'[^']*'|[^\s,;&}\]]+)"#).expect("static pattern"))
+}
+
+/// Is the key a whole token, rather than the tail of a longer identifier?
+///
+/// Replaces the leading `(?:^|[^A-Za-z0-9_])` the pattern used to carry. Same
+/// rule, but checked without consuming the character, so it stays available as
+/// the boundary for the next key.
+fn starts_a_token(input: &str, start: usize) -> bool {
+    if start == 0 {
+        return true;
+    }
+    let previous = input.as_bytes()[start - 1];
+    !(previous.is_ascii_alphanumeric() || previous == b'_')
+}
+
+/// Match the value that begins at `offset`, as a byte range into `input`.
+fn value_after(pattern: &Regex, input: &str, offset: usize) -> Option<(usize, usize)> {
+    let found = pattern.find(input.get(offset..)?)?;
+    Some((offset + found.start(), offset + found.end()))
 }
 
 /// The JSON spelling of an assignment: `"password": "hunter2"`. The pattern
@@ -78,13 +122,12 @@ fn assignment() -> &'static Regex {
 ///
 /// A quoted key needs no identifier-shape gate: the quotes themselves are the
 /// evidence that this is config or data, not a word in a sentence.
-fn quoted_key_assignment() -> &'static Regex {
+/// Key and separator only, for the same non-overlapping reason as above.
+fn quoted_key_separator() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
-        Regex::new(
-            r#"(?:"([A-Za-z0-9_.-]{1,64})"|'([A-Za-z0-9_.-]{1,64})')[ \t]*:[ \t]*("[^"]*"|'[^']*'|[^\s,;&}\]]+)"#,
-        )
-        .expect("static pattern")
+        Regex::new(r#"(?:"([A-Za-z0-9_.-]{1,64})"|'([A-Za-z0-9_.-]{1,64})')[ \t]*:[ \t]*"#)
+            .expect("static pattern")
     })
 }
 
@@ -145,51 +188,92 @@ fn segments(key: &str) -> Vec<String> {
 
 pub(crate) fn detect(input: &str) -> Vec<Region> {
     let mut regions = Vec::new();
-    for captures in assignment().captures_iter(input) {
-        let (Some(key), Some(separator), Some(value)) =
-            (captures.get(1), captures.get(2), captures.get(3))
+    for captures in key_separator().captures_iter(input) {
+        let (Some(whole), Some(key), Some(separator)) =
+            (captures.get(0), captures.get(1), captures.get(2))
         else {
             continue;
         };
 
-        if !is_credential_key(key.as_str()) {
+        if !starts_a_token(input, key.start()) || !is_credential_key(key.as_str()) {
             continue;
         }
+        let Some((start, end)) = value_after(value_at_start(), input, whole.end()) else {
+            continue;
+        };
         // A bare `:` after a lone credential word is usually prose — unless the
         // value is quoted, which is the YAML spelling (`password: "hunter2"`);
         // prose does not quote what follows its colon.
         if separator.as_str() == ":"
             && !is_identifier_shaped(key.as_str())
-            && !is_quoted(value.as_str())
+            && !is_quoted(&input[start..end])
         {
             continue;
         }
 
-        regions.extend(value_region(input, value));
+        regions.extend(value_region(input, start, end));
     }
-    for captures in quoted_key_assignment().captures_iter(input) {
-        let (Some(key), Some(value)) =
-            (captures.get(1).or_else(|| captures.get(2)), captures.get(3))
-        else {
+    for captures in quoted_key_separator().captures_iter(input) {
+        let (Some(whole), Some(key)) = (
+            captures.get(0),
+            captures.get(1).or_else(|| captures.get(2)),
+        ) else {
             continue;
         };
         if !is_credential_key(key.as_str()) {
             continue;
         }
-        regions.extend(value_region(input, value));
+        let Some((start, end)) = value_after(quoted_value_at_start(), input, whole.end()) else {
+            continue;
+        };
+        regions.extend(value_region(input, start, end));
     }
     regions
 }
 
 /// Vet a matched value and turn it into a region, or decline: too short, purely
 /// numeric, or a placeholder.
-fn value_region(input: &str, value: regex::Match) -> Option<Region> {
-    let (start, end) = strip_quotes(input, value.start(), value.end());
-    let raw = &input[start..end];
+fn value_region(input: &str, start: usize, end: usize) -> Option<Region> {
+    let (start, end) = strip_quotes(input, start, end);
+    let raw = trim_trailing_delimiters(&input[start..end]);
+    let end = start + raw.len();
     if raw.len() < MIN_VALUE_LEN || is_numeric(raw) || !is_real_secret_value(raw) {
         return None;
     }
     Some(Region::new(start, end, Category::CredentialValue))
+}
+
+/// Drop closing delimiters the value ran past.
+///
+/// An unquoted value ends at whitespace, which is right for a shell line or a
+/// `.env` file and wrong everywhere else: in `f("API_KEY=hunter2xyz")` the run
+/// swallows the trailing `")`, and replacing that span leaves
+/// `f("API_KEY=[REDACTED]` — a corrupted line, which is the over-redaction
+/// failure this crate takes as seriously as a leak. A bracket the value could
+/// not itself have opened, an unpaired quote, or a trailing escape belongs to
+/// the syntax around the value, so it survives the replacement.
+///
+/// Only ASCII bytes are trimmed, so the range stays on a character boundary.
+fn trim_trailing_delimiters(value: &str) -> &str {
+    let count = |bytes: &[u8], needle: u8| bytes.iter().filter(|b| **b == needle).count();
+    let mut end = value.len();
+    while let Some(&last) = value.as_bytes()[..end].last() {
+        let bytes = &value.as_bytes()[..end];
+        let runs_past = match last {
+            b')' => count(bytes, b')') > count(bytes, b'('),
+            b']' => count(bytes, b']') > count(bytes, b'['),
+            b'}' => count(bytes, b'}') > count(bytes, b'{'),
+            b'>' => count(bytes, b'>') > count(bytes, b'<'),
+            b'"' | b'\'' => count(bytes, last) % 2 == 1,
+            b'\\' => true,
+            _ => false,
+        };
+        if !runs_past {
+            break;
+        }
+        end -= 1;
+    }
+    &value[..end]
 }
 
 /// A purely numeric value is a port, a count, a limit — `max_tokens=4096`,
