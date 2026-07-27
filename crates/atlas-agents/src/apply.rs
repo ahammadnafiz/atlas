@@ -412,6 +412,15 @@ fn apply_tool_call(
             if let Some(result) = formatted.clone() {
                 tc.result = Some(result);
             }
+            // Claude Code frequently reports `locations` only on the UPDATE and
+            // never on the create, so the create-only assignment below silently
+            // dropped every path it told us about. Guarded on non-empty: an
+            // update that omits the field must not wipe what the create set.
+            if let Some(locs) = v.get("locations").and_then(|l| l.as_array()) {
+                if !locs.is_empty() {
+                    tc.locations = locs.clone();
+                }
+            }
             let updated = tc.clone();
             let msg_id = msg.id.clone();
             let agent_id = st.agent_id;
@@ -468,4 +477,114 @@ fn apply_tool_call(
             tool_call,
         },
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::events::DeltaSink;
+    use std::sync::Arc;
+
+    struct NullSink;
+    impl DeltaSink for NullSink {
+        fn emit(&self, _envelope: SessionDeltaEnvelope) {}
+    }
+
+    fn harness() -> (Emitter, Mutex<SessionState>) {
+        (
+            Emitter::new(Arc::new(NullSink)),
+            Mutex::new(SessionState::new(
+                AgentId::new(),
+                "sess-1".into(),
+                "/tmp".into(),
+                "codex".into(),
+            )),
+        )
+    }
+
+    /// Read the single tool call back out of the session state.
+    fn only_tool_call(state: &Mutex<SessionState>) -> ToolCall {
+        let st = state.lock();
+        st.messages
+            .iter()
+            .flat_map(|m| m.tool_calls.iter())
+            .find(|t| t.id == "tc-1")
+            .expect("tool call present")
+            .clone()
+    }
+
+    /// Claude Code often reports `locations` only on the UPDATE. Before this was
+    /// fixed the update branch ignored the field entirely, so every path it told
+    /// us about was dropped — the file chips on the turn card went missing and
+    /// the analytics middleware had nothing to count.
+    #[test]
+    fn locations_survive_update_only_delivery() {
+        let (emitter, state) = harness();
+
+        apply_tool_call(
+            &emitter,
+            &state,
+            &serde_json::json!({
+                "toolCallId": "tc-1",
+                "title": "Read",
+                "kind": "read",
+                "status": "pending",
+            }),
+            false,
+        );
+        assert!(only_tool_call(&state).locations.is_empty());
+
+        apply_tool_call(
+            &emitter,
+            &state,
+            &serde_json::json!({
+                "toolCallId": "tc-1",
+                "status": "completed",
+                "locations": [{ "path": "/tmp/a.rs", "line": 4 }],
+            }),
+            true,
+        );
+
+        let tc = only_tool_call(&state);
+        assert_eq!(tc.locations.len(), 1);
+        assert_eq!(tc.locations[0]["path"], serde_json::json!("/tmp/a.rs"));
+    }
+
+    /// The merge is guarded on non-empty precisely so the common case — a status
+    /// update that simply omits `locations` — cannot erase what the create (or
+    /// an earlier update) established.
+    #[test]
+    fn empty_locations_update_does_not_wipe() {
+        let (emitter, state) = harness();
+
+        apply_tool_call(
+            &emitter,
+            &state,
+            &serde_json::json!({
+                "toolCallId": "tc-1",
+                "title": "Edit",
+                "kind": "edit",
+                "locations": [{ "path": "/tmp/b.rs" }],
+            }),
+            false,
+        );
+
+        // No `locations` key at all.
+        apply_tool_call(
+            &emitter,
+            &state,
+            &serde_json::json!({ "toolCallId": "tc-1", "status": "completed" }),
+            true,
+        );
+        assert_eq!(only_tool_call(&state).locations.len(), 1);
+
+        // Present but empty — same outcome, for the adapter that sends `[]`.
+        apply_tool_call(
+            &emitter,
+            &state,
+            &serde_json::json!({ "toolCallId": "tc-1", "locations": [] }),
+            true,
+        );
+        assert_eq!(only_tool_call(&state).locations.len(), 1);
+    }
 }

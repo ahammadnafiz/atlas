@@ -454,6 +454,19 @@ impl AgentManager {
 
     // ── internals ────────────────────────────────────────────────────────────
 
+    /// The plugin an agent was spawned from (`"claude-code-ts"`, `"codex"`,
+    /// `"cersei"`), or `None` if it is not registered.
+    ///
+    /// Public because the host's analytics middleware needs it on the delta hot
+    /// path: it is one `DashMap::get` and takes no session lock, unlike
+    /// `snapshot()` which clones the whole transcript.
+    pub fn plugin_id_for_agent(&self, agent_id: AgentId) -> Option<String> {
+        self.inner
+            .agent_plugins
+            .get(&agent_id)
+            .map(|e| e.value().clone())
+    }
+
     fn plugin_id_for(&self, agent_id: AgentId) -> Result<String> {
         self.inner
             .agent_plugins

@@ -109,15 +109,22 @@ pub fn run() {
             // before the webview starts loading — paid in parallel with the
             // WebView framework init, ~1ms on warm cache.
             let mut loaded = AppState::load(&app.handle());
-            // Ensure a stable anonymous telemetry id exists, persisting it on the
-            // very first launch so it survives even if the user never changes a
-            // setting (which is what would otherwise trigger a save). No PII.
-            let first_launch = loaded.telemetry_anon_id.is_none();
-            if first_launch {
-                loaded.telemetry_anon_id = Some(uuid::Uuid::new_v4().to_string());
+            // Device-stable telemetry identity, owned by Rust in its own file.
+            // It used to live in `state.json` as `telemetry_anon_id`, where every
+            // settings save wiped it (the frontend payload omitted the field and
+            // the command replaced the whole struct) — so one machine became a
+            // new PostHog person on every save. An install upgrading from that
+            // era ADOPTS its existing id here rather than forking a new person.
+            let (device, is_new_device) =
+                telemetry::device::load_or_create(&app.handle(), loaded.telemetry_anon_id.as_deref());
+            let device_id = device.device_id.clone();
+            let device_id_source = device.source.clone();
+            // Mirror it back into `state.json` so the two agree and a downgrade
+            // still finds an id. `AppStatePatch` now stops the frontend wiping it.
+            if loaded.telemetry_anon_id.as_deref() != Some(device_id.as_str()) {
+                loaded.telemetry_anon_id = Some(device_id.clone());
                 let _ = AppState::save(&app.handle(), &loaded);
             }
-            let anon_id = loaded.telemetry_anon_id.clone().unwrap_or_default();
             let telemetry_enabled = loaded.settings.share_telemetry;
             let app_state: AppStateHandle = Arc::new(Mutex::new(loaded));
             app.manage(app_state);
@@ -125,7 +132,7 @@ pub fn run() {
             // Opt-in product telemetry. Inert unless the user has enabled it AND
             // a PostHog key resolves (env / telemetry.json / build-time default).
             let (telemetry, flush_rx) =
-                telemetry::TelemetryClient::new(&app.handle(), anon_id, telemetry_enabled);
+                telemetry::TelemetryClient::new(&app.handle(), device_id, telemetry_enabled);
             app.manage(telemetry.clone());
             if let Some(rx) = flush_rx {
                 let tclient = telemetry.clone();
@@ -158,10 +165,14 @@ pub fn run() {
                     prev(info);
                 }));
             }
-            // Launch / active-user signal.
+            // Launch / active-user signal. `is_first_launch` is only honest now
+            // that the device id survives a settings save.
             telemetry.capture(
                 "app_started",
-                serde_json::json!({ "is_first_launch": first_launch }),
+                serde_json::json!({
+                    "is_first_launch": is_new_device,
+                    "device_id_source": device_id_source,
+                }),
             );
 
             commands::agents::install_manager(&app.handle());
@@ -429,6 +440,7 @@ pub fn run() {
             commands::telemetry::telemetry_config,
             commands::telemetry::telemetry_set_enabled,
             commands::telemetry::telemetry_capture,
+            commands::feedback::feedback_submit,
             commands::updater::update_check_now,
             commands::updater::update_apply,
             commands::updater::update_state,

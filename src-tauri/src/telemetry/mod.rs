@@ -11,10 +11,21 @@
 //! and the never-collected list; an event added here belongs in that table in the
 //! same change.
 //!
-//! Identity is a single persisted anonymous UUID (`telemetry_anon_id` in
-//! `state.json`) used as the PostHog `distinct_id` by both this Rust emitter
-//! and the frontend `posthog-js` (which handles client-side crashes only), so
-//! one install maps to one anonymous person.
+//! Identity has two layers. The base is a persisted random UUID per **device**
+//! (`<app_config_dir>/device.json`, see [`device`]), used as the PostHog
+//! `distinct_id` by both this Rust emitter and the frontend `posthog-js`, so one
+//! machine maps to one person. When the user signs in to an Atlas account,
+//! [`TelemetryClient::identify_account`] swaps the id to the account id and
+//! sends `$identify` with `$anon_distinct_id`, merging the device person into
+//! the account. Signing out reverts to the device id.
+//!
+//! That merge is retroactive — PostHog re-attributes the device person's prior
+//! events to the account — and it replaces the "anonymous forever" posture this
+//! module shipped with through 0.2.3 (ATL-52). It was retired deliberately in
+//! 0.2.4; `TELEMETRY.md` was rewritten in the same change and is the public
+//! statement of what this now does. What did **not** change: identity is still
+//! consent-gated, so an install that never opted in sends nothing extra as a
+//! result of signing in.
 //!
 //! Key/host resolution (highest priority wins):
 //!   1. env `ATLAS_POSTHOG_KEY`/`POSTHOG_KEY` (+ `ATLAS_POSTHOG_HOST`/`POSTHOG_HOST`),
@@ -23,11 +34,13 @@
 //!   3. compile-time `option_env!("ATLAS_POSTHOG_KEY")` — official release builds.
 //!   4. none → the client is permanently **inert** (no network, every call a no-op).
 
+pub mod device;
+
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use dashmap::DashMap;
+use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tauri::{AppHandle, Manager};
@@ -49,11 +62,35 @@ const BUILD_KEY: Option<&str> = option_env!("ATLAS_POSTHOG_KEY");
 const BUILD_HOST: Option<&str> = option_env!("ATLAS_POSTHOG_HOST");
 
 /// A single queued capture, serialized into the PostHog `/batch/` payload.
+///
+/// Carries its own `distinct_id`, stamped at **enqueue** time rather than at
+/// flush. That is what makes the sign-in merge correct: events captured before
+/// `$identify` keep the device id and are merged by PostHog, while a batch that
+/// straddles the transition no longer mislabels its first half.
 #[derive(Clone)]
 pub(crate) struct QueuedEvent {
     event: String,
+    distinct_id: String,
     properties: Value,
     timestamp: String,
+}
+
+/// The live analytics identity: who subsequent events are attributed to.
+#[derive(Debug, Default)]
+struct Identity {
+    /// `device_id` while signed out, the Atlas user id while signed in.
+    distinct_id: String,
+    /// `Some` only while signed in.
+    account_id: Option<String>,
+    /// The last identity sent, so a re-sync that changed nothing sends nothing.
+    /// `broadcast` fires on every auth transition *and* every revalidation, so
+    /// without this a long session would emit a `$identify` on a timer.
+    last_sent: Option<AccountIdentity>,
+    /// PostHog `$groups` for the active Organisation, injected into every event.
+    groups: Option<Value>,
+    /// A device→account merge that could not be sent because consent was off at
+    /// the time. Drained on opt-in so the link isn't lost forever.
+    pending_merge_anon: Option<String>,
 }
 
 /// Non-secret config the frontend reads to bootstrap `posthog-js`.
@@ -62,11 +99,33 @@ pub(crate) struct QueuedEvent {
 pub struct TelemetryConfig {
     pub enabled: bool,
     pub host: String,
+    /// Device-stable anonymous id. Still named `anonId` on the wire so the
+    /// renderer bootstrap keeps working unchanged.
     pub anon_id: String,
+    /// Atlas account id when signed in. Lets the renderer identify at boot
+    /// instead of waiting for an `atlas:auth-changed` it may already have missed
+    /// (`initTelemetry` is async and races the auth restore).
+    pub account_id: Option<String>,
     pub using_default_key: bool,
     /// PostHog *project* (write-only ingest) key — safe to expose client-side.
     /// `None` when inert; the frontend then skips `posthog-js` init entirely.
     pub key: Option<String>,
+}
+
+/// The account facts telemetry is allowed to know, built from an `AuthSnapshot`
+/// by `commands::auth::sync_identity`.
+///
+/// Note what is absent: `avatar_path`. It is an absolute local path, and paths
+/// do not leave the machine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountIdentity {
+    pub user_id: String,
+    pub email: String,
+    pub name: String,
+    pub org_id: Option<String>,
+    pub org_name: Option<String>,
+    pub org_role: Option<String>,
+    pub org_count: usize,
 }
 
 /// The two auto-update values pulled from PostHog remote config.
@@ -102,13 +161,16 @@ pub struct TelemetryClient {
     api_key: Option<String>,
     host: String,
     using_default_key: bool,
-    distinct_id: String,
+    /// Immutable per-device id. The `$anon_distinct_id` of any account merge,
+    /// and what identity reverts to on sign-out.
+    device_id: String,
+    /// Who events are attributed to right now. Behind a lock because the flush
+    /// loop holds only an `Arc<Self>` and `capture` takes `&self`.
+    identity: RwLock<Identity>,
     app_version: &'static str,
     os: &'static str,
     arch: &'static str,
     tx: Option<mpsc::Sender<QueuedEvent>>,
-    /// Latest cumulative usage seen per session, stamped onto `agent_turn_finished`.
-    last_usage: DashMap<String, Value>,
 }
 
 struct Resolved {
@@ -213,7 +275,7 @@ impl TelemetryClient {
     /// `run_flush_loop`. `enabled` is the persisted opt-in setting.
     pub(crate) fn new(
         app: &AppHandle,
-        distinct_id: String,
+        device_id: String,
         enabled: bool,
     ) -> (Arc<Self>, Option<mpsc::Receiver<QueuedEvent>>) {
         let resolved = resolve_keys(app);
@@ -234,14 +296,28 @@ impl TelemetryClient {
             api_key,
             host,
             using_default_key,
-            distinct_id,
+            identity: RwLock::new(Identity {
+                distinct_id: device_id.clone(),
+                ..Identity::default()
+            }),
+            device_id,
             app_version: env!("CARGO_PKG_VERSION"),
             os: std::env::consts::OS,
             arch: std::env::consts::ARCH,
             tx,
-            last_usage: DashMap::new(),
         });
         (client, rx)
+    }
+
+    /// Who events are attributed to right now — the account id when signed in,
+    /// otherwise this device's id.
+    pub fn current_distinct_id(&self) -> String {
+        self.identity.read().distinct_id.clone()
+    }
+
+    /// The signed-in Atlas user id, if any.
+    pub fn account_id(&self) -> Option<String> {
+        self.identity.read().account_id.clone()
     }
 
     pub fn is_enabled(&self) -> bool {
@@ -252,7 +328,8 @@ impl TelemetryClient {
         TelemetryConfig {
             enabled: self.is_enabled(),
             host: self.host.clone(),
-            anon_id: self.distinct_id.clone(),
+            anon_id: self.device_id.clone(),
+            account_id: self.account_id(),
             using_default_key: self.using_default_key,
             key: if self.inert {
                 None
@@ -275,9 +352,11 @@ impl TelemetryClient {
         let key = self.api_key.clone()?; // inert build → no key → skip
         let host = self.host.clone();
         let client = posthog_rs::client((key.as_str(), host.as_str())).await;
+        // Keyed on the DEVICE id, not the live identity: the update check must
+        // resolve to the same flags across a sign-in, and it is not analytics.
         let flags = client
             .evaluate_flags(
-                self.distinct_id.as_str(),
+                self.device_id.as_str(),
                 posthog_rs::EvaluateFlagsOptions::default(),
             )
             .await
@@ -301,6 +380,10 @@ impl TelemetryClient {
         if on && !was {
             self.enabled.store(true, Ordering::Relaxed);
             self.capture("telemetry_opt_in", json!({}));
+            // A sign-in that happened while consent was off left the device→account
+            // link unsent. Send it now, so opting in later doesn't strand the
+            // account as a second, unrelated person.
+            self.drain_pending_merge();
         } else if !on && was {
             self.capture("telemetry_opt_out", json!({}));
             self.enabled.store(false, Ordering::Relaxed);
@@ -319,33 +402,191 @@ impl TelemetryClient {
         self.inject_common(&mut properties);
         let _ = tx.try_send(QueuedEvent {
             event: event.to_string(),
+            distinct_id: self.current_distinct_id(),
             properties,
             timestamp: now_iso(),
         });
     }
 
-    /// The account events, and the whole reason they are named here rather than
-    /// written inline at their call sites (ATL-52).
+    /// Attribute subsequent events to this Atlas account, merging the device
+    /// person into it (`$identify` + `$anon_distinct_id`).
     ///
-    /// Atlas's telemetry identity is the persisted anonymous install UUID above,
-    /// consented to under "Share anonymous usage data". Signing in must not
-    /// change that: there is no `identify` and no `alias` anywhere in this app,
-    /// and these two events carry **no user id, email, or Organisation id**.
-    /// Linking the install to a real user would retroactively de-anonymize every
-    /// event it has ever sent, under a consent string that promised the
-    /// opposite. ADR-0007 §8's identified analytics is satisfied server-side,
-    /// where session creation calls `identify` — the desktop must not duplicate
-    /// it.
+    /// **Idempotent.** Called from the single auth broadcast funnel, which fires
+    /// on every transition *and* on each launch revalidation — so repeat calls
+    /// with the same `user_id` must refresh person properties without sending
+    /// another merge, or a relaunch would emit one every time.
     ///
-    /// Defining the payload once, in the module that owns that promise, is what
-    /// lets a test hold it: a `json!({})` written at the call site could grow a
-    /// `user_id` without anything noticing.
+    /// The `$anon_distinct_id` is attached **only** when the id being replaced is
+    /// this device's own. Merging one account into another is irreversible in
+    /// PostHog: it would silently fuse two real people, and there is no undo.
+    /// Account-to-account switches therefore re-attribute going forward and
+    /// leave history where it is.
     ///
-    /// Both are no-ops unless consent was already granted, because
-    /// [`capture`](Self::capture) is — a user who has not opted in sends nothing
-    /// extra as a result of signing in.
-    pub fn capture_signed_in(&self) {
-        self.capture("auth_signed_in", json!({}));
+    /// Consent-gated like everything else — [`capture`](Self::capture) is a
+    /// no-op when the user has not opted in, so signing in sends nothing. The
+    /// unsent merge is remembered and drained if they later opt in.
+    pub fn identify_account(&self, id: &AccountIdentity) {
+        if self.inert || id.user_id.trim().is_empty() {
+            return;
+        }
+
+        let merge_anon = {
+            let mut g = self.identity.write();
+            g.groups = id
+                .org_id
+                .as_ref()
+                .map(|o| json!({ "organisation": o.clone() }));
+
+            // Nothing has changed since the last send — not the account, not the
+            // name, not the active org. Emitting again would only add noise.
+            if g.last_sent.as_ref() == Some(id) {
+                return;
+            }
+            if g.account_id.as_deref() == Some(id.user_id.as_str()) {
+                // Same account, changed details — refresh `$set`, no merge.
+                g.last_sent = Some(id.clone());
+                None
+            } else {
+                let prior = std::mem::replace(&mut g.distinct_id, id.user_id.clone());
+                g.account_id = Some(id.user_id.clone());
+                let anon = (prior == self.device_id).then_some(prior);
+                if !self.is_enabled() {
+                    // Remember the merge for `set_enabled(true)` to drain, and
+                    // deliberately do NOT record this as sent — opting in later
+                    // must still deliver the person properties.
+                    g.pending_merge_anon = anon;
+                    return;
+                }
+                g.last_sent = Some(id.clone());
+                anon
+            }
+        };
+
+        let mut props = json!({
+            "$set": {
+                "email": id.email,
+                "name": id.name,
+                "atlas_account": true,
+                "atlas_org_count": id.org_count,
+                "atlas_active_org_id": id.org_id,
+            },
+            "$set_once": {
+                "atlas_device_id": self.device_id,
+            },
+        });
+        if let (Some(anon), Value::Object(m)) = (merge_anon, &mut props) {
+            m.insert("$anon_distinct_id".into(), json!(anon));
+        }
+        self.capture("$identify", props);
+
+        // Org-level rollups (`$groupidentify` defines the group; `$groups` on
+        // each event associates it).
+        if let Some(org) = id.org_id.as_ref() {
+            self.capture(
+                "$groupidentify",
+                json!({
+                    "$group_type": "organisation",
+                    "$group_key": org,
+                    "$group_set": { "name": id.org_name, "role": id.org_role },
+                }),
+            );
+        }
+    }
+
+    /// Revert to the device person. Emits nothing itself — the caller decides
+    /// whether the sign-out is worth an event, and `auth_signed_out` is captured
+    /// *before* this so it lands on the account it belongs to.
+    pub fn reset_identity(&self) {
+        let mut g = self.identity.write();
+        g.distinct_id = self.device_id.clone();
+        g.account_id = None;
+        g.groups = None;
+        g.pending_merge_anon = None;
+        // Signing back into the same account must re-identify, so this cannot
+        // be remembered across a sign-out.
+        g.last_sent = None;
+    }
+
+    /// Send a merge that `identify_account` deferred because consent was off.
+    fn drain_pending_merge(&self) {
+        let anon = self.identity.write().pending_merge_anon.take();
+        if let Some(anon) = anon {
+            self.capture(
+                "$identify",
+                json!({
+                    "$anon_distinct_id": anon,
+                    "$set_once": { "atlas_device_id": self.device_id },
+                }),
+            );
+        }
+    }
+
+    /// One-shot POST to `/capture/`, bypassing both the queue and the opt-in
+    /// gate.
+    ///
+    /// **Only** for submissions the user explicitly initiated — today that means
+    /// feedback, where a button labelled "Send" that silently discarded the
+    /// message would be a worse betrayal than sending it. Still a hard no-op
+    /// when **inert**: no resolved key means no network under any circumstance,
+    /// and that promise is not negotiable.
+    ///
+    /// Direct rather than queued so the caller can show a real success or
+    /// failure, instead of "it'll go out within five seconds, probably".
+    pub async fn capture_user_initiated(
+        &self,
+        event: &str,
+        mut properties: Value,
+    ) -> Result<(), String> {
+        let Some(key) = self.api_key.clone() else {
+            return Err("Telemetry is not configured in this build.".into());
+        };
+        self.inject_common(&mut properties);
+        if let Value::Object(m) = &mut properties {
+            // Makes the consent state of every submission visible downstream.
+            m.insert("telemetry_opt_in".into(), json!(self.is_enabled()));
+        }
+        let url = format!("{}/capture/", self.host.trim_end_matches('/'));
+        let body = json!({
+            "api_key": key,
+            "event": event,
+            "distinct_id": self.current_distinct_id(),
+            "properties": properties,
+            "timestamp": now_iso(),
+        });
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(15))
+            .build()
+            .map_err(|e| e.to_string())?;
+        let resp = http
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        if resp.status().is_success() {
+            Ok(())
+        } else {
+            Err(format!("PostHog returned {}", resp.status()))
+        }
+    }
+
+    /// The account events.
+    ///
+    /// These no longer carry "no identity at all" — [`identify_account`] has
+    /// already attributed the session to the Atlas account by the time this
+    /// fires, so the event lands on the account person. The properties here are
+    /// the *shape* of the account, not the person: counts, not names.
+    ///
+    /// Still consent-gated, because [`capture`](Self::capture) is. That part of
+    /// the original ATL-52 guarantee stands: an install that has never opted in
+    /// sends nothing extra as a result of signing in.
+    ///
+    /// [`identify_account`]: Self::identify_account
+    pub fn capture_signed_in(&self, org_count: usize, has_active_org: bool) {
+        self.capture(
+            "auth_signed_in",
+            json!({ "org_count": org_count, "has_active_org": has_active_org }),
+        );
     }
 
     /// Companion to [`capture_signed_in`](Self::capture_signed_in). Emitted only
@@ -353,24 +594,10 @@ impl TelemetryClient {
     /// a revocation into this event would leave a count that means neither one
     /// thing nor the other.
     pub fn capture_signed_out(&self) {
-        self.capture("auth_signed_out", json!({}));
-    }
-
-    /// Remember the latest cumulative usage for a session (stamped onto the
-    /// next `agent_turn_finished`). No-op when inert.
-    pub fn note_usage(&self, session_id: &str, usage: Value) {
-        if self.inert {
-            return;
-        }
-        self.last_usage.insert(session_id.to_string(), usage);
-    }
-
-    /// Take (and clear) the last recorded usage for a session.
-    pub fn take_usage(&self, session_id: &str) -> Value {
-        self.last_usage
-            .remove(session_id)
-            .map(|(_, v)| v)
-            .unwrap_or(Value::Null)
+        self.capture(
+            "auth_signed_out",
+            json!({ "had_account": self.account_id().is_some() }),
+        );
     }
 
     /// Best-effort **synchronous** capture for the panic hook. Because the build
@@ -390,7 +617,7 @@ impl TelemetryClient {
         let body = json!({
             "api_key": key,
             "event": "rust_panic",
-            "distinct_id": self.distinct_id,
+            "distinct_id": self.current_distinct_id(),
             "properties": properties,
             "timestamp": now_iso(),
         });
@@ -420,6 +647,11 @@ impl TelemetryClient {
                 .or_insert_with(|| json!(self.app_version));
             map.entry("os").or_insert_with(|| json!(self.os));
             map.entry("arch").or_insert_with(|| json!(self.arch));
+            // Org-level rollups while an Organisation is active. Only the id —
+            // the name and role live on the group itself via `$groupidentify`.
+            if let Some(groups) = self.identity.read().groups.clone() {
+                map.entry("$groups").or_insert(groups);
+            }
         }
     }
 }
@@ -451,19 +683,19 @@ pub(crate) async fn run_flush_loop(
                     Some(ev) => {
                         buf.push(ev);
                         if buf.len() >= FLUSH_BATCH {
-                            send_batch(&http, &url, &api_key, &client.distinct_id, &mut buf).await;
+                            send_batch(&http, &url, &api_key, &mut buf).await;
                         }
                     }
                     None => {
                         // All senders dropped — final flush then exit.
-                        send_batch(&http, &url, &api_key, &client.distinct_id, &mut buf).await;
+                        send_batch(&http, &url, &api_key, &mut buf).await;
                         break;
                     }
                 }
             }
             _ = ticker.tick() => {
                 if !buf.is_empty() {
-                    send_batch(&http, &url, &api_key, &client.distinct_id, &mut buf).await;
+                    send_batch(&http, &url, &api_key, &mut buf).await;
                 }
             }
         }
@@ -474,7 +706,6 @@ async fn send_batch(
     http: &reqwest::Client,
     url: &str,
     api_key: &str,
-    distinct_id: &str,
     buf: &mut Vec<QueuedEvent>,
 ) {
     if buf.is_empty() {
@@ -485,7 +716,9 @@ async fn send_batch(
         .map(|e| {
             json!({
                 "event": e.event,
-                "distinct_id": distinct_id,
+                // Per-event, stamped when it was captured — a batch that spans a
+                // sign-in must not relabel the events queued before it.
+                "distinct_id": e.distinct_id,
                 "properties": e.properties,
                 "timestamp": e.timestamp,
             })
@@ -529,52 +762,72 @@ mod tests {
         assert!(r.contains("here"));
     }
 
-    #[test]
-    fn inert_client_is_a_total_no_op() {
-        // No key, no channel → inert. Build the struct directly (resolve_keys
-        // needs an AppHandle we don't have in a unit test).
+
+    /// Build a client without an `AppHandle` (which `resolve_keys` would need).
+    /// `enabled` is the consent gate; the returned receiver is the queue tail.
+    fn client(enabled: bool, inert: bool) -> (TelemetryClient, mpsc::Receiver<QueuedEvent>) {
+        let (tx, rx) = mpsc::channel(32);
         let c = TelemetryClient {
-            enabled: AtomicBool::new(true),
-            inert: true,
-            api_key: None,
+            enabled: AtomicBool::new(enabled && !inert),
+            inert,
+            api_key: (!inert).then(|| "phc_test".to_string()),
             host: DEFAULT_HOST.to_string(),
-            using_default_key: false,
-            distinct_id: "anon".into(),
+            using_default_key: true,
+            identity: RwLock::new(Identity {
+                distinct_id: "device-uuid".into(),
+                ..Identity::default()
+            }),
+            device_id: "device-uuid".into(),
             app_version: "0.0.0",
             os: "test",
             arch: "test",
-            tx: None,
-            last_usage: DashMap::new(),
+            tx: (!inert).then_some(tx),
         };
+        (c, rx)
+    }
+
+    fn account(user_id: &str) -> AccountIdentity {
+        AccountIdentity {
+            user_id: user_id.into(),
+            email: "a@example.com".into(),
+            name: "A".into(),
+            org_id: Some("org-1".into()),
+            org_name: Some("Acme".into()),
+            org_role: Some("admin".into()),
+            org_count: 2,
+        }
+    }
+
+    /// Drain the queue into `(event, distinct_id, properties)` triples.
+    fn drain(rx: &mut mpsc::Receiver<QueuedEvent>) -> Vec<(String, String, Value)> {
+        let mut out = Vec::new();
+        while let Ok(e) = rx.try_recv() {
+            out.push((e.event, e.distinct_id, e.properties));
+        }
+        out
+    }
+
+    #[test]
+    fn inert_client_is_a_total_no_op() {
+        let (c, _rx) = client(true, true);
         assert!(!c.is_enabled());
         assert!(c.inert);
         // None of these may panic or transmit.
-        c.capture("agent_turn_finished", json!({ "x": 1 }));
+        c.capture("agent_turn_completed", json!({ "x": 1 }));
         c.set_enabled(true);
         c.set_enabled(false);
-        c.note_usage("s1", json!({ "input_tokens": 5 }));
-        assert_eq!(c.take_usage("s1"), Value::Null); // note_usage was a no-op
+        c.identify_account(&account("user-1"));
+        c.reset_identity();
+        assert_eq!(c.current_distinct_id(), "device-uuid");
         let cfg = c.config();
         assert!(!cfg.enabled);
         assert!(cfg.key.is_none());
+        assert!(cfg.account_id.is_none());
     }
 
     #[test]
     fn disabled_client_drops_events_but_records_nothing() {
-        let (tx, mut rx) = mpsc::channel(8);
-        let c = TelemetryClient {
-            enabled: AtomicBool::new(false),
-            inert: false,
-            api_key: Some("phc_test".into()),
-            host: DEFAULT_HOST.to_string(),
-            using_default_key: true,
-            distinct_id: "anon".into(),
-            app_version: "0.0.0",
-            os: "test",
-            arch: "test",
-            tx: Some(tx),
-            last_usage: DashMap::new(),
-        };
+        let (c, mut rx) = client(false, false);
         c.capture("agent_turn_started", json!({}));
         assert!(rx.try_recv().is_err(), "disabled client must not enqueue");
 
@@ -585,73 +838,130 @@ mod tests {
         assert_eq!(ev.properties["$lib"], json!("atlas-rust"));
         assert_eq!(ev.properties["app_version"], json!("0.0.0"));
 
-        // Now a real capture flows through with usage round-trip.
-        c.note_usage("s1", json!({ "input_tokens": 12 }));
-        assert_eq!(c.take_usage("s1")["input_tokens"], json!(12));
-        c.capture("agent_turn_finished", json!({ "agent_kind": "atlas" }));
-        let ev2 = rx.try_recv().expect("finished event");
-        assert_eq!(ev2.event, "agent_turn_finished");
-        assert_eq!(ev2.properties["agent_kind"], json!("atlas"));
+        c.capture("agent_turn_completed", json!({ "plugin_id": "codex" }));
+        let ev2 = rx.try_recv().expect("completed event");
+        assert_eq!(ev2.event, "agent_turn_completed");
+        assert_eq!(ev2.properties["plugin_id"], json!("codex"));
     }
 
-    /// Build a non-inert client with `enabled` as given, plus the receiving end
-    /// of its queue.
-    fn client_with_consent(enabled: bool) -> (TelemetryClient, mpsc::Receiver<QueuedEvent>) {
-        let (tx, rx) = mpsc::channel(8);
-        let c = TelemetryClient {
-            enabled: AtomicBool::new(enabled),
-            inert: false,
-            api_key: Some("phc_test".into()),
-            host: DEFAULT_HOST.to_string(),
-            using_default_key: true,
-            distinct_id: "anon-install-uuid".into(),
-            app_version: "0.0.0",
-            os: "test",
-            arch: "test",
-            tx: Some(tx),
-            last_usage: DashMap::new(),
-        };
-        (c, rx)
-    }
-
-    /// ATL-52: signing in must not become a telemetry backdoor. A user who has
-    /// not opted in sends *nothing* extra as a result of signing in or out.
+    /// The core of the account linkage: events before sign-in keep the device
+    /// id, `$identify` carries the merge, and events after land on the account.
     #[test]
-    fn auth_events_are_gated_by_consent() {
-        let (c, mut rx) = client_with_consent(false);
-        c.capture_signed_in();
-        c.capture_signed_out();
+    fn identify_swaps_distinct_id_and_merges_device() {
+        let (c, mut rx) = client(true, false);
+
+        c.capture("app_started", json!({}));
+        c.identify_account(&account("user-1"));
+        c.capture("agent_turn_started", json!({}));
+
+        let events = drain(&mut rx);
+        let before = &events[0];
+        assert_eq!(before.0, "app_started");
+        assert_eq!(before.1, "device-uuid", "pre-sign-in event keeps the device id");
+
+        let ident = events.iter().find(|e| e.0 == "$identify").expect("$identify");
+        assert_eq!(ident.1, "user-1");
+        assert_eq!(ident.2["$anon_distinct_id"], json!("device-uuid"));
+        assert_eq!(ident.2["$set"]["email"], json!("a@example.com"));
+        assert_eq!(ident.2["$set_once"]["atlas_device_id"], json!("device-uuid"));
+
+        let group = events.iter().find(|e| e.0 == "$groupidentify").expect("group");
+        assert_eq!(group.2["$group_key"], json!("org-1"));
+
+        let after = events.last().expect("post-identify event");
+        assert_eq!(after.0, "agent_turn_started");
+        assert_eq!(after.1, "user-1");
+        assert_eq!(after.2["$groups"]["organisation"], json!("org-1"));
+    }
+
+    /// `broadcast` re-syncs identity on every auth transition and on each launch
+    /// revalidation, so a non-idempotent identify would emit a merge per launch.
+    #[test]
+    fn identify_is_idempotent() {
+        let (c, mut rx) = client(true, false);
+        c.identify_account(&account("user-1"));
+        c.identify_account(&account("user-1"));
+        let identifies = drain(&mut rx).into_iter().filter(|e| e.0 == "$identify").count();
+        assert_eq!(identifies, 1);
+    }
+
+    /// Merging one account into another is irreversible in PostHog — it fuses
+    /// two real people with no undo. Switching accounts must re-attribute going
+    /// forward and leave history alone.
+    #[test]
+    fn identify_never_merges_two_accounts() {
+        let (c, mut rx) = client(true, false);
+        c.identify_account(&account("user-1"));
+        c.identify_account(&account("user-2"));
+
+        let identifies: Vec<_> = drain(&mut rx).into_iter().filter(|e| e.0 == "$identify").collect();
+        assert_eq!(identifies.len(), 2);
+        assert_eq!(identifies[0].2["$anon_distinct_id"], json!("device-uuid"));
         assert!(
-            rx.try_recv().is_err(),
-            "auth events must not be enqueued without consent"
+            identifies[1].2.get("$anon_distinct_id").is_none(),
+            "account→account switch must not carry a merge"
         );
     }
 
-    /// ATL-52: the install stays anonymous after sign-in. These two events carry
-    /// nothing beyond the common properties every event gets — in particular no
-    /// user id, email, or Organisation id. This is the test the payload lives in
-    /// `capture_signed_in` / `capture_signed_out` to make possible.
     #[test]
-    fn auth_events_carry_no_identity() {
-        let (c, mut rx) = client_with_consent(true);
-        c.capture_signed_in();
+    fn reset_reverts_to_the_device_id() {
+        let (c, mut rx) = client(true, false);
+        c.identify_account(&account("user-1"));
+        let _ = drain(&mut rx);
+
+        c.reset_identity();
+        assert_eq!(c.current_distinct_id(), "device-uuid");
+        assert!(c.account_id().is_none());
+        assert!(drain(&mut rx).is_empty(), "reset emits nothing itself");
+
+        c.capture("app_started", json!({}));
+        let ev = drain(&mut rx);
+        assert_eq!(ev[0].1, "device-uuid");
+        assert!(ev[0].2.get("$groups").is_none(), "groups cleared on reset");
+    }
+
+    /// The surviving half of ATL-52: signing in is not a telemetry backdoor. A
+    /// user who has not opted in sends nothing extra as a result of it.
+    #[test]
+    fn auth_events_and_identify_are_gated_by_consent() {
+        let (c, mut rx) = client(false, false);
+        c.identify_account(&account("user-1"));
+        c.capture_signed_in(2, true);
         c.capture_signed_out();
+        assert!(
+            rx.try_recv().is_err(),
+            "nothing may be enqueued without consent"
+        );
+    }
 
-        // The four keys `inject_common` adds, and nothing else is permitted.
-        const COMMON: [&str; 4] = ["$lib", "app_version", "os", "arch"];
+    /// ...but the link isn't lost forever: opting in later sends the merge that
+    /// was deferred, so the account doesn't become a second unrelated person.
+    #[test]
+    fn opt_in_drains_a_deferred_identify() {
+        let (c, mut rx) = client(false, false);
+        c.identify_account(&account("user-1"));
+        assert_eq!(c.current_distinct_id(), "user-1", "identity still switches");
 
-        for expected in ["auth_signed_in", "auth_signed_out"] {
-            let ev = rx.try_recv().unwrap_or_else(|_| panic!("{expected} event"));
-            assert_eq!(ev.event, expected);
-            let props = ev.properties.as_object().expect("object properties");
-            let extra: Vec<&String> = props
-                .keys()
-                .filter(|k| !COMMON.contains(&k.as_str()))
-                .collect();
-            assert!(
-                extra.is_empty(),
-                "{expected} must carry no properties beyond the common ones, found {extra:?}"
-            );
-        }
+        c.set_enabled(true);
+        let events = drain(&mut rx);
+        assert_eq!(events[0].0, "telemetry_opt_in");
+        let ident = events.iter().find(|e| e.0 == "$identify").expect("$identify");
+        assert_eq!(ident.1, "user-1");
+        assert_eq!(ident.2["$anon_distinct_id"], json!("device-uuid"));
+    }
+
+    /// `auth_signed_out` must be captured before `reset_identity` so it lands on
+    /// the account it describes — see the ordering in `commands::auth`.
+    #[test]
+    fn signed_out_reports_whether_an_account_was_held() {
+        let (c, mut rx) = client(true, false);
+        c.identify_account(&account("user-1"));
+        let _ = drain(&mut rx);
+
+        c.capture_signed_out();
+        let ev = drain(&mut rx);
+        assert_eq!(ev[0].0, "auth_signed_out");
+        assert_eq!(ev[0].1, "user-1");
+        assert_eq!(ev[0].2["had_account"], json!(true));
     }
 }

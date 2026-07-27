@@ -39,6 +39,7 @@ import { useModelPricingStore } from "../stores/model-pricing-store";
 import { useClaudeSetupStore } from "@/features/claude-setup/stores/claude-setup-store";
 import { useProjectStore } from "@/features/project/stores/project-store";
 import { setEnabled as setTelemetryEnabled } from "@/features/telemetry/posthog-client";
+import { useFeedbackStore } from "@/features/feedback/stores/feedback-store";
 import { updater } from "@/features/updater/lib/updater-api";
 import { useUpdaterStore } from "@/features/updater/stores/updater-store";
 import {
@@ -295,8 +296,8 @@ function GeneralSettings() {
         />
       </SettingRow>
       <SettingRow
-        label="Share anonymous usage data"
-        description="Anonymous, privacy-preserving usage data (app launches, agents/skills used, token counts, crashes, and that a sign-in happened — never who signed in) to help improve Atlas. Never your prompts, code, paths, or keys. See TELEMETRY.md."
+        label="Share usage data"
+        description="Privacy-preserving usage data (app launches, which agents and tools you use, how many files a turn touched, token counts, crashes) to help improve Atlas. Never your prompts, code, file paths, or keys. See TELEMETRY.md."
       >
         <Toggle
           checked={settings.shareTelemetry}
@@ -308,6 +309,33 @@ function GeneralSettings() {
             );
           }}
         />
+      </SettingRow>
+      <SettingRow
+        label="Link usage data to my account"
+        description="While signed in, attribute usage data to your Atlas account instead of an anonymous per-device id. Turn this off to stay anonymous even when signed in — already-linked history stays linked."
+      >
+        <Toggle
+          checked={settings.linkTelemetryToAccount}
+          disabled={!settings.shareTelemetry}
+          onChange={(next) => updateSettings({ linkTelemetryToAccount: next })}
+        />
+      </SettingRow>
+      <SettingRow
+        label="Send feedback"
+        description="Report a bug, request a feature, or tell us what feels clumsy — with an optional screenshot. Opens a panel in the bottom-right corner."
+      >
+        <button
+          type="button"
+          onClick={() =>
+            useFeedbackStore.getState().actions.openPanel("settings")
+          }
+          className={cn(
+            "h-7 rounded-md px-2.5 text-[11px] font-medium border border-border-default bg-bg-elevated",
+            "text-text-primary hover:bg-bg-hover transition-colors",
+          )}
+        >
+          Send feedback
+        </button>
       </SettingRow>
       <SettingRow
         label="Next-step suggestions"
@@ -733,15 +761,20 @@ function Toggle({
   defaultChecked = false,
   checked,
   onChange,
+  disabled = false,
 }: {
   defaultChecked?: boolean;
   checked?: boolean;
   onChange?: (next: boolean) => void;
+  /** For a sub-setting whose parent is off — dimmed and inert, but still
+   *  showing its own stored value rather than lying about it. */
+  disabled?: boolean;
 }) {
   const [internal, setInternal] = useState(defaultChecked);
   const isControlled = checked !== undefined;
   const value = isControlled ? checked : internal;
   const apply = (next: boolean) => {
+    if (disabled) return;
     if (!isControlled) setInternal(next);
     onChange?.(next);
   };
@@ -755,9 +788,11 @@ function Toggle({
       onClick={() => apply(!value)}
       role="switch"
       aria-checked={value}
+      disabled={disabled}
       className={cn(
-        "relative inline-flex h-5 w-9 shrink-0 cursor-pointer items-center",
+        "relative inline-flex h-5 w-9 shrink-0 items-center",
         "rounded-full border-2 border-transparent transition-colors",
+        disabled ? "opacity-40 cursor-not-allowed" : "cursor-pointer",
         value
           ? "bg-[var(--accent-primary)]"
           : "bg-[var(--bg-elevated)]"
