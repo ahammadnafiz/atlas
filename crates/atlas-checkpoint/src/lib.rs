@@ -66,7 +66,7 @@ pub use capture::{
     hash_written_content, Capture, FileWrite, SessionKey, ToolCallContent, TurnContent,
 };
 pub use error::{Error, Result};
-pub use checkpoint::{walk_new_commits, WalkOutcome};
+pub use checkpoint::{reconcile_rewrites, walk_new_commits, ReconcileOutcome, WalkOutcome};
 pub use model::{
     AgentEdit, Checkpoint, LinkState, FileTouch, Message, Mode, Role, Session, Source, SyncState, TokenTotals, ToolCall,
     ToolStatus, TurnState, WorkspaceMode,

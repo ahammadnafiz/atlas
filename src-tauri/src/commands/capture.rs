@@ -369,6 +369,30 @@ fn worker(rx: mpsc::Receiver<Job>) {
                 Ok(_) => {}
                 Err(e) => tracing::warn!(target: "atlas::capture", "commit walk failed: {e}"),
             }
+
+            // Same trigger, because a rewrite moves refs exactly like a commit
+            // does. Cheap when nothing was rewritten: it does no work at all
+            // once every Checkpoint's commit is still reachable.
+            match atlas_checkpoint::reconcile_rewrites(store, workspace_id, &root) {
+                Ok(outcome) if outcome.is_mass_orphan() => tracing::warn!(
+                    target: "atlas::capture",
+                    orphaned = outcome.orphaned,
+                    "history-wide rewrite orphaned Checkpoints in bulk"
+                ),
+                Ok(outcome) if outcome.relinked + outcome.orphaned + outcome.recovered > 0 => {
+                    tracing::info!(
+                        target: "atlas::capture",
+                        relinked = outcome.relinked,
+                        orphaned = outcome.orphaned,
+                        recovered = outcome.recovered,
+                        "reconciled Checkpoints after a history rewrite"
+                    )
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(target: "atlas::capture", "reconciliation failed: {e}")
+                }
+            }
             continue;
         }
 

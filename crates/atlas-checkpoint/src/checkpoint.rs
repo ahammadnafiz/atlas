@@ -291,3 +291,154 @@ pub fn has_unreachable_checkpoints(store: &Store, workspace_id: &str, repo: &Pat
         .into_iter()
         .any(|cp| cp.link_state == LinkState::Linked && !git::is_reachable(repo, &cp.commit_sha)))
 }
+
+/// What one reconciliation pass did.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ReconcileOutcome {
+    /// Re-pointed at the commit now carrying the same change. The developer
+    /// never notices these.
+    pub relinked: usize,
+    /// Marked orphaned: the commit is gone and nothing carrying the same change
+    /// could be identified.
+    pub orphaned: usize,
+    /// Previously orphaned, and reachable again — a reverted force-push.
+    pub recovered: usize,
+    /// Reconciliation was skipped because a rewrite was still in progress.
+    pub deferred: bool,
+}
+
+impl ReconcileOutcome {
+    /// Did this pass orphan enough Checkpoints at once to be worth telling the
+    /// developer about?
+    ///
+    /// A history-wide rewrite (`git filter-repo`, a rebase of everything)
+    /// orphans in bulk. That is correct behaviour, but discovering it link by
+    /// link is not — the capture-health signal reports it once so the developer
+    /// learns *why* their timeline just changed.
+    pub fn is_mass_orphan(&self) -> bool {
+        self.orphaned >= MASS_ORPHAN_THRESHOLD
+    }
+}
+
+/// Orphaning at least this many Checkpoints in one pass is a history-wide
+/// rewrite rather than an ordinary squash.
+pub const MASS_ORPHAN_THRESHOLD: usize = 5;
+
+/// Re-attach Checkpoints whose commits were rewritten.
+///
+/// Most developers rewrite history before pushing — `git pull --rebase`, an
+/// interactive rebase to tidy a series, an `--amend` to fix a typo — and each
+/// rewrites every commit hash involved. Without this, every Checkpoint recorded
+/// against those hashes points at a commit that is no longer reachable. Nothing
+/// errors; the links just rot, and "trace any change back to the Session that
+/// produced it" becomes quietly false.
+///
+/// The mechanism is git's own stable patch-id, which hashes the **diff** rather
+/// than the commit — so the same change under a new hash hashes identically.
+/// This is how git itself detects already-applied commits during a rebase.
+///
+/// Safe and cheap to call on every ref movement: it does nothing when every
+/// Checkpoint's commit is still reachable.
+pub fn reconcile_rewrites(store: &Store, workspace_id: &str, repo: &Path) -> Result<ReconcileOutcome> {
+    use crate::model::LinkState;
+
+    let mut outcome = ReconcileOutcome::default();
+    if !git::is_repository(repo) {
+        return Ok(outcome);
+    }
+
+    // Mid-rebase the old commits are already detached and the new ones do not
+    // exist yet. Orphaning in that window would be premature — and orphaning is
+    // not a thing to do speculatively. The next ref movement, when the rewrite
+    // has finished, reconciles correctly.
+    if git::rewrite_in_progress(repo) {
+        outcome.deferred = true;
+        return Ok(outcome);
+    }
+
+    let checkpoints = store.checkpoints_for_workspace(workspace_id)?;
+    if checkpoints.is_empty() {
+        return Ok(outcome);
+    }
+
+    // Built once for the whole pass rather than per Checkpoint — an interactive
+    // rebase touches every Checkpoint on the branch at the same time.
+    let mut patch_ids: Option<std::collections::HashMap<String, Vec<String>>> = None;
+
+    for checkpoint in checkpoints {
+        let reachable = git::is_reachable(repo, &checkpoint.commit_sha);
+
+        match checkpoint.link_state {
+            // A previously orphaned Checkpoint whose commit is reachable again —
+            // a reverted force-push. Re-link it rather than leaving the record
+            // pessimistic.
+            LinkState::Orphaned if reachable => {
+                store.relink_checkpoint(&checkpoint.id, &checkpoint.commit_sha)?;
+                outcome.recovered += 1;
+                continue;
+            }
+            LinkState::Orphaned => continue,
+            LinkState::Linked if reachable => continue,
+            LinkState::Linked => {}
+        }
+
+        // The commit is gone. Look for one carrying the same change.
+        let Some(patch_id) = &checkpoint.patch_id else {
+            // No patch-id means an empty diff, which can neither donate nor
+            // receive a re-point.
+            store.orphan_checkpoint(&checkpoint.id)?;
+            outcome.orphaned += 1;
+            continue;
+        };
+
+        let map = patch_ids
+            .get_or_insert_with(|| git::patch_id_map(repo, RECOVERY_SCAN_LIMIT));
+
+        match resolve_candidate(repo, map.get(patch_id), checkpoint.branch.as_deref()) {
+            Some(commit) => {
+                store.relink_checkpoint(&checkpoint.id, &commit)?;
+                outcome.relinked += 1;
+            }
+            None => {
+                // A squash collapses several patches into one that matches none
+                // of them; a differently-resolved conflict changes the diff.
+                // Both are honest orphans — saying so beats attaching to the
+                // wrong commit, which silently corrupts a shared timeline.
+                store.orphan_checkpoint(&checkpoint.id)?;
+                outcome.orphaned += 1;
+            }
+        }
+    }
+
+    Ok(outcome)
+}
+
+/// Pick the commit a Checkpoint should re-point at, or `None` to orphan.
+///
+/// patch-id is **not unique across history**. The classic collision is a
+/// cherry-pick: the same diff reachable at two commits on two branches. The rule
+/// is to prefer the branch the Checkpoint was recorded on, and to orphan rather
+/// than pick arbitrarily when that does not disambiguate — a wrong link silently
+/// corrupts a shared Organisation timeline, while an orphan is honest and
+/// recoverable.
+fn resolve_candidate(
+    repo: &Path,
+    candidates: Option<&Vec<String>>,
+    recorded_branch: Option<&str>,
+) -> Option<String> {
+    let candidates = candidates?;
+    match candidates.len() {
+        0 => None,
+        1 => Some(candidates[0].clone()),
+        _ => {
+            let branch = recorded_branch?;
+            let on_branch: Vec<&String> = candidates
+                .iter()
+                .filter(|sha| git::branches_containing(repo, sha).iter().any(|b| b == branch))
+                .collect();
+            // Still ambiguous after the branch preference — two commits with the
+            // same diff on the same branch. Orphan rather than guess.
+            (on_branch.len() == 1).then(|| on_branch[0].clone())
+        }
+    }
+}

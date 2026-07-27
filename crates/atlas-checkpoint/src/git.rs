@@ -187,6 +187,74 @@ pub fn recent_commits(repo: &Path, limit: usize) -> Result<Vec<String>> {
     Ok(out.lines().map(str::trim).filter(|l| !l.is_empty()).map(str::to_string).collect())
 }
 
+/// Is a history rewrite in progress right now?
+///
+/// Mid-rebase, commits are transiently unreachable — the old ones are already
+/// detached and the new ones do not exist yet. Reconciling in that window would
+/// orphan Checkpoints that are about to be perfectly fine, and orphaning is not
+/// something to do speculatively.
+///
+/// The watcher deliberately does not *watch* these directories (ref movement is
+/// a sufficient trigger, and a completed rebase always moves refs), but checking
+/// for them costs two `stat`s and turns "tolerate firing mid-rebase" from a hope
+/// into a guarantee.
+pub fn rewrite_in_progress(repo: &Path) -> bool {
+    let git_dir = repo.join(".git");
+    ["rebase-merge", "rebase-apply", "CHERRY_PICK_HEAD", "MERGE_HEAD"]
+        .iter()
+        .any(|marker| git_dir.join(marker).exists())
+}
+
+/// The most recent `limit` commits across **every** ref, newest first.
+///
+/// Distinct from [`recent_commits`], which follows the current branch's first
+/// parent. A rewritten commit does not necessarily land on the branch that is
+/// checked out — and the ambiguity that matters most, a cherry-pick, is by
+/// definition the same diff on *two different branches*. Scanning only HEAD
+/// would make that collision invisible and the re-match would confidently pick
+/// the one candidate it happened to see.
+pub fn recent_commits_all_refs(repo: &Path, limit: usize) -> Result<Vec<String>> {
+    let out = run(repo, &["rev-list", "--all", "--max-count", &limit.to_string()])?;
+    Ok(out.lines().map(str::trim).filter(|l| !l.is_empty()).map(str::to_string).collect())
+}
+
+/// Every reachable commit's patch-id, as `patch_id -> [commit, …]`.
+///
+/// One pass rather than a `patch-id` invocation per candidate: a reconciliation
+/// after an interactive rebase has to consider every rewritten commit against
+/// every affected Checkpoint, and doing that pairwise would be quadratic in
+/// subprocess spawns.
+pub fn patch_id_map(repo: &Path, limit: usize) -> std::collections::HashMap<String, Vec<String>> {
+    let mut map: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+    let Ok(commits) = recent_commits_all_refs(repo, limit) else {
+        return map;
+    };
+    for commit in commits {
+        // `None` for an empty diff, which is exactly right: the patch-id of an
+        // empty diff is a constant, so letting empty commits into this map would
+        // make every one of them a candidate match for every other.
+        if let Some(id) = patch_id(repo, &commit) {
+            map.entry(id).or_default().push(commit);
+        }
+    }
+    map
+}
+
+/// The branches a commit is on.
+///
+/// Used to break a patch-id tie: the classic ambiguity is a cherry-pick, where
+/// the same diff is reachable at two commits on two branches.
+pub fn branches_containing(repo: &Path, sha: &str) -> Vec<String> {
+    let Ok(out) = run(repo, &["branch", "--format=%(refname:short)", "--contains", sha]) else {
+        return Vec::new();
+    };
+    out.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('('))
+        .map(str::to_string)
+        .collect()
+}
+
 pub fn commit_info(repo: &Path, sha: &str) -> Result<CommitInfo> {
     // Unit-separator delimited so an author name containing the delimiter is
     // not a parsing hazard.
@@ -610,6 +678,40 @@ mod tests {
 
         repo.git(&["reset", "--hard", "HEAD~1"]);
         assert!(!is_reachable(repo.path(), &before));
+    }
+
+    #[test]
+    fn the_all_refs_scan_sees_commits_that_are_not_on_the_current_branch() {
+        // The reason reconciliation cannot scan HEAD alone: a cherry-pick puts
+        // the same diff on another branch, and a candidate scan that misses it
+        // would confidently re-point at the one commit it happened to see.
+        let repo = TestRepo::new();
+        repo.write("a.rs", "one\n");
+        repo.commit_all("initial");
+        repo.git(&["checkout", "-b", "side"]);
+        repo.write("side.rs", "side\n");
+        let side = repo.commit_all("only on side");
+        repo.git(&["checkout", "main"]);
+
+        assert!(
+            !recent_commits(repo.path(), 50).unwrap().contains(&side),
+            "the first-parent scan follows only the current branch"
+        );
+        assert!(
+            recent_commits_all_refs(repo.path(), 50).unwrap().contains(&side),
+            "the all-refs scan must see it"
+        );
+    }
+
+    #[test]
+    fn a_rewrite_in_progress_is_detected_from_gits_own_markers() {
+        let repo = TestRepo::new();
+        repo.write("a.rs", "one\n");
+        repo.commit_all("initial");
+        assert!(!rewrite_in_progress(repo.path()));
+
+        std::fs::create_dir_all(repo.path().join(".git/rebase-merge")).unwrap();
+        assert!(rewrite_in_progress(repo.path()));
     }
 
     #[test]
