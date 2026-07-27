@@ -100,6 +100,13 @@ pub struct HostSignals {
     /// Whether this Workspace *needs* a watcher — a non-git Workspace never has
     /// one and is perfectly healthy without it.
     pub expects_watcher: bool,
+    /// Whether **this process** holds the Workspace's writer lock.
+    ///
+    /// Passed in rather than read off the store, because health is evaluated
+    /// against a read-only connection that never asked for the lock — asking it
+    /// would always answer "no" and report a second window that does not exist.
+    /// Only the host's store registry knows the real answer.
+    pub is_writer: bool,
 }
 
 /// Compute the current health of a Workspace.
@@ -126,7 +133,7 @@ pub fn evaluate(store: &Store, workspace_id: &str, host: HostSignals) -> Result<
 
     // ── Stopped: not recording at all ───────────────────────────────────────
 
-    if !store.is_writer() {
+    if !host.is_writer {
         issues.push(HealthIssue {
             state: HealthState::Stopped,
             reason: "Another Atlas window is recording this Workspace.".into(),

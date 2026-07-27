@@ -248,3 +248,48 @@ fn an_unknown_session_reads_as_absent_rather_than_an_error() {
     let store = store_in(dir.path());
     assert!(timeline::detail(&store, "as-nope", no_subjects).unwrap().is_none());
 }
+
+// ── Reading while another store in this process holds the writer lock ───────
+
+#[test]
+fn a_reader_never_takes_the_writer_lock_from_the_store_that_holds_it() {
+    // The bug this pins: the host opened a second `Store` on the same directory
+    // for every command, which contended with its own capture worker for the
+    // writer lock and lost. `capture_enable` then reported "another Atlas window
+    // is already recording this workspace" — naming a window that did not exist
+    // — and could never succeed on a Workspace the user had sent a prompt in.
+    let dir = tempfile::tempdir().unwrap();
+    let (writer, session_id) = seeded(dir.path());
+    assert!(writer.is_writer(), "the first store must hold the lock");
+
+    let reader = Store::open_reader(dir.path().join(".atlas")).expect("reader opens");
+    assert!(!reader.is_writer(), "a reader must never claim the lock");
+    // And crucially, the writer still holds it.
+    assert!(writer.is_writer(), "opening a reader must not disturb the writer");
+
+    // The reader sees everything the writer wrote.
+    let sessions = timeline::sessions(&reader, WORKSPACE).unwrap();
+    assert_eq!(sessions.len(), 1);
+    assert!(timeline::detail(&reader, &session_id, no_subjects).unwrap().is_some());
+}
+
+#[test]
+fn the_writer_keeps_writing_while_a_reader_is_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut writer = store_in(dir.path());
+    let reader = Store::open_reader(dir.path().join(".atlas")).expect("reader opens");
+
+    // A write taken *after* the reader attached must still succeed — this is
+    // what `require_writer` was rejecting.
+    let session_id = {
+        let mut capture = Capture::new(&mut writer, WorkspaceMode::Local);
+        capture
+            .record_prompt(&key("after-reader"), "Still recording", 1, None, None, None)
+            .expect("the writer keeps its lock while a reader is attached")
+    };
+
+    // WAL: the reader opened before the write still sees it on a fresh query.
+    let sessions = timeline::sessions(&reader, WORKSPACE).unwrap();
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].id, session_id);
+}

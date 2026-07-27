@@ -44,18 +44,55 @@ impl Store {
     /// remain able to *browse* the timeline. Capture checks
     /// [`Store::is_writer`] and defers rather than double-writing.
     pub fn open(atlas_dir: impl AsRef<Path>) -> Result<Self> {
-        let root = atlas_dir.as_ref().to_path_buf();
-        fs::create_dir_all(&root).map_err(|e| Error::Storage(format!("{}: {e}", root.display())))?;
-        ensure_self_ignored(&root);
+        Self::open_inner(atlas_dir.as_ref(), true, true)
+    }
 
-        let writer_lock = match WriterLock::acquire(&root.join("sessions.lock")) {
-            Ok(lock) => Some(lock),
-            Err(Error::AlreadyLocked) => None,
-            Err(e) => return Err(e),
+    /// Open the store for reading only, without touching the writer lock.
+    ///
+    /// The writer lock arbitrates between **processes**. A second `Store` opened
+    /// inside the *same* process contends for it exactly as hard as a second
+    /// window would, and loses — so a read path that used [`Store::open`] would
+    /// make the host lock itself out of its own Workspace and then report
+    /// "another Atlas window is already recording", which is both false and
+    /// unactionable.
+    ///
+    /// So reads get their own connection and never ask for the lock. WAL is what
+    /// makes that safe: a reader sees a consistent snapshot and neither blocks
+    /// the writer nor is blocked by it.
+    ///
+    /// [`Store::is_writer`] is always `false` here, and that answer is
+    /// meaningless — a reader was never trying to be the writer. Anything that
+    /// needs to know whether *this process* holds the lock must ask the owner of
+    /// the writing store, not a reader.
+    ///
+    /// Unlike [`Store::open`] this **creates nothing** and errors if the store
+    /// does not exist. Capture is opt-in, and a read — listing Sessions, polling
+    /// a status line — must never be what silently plants an `.atlas/` directory
+    /// in a Workspace the developer never enabled.
+    pub fn open_reader(atlas_dir: impl AsRef<Path>) -> Result<Self> {
+        Self::open_inner(atlas_dir.as_ref(), false, false)
+    }
+
+    fn open_inner(atlas_dir: &Path, take_lock: bool, create: bool) -> Result<Self> {
+        let root = atlas_dir.to_path_buf();
+        if create {
+            fs::create_dir_all(&root)
+                .map_err(|e| Error::Storage(format!("{}: {e}", root.display())))?;
+            ensure_self_ignored(&root);
+        }
+
+        let writer_lock = if take_lock {
+            match WriterLock::acquire(&root.join("sessions.lock")) {
+                Ok(lock) => Some(lock),
+                Err(Error::AlreadyLocked) => None,
+                Err(e) => return Err(e),
+            }
+        } else {
+            None
         };
 
         let db_path = root.join("sessions.db");
-        let conn = Self::open_connection(&db_path)?;
+        let conn = Self::open_connection(&db_path, create)?;
         schema::migrate(&conn)?;
 
         let store = Self {
@@ -73,8 +110,18 @@ impl Store {
         Ok(store)
     }
 
-    fn open_connection(db_path: &Path) -> Result<Connection> {
-        let conn = Connection::open(db_path)
+    fn open_connection(db_path: &Path, create: bool) -> Result<Connection> {
+        // A reader opens read-write-without-create rather than read-only: the
+        // schema migration below is idempotent and must still be able to run on
+        // a database written by an older build, but a *missing* database is an
+        // absent Workspace and must stay absent.
+        let mut flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+            | rusqlite::OpenFlags::SQLITE_OPEN_URI
+            | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        if create {
+            flags |= rusqlite::OpenFlags::SQLITE_OPEN_CREATE;
+        }
+        let conn = Connection::open_with_flags(db_path, flags)
             .map_err(|e| Error::Storage(format!("{}: {e}", db_path.display())))?;
 
         // WAL so a reader (the timeline) never blocks the writer (capture), and

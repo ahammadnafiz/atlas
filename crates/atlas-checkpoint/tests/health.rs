@@ -14,12 +14,12 @@ const WORKSPACE: &str = "ws-atlas";
 
 /// A Workspace whose git watcher is attached and healthy.
 fn watching() -> HostSignals {
-    HostSignals { watcher_attached: true, expects_watcher: true }
+    HostSignals { watcher_attached: true, expects_watcher: true, is_writer: true }
 }
 
 /// A Workspace that needs no watcher — not a git repository.
 fn no_watcher_needed() -> HostSignals {
-    HostSignals { watcher_attached: false, expects_watcher: false }
+    HostSignals { watcher_attached: false, expects_watcher: false, is_writer: true }
 }
 
 fn store_in(root: &Path) -> Store {
@@ -222,7 +222,7 @@ fn a_dead_watcher_moves_the_workspace_to_stopped() {
     init_repo(dir.path());
     let store = bound(dir.path());
 
-    let stopped = HostSignals { watcher_attached: false, expects_watcher: true };
+    let stopped = HostSignals { watcher_attached: false, expects_watcher: true, is_writer: true };
     let health = health(&store, stopped);
 
     assert_eq!(health.state, HealthState::Stopped);
@@ -271,7 +271,12 @@ fn a_second_window_reports_stopped_rather_than_silently_not_recording() {
     let second = store_in(dir.path());
     assert!(!second.is_writer());
 
-    let health = health(&second, no_watcher_needed());
+    // Writer-ness is a host signal, not something read off the store: the health
+    // read runs against a reader connection that never asked for the lock.
+    let health = health(
+        &second,
+        HostSignals { watcher_attached: false, expects_watcher: false, is_writer: false },
+    );
     assert_eq!(health.state, HealthState::Stopped);
     assert!(
         health.issues.iter().any(|i| i.reason.contains("Another Atlas window")),
@@ -338,7 +343,7 @@ impl HealthSignalsBoth<'_> {
         evaluate_health(
             self.0,
             WORKSPACE,
-            HostSignals { watcher_attached: false, expects_watcher: true },
+            HostSignals { watcher_attached: false, expects_watcher: true, is_writer: true },
         )
         .expect("health evaluates")
     }

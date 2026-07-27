@@ -31,7 +31,7 @@
 //! immediately, and turns are written in the order they happened.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
@@ -152,12 +152,40 @@ pub struct CaptureState {
     pending_writes: Mutex<HashMap<String, Vec<PendingWrite>>>,
     /// How the drain gets an access token. Shared with the worker.
     token: TokenProvider,
+    /// Every writing session store this process has open.
+    stores: StoreRegistry,
     tx: mpsc::Sender<Job>,
 }
 
 /// A late-bound source of access tokens, shared between the command surface and
 /// the capture worker.
 type TokenProvider = Arc<Mutex<Option<Box<dyn Fn() -> Option<String> + Send>>>>;
+
+/// One writing [`Store`] per Workspace root, for the whole process.
+///
+/// This exists because the writer lock arbitrates between **processes**, and the
+/// first version of this module gave one process two stores per Workspace: the
+/// worker cached one for its lifetime, and every command opened another. The
+/// command's store lost the race for the lock and reported "another Atlas window
+/// is already recording this workspace" — naming a window that did not exist,
+/// and making `capture_enable` fail permanently on any Workspace the user had
+/// ever sent a prompt in.
+///
+/// So: exactly one writer per root, shared. Reads do not come through here at
+/// all — they open their own connection via [`Store::open_reader`], so listing
+/// Sessions never waits behind a long import.
+type StoreRegistry = Arc<Mutex<HashMap<PathBuf, StoreHandle>>>;
+
+/// A shared store, plus the one fact about it that must be readable without
+/// waiting for whatever is currently using it.
+#[derive(Clone)]
+struct StoreHandle {
+    store: Arc<Mutex<Store>>,
+    /// Whether this process took the Workspace's writer lock, cached at open
+    /// time. A status read must be able to answer this while the worker is
+    /// midway through a multi-minute import.
+    is_writer: bool,
+}
 
 impl CaptureState {
     /// `token` mints a fresh access token for the drain. A closure rather than a
@@ -171,20 +199,44 @@ impl CaptureState {
         // instead of failing it, and is exactly Local-mode behaviour.
         let token: TokenProvider = Arc::new(Mutex::new(None));
         let token_for_worker = token.clone();
+        let stores: StoreRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let stores_for_worker = stores.clone();
         // Unbounded on purpose. A bounded channel would have to choose between
         // blocking the emit thread and dropping a turn, and both are worse than
         // holding a few queued turns in memory — the worker drains them in
         // milliseconds.
         std::thread::Builder::new()
             .name("atlas-capture".into())
-            .spawn(move || worker(rx, token_for_worker))
+            .spawn(move || worker(rx, token_for_worker, stores_for_worker))
             .expect("capture worker thread");
         Self {
             sessions: Mutex::new(HashMap::new()),
             pending_writes: Mutex::new(HashMap::new()),
             token,
+            stores,
             tx,
         }
+    }
+
+    /// The process's writing store for this Workspace, opening it if needed.
+    ///
+    /// Every write path — binding, promotion, the worker's own jobs — must go
+    /// through this. Opening a second `Store` on the same root inside this
+    /// process is what produced the phantom "another Atlas window" error.
+    fn writer(&self, root: &Path) -> Result<Arc<Mutex<Store>>, String> {
+        Ok(open_in(&self.stores, root)?.store)
+    }
+
+    /// Does this process hold the Workspace's writer lock?
+    ///
+    /// Answers `false` for a Workspace nothing has opened yet, which is correct:
+    /// nothing is recording it, and nothing is claiming to.
+    fn holds_writer_lock(&self, root: &Path) -> bool {
+        self.stores
+            .lock()
+            .expect("store registry")
+            .get(root)
+            .is_some_and(|handle| handle.is_writer)
     }
 
     /// Install the credential source the drain uses.
@@ -365,7 +417,9 @@ pub fn capture_detect(project_path: String) -> Result<atlas_checkpoint::Workspac
 /// How this Workspace is bound, or `null` if capture was never enabled.
 #[tauri::command]
 pub fn capture_binding(project_path: String) -> Result<Option<atlas_checkpoint::Binding>, String> {
-    let store = open_store(&project_path)?;
+    let Some(store) = open_reader(&project_path)? else {
+        return Ok(None);
+    };
     store.binding().map_err(|e| e.to_string())
 }
 
@@ -382,7 +436,11 @@ pub fn capture_enable(
     let mode = WorkspaceMode::parse(&mode)
         .ok_or_else(|| format!("unknown workspace mode: {mode}"))?;
     let root = std::path::Path::new(&project_path);
-    let store = open_store(&project_path)?;
+    // The process-wide writer, not a second store on the same directory: that
+    // is what used to lose the writer lock to Atlas's own capture worker and
+    // report a nonexistent second window.
+    let handle = app.state::<CaptureState>().writer(root)?;
+    let store = handle.lock().expect("session store");
 
     let binding = atlas_checkpoint::bind(&store, &project_path, root, mode)
         .map_err(|e| e.to_string())?;
@@ -414,10 +472,10 @@ pub fn capture_enable(
 pub fn capture_import_preview(
     project_path: String,
 ) -> Result<atlas_checkpoint::ImportPreview, String> {
-    let store = open_store(&project_path)?;
+    let store = open_reader(&project_path)?;
     let mode = store
-        .binding()
-        .map_err(|e| e.to_string())?
+        .as_ref()
+        .and_then(|s| s.binding().ok().flatten())
         .map(|b| b.mode)
         .unwrap_or(WorkspaceMode::Local);
     let root = std::path::Path::new(&project_path);
@@ -441,9 +499,13 @@ pub fn capture_import_confirm(project_path: String, app: AppHandle) -> Result<()
 /// Checkpoints without a restart, which it can only do once the fingerprint it
 /// had no way to know is filled in.
 #[tauri::command]
-pub fn capture_refresh(project_path: String) -> Result<Option<atlas_checkpoint::Binding>, String> {
+pub fn capture_refresh(
+    project_path: String,
+    app: AppHandle,
+) -> Result<Option<atlas_checkpoint::Binding>, String> {
     let root = std::path::Path::new(&project_path);
-    let store = open_store(&project_path)?;
+    let handle = app.state::<CaptureState>().writer(root)?;
+    let store = handle.lock().expect("session store");
     let binding = atlas_checkpoint::refresh_detection(&store, root).map_err(|e| e.to_string())?;
     if let Some(binding) = &binding {
         let _ = atlas_checkpoint::walk_new_commits(&store, &project_path, root, binding.mode);
@@ -453,8 +515,10 @@ pub fn capture_refresh(project_path: String) -> Result<Option<atlas_checkpoint::
 
 /// Stop capturing. Nothing already recorded is deleted.
 #[tauri::command]
-pub fn capture_disable(project_path: String) -> Result<(), String> {
-    atlas_checkpoint::disable(&open_store(&project_path)?).map_err(|e| e.to_string())
+pub fn capture_disable(project_path: String, app: AppHandle) -> Result<(), String> {
+    let handle = app.state::<CaptureState>().writer(std::path::Path::new(&project_path))?;
+    let store = handle.lock().expect("session store");
+    atlas_checkpoint::disable(&store).map_err(|e| e.to_string())
 }
 
 /// Initialise a repository in a non-git Workspace, then re-detect.
@@ -462,7 +526,10 @@ pub fn capture_disable(project_path: String) -> Result<(), String> {
 /// Framed in the UI as unlocking commit linkage rather than as a requirement,
 /// because that is what it is: Sessions are captured either way.
 #[tauri::command]
-pub fn capture_git_init(project_path: String) -> Result<Option<atlas_checkpoint::Binding>, String> {
+pub fn capture_git_init(
+    project_path: String,
+    app: AppHandle,
+) -> Result<Option<atlas_checkpoint::Binding>, String> {
     let status = std::process::Command::new("git")
         .arg("-C")
         .arg(&project_path)
@@ -472,7 +539,7 @@ pub fn capture_git_init(project_path: String) -> Result<Option<atlas_checkpoint:
     if !status.status.success() {
         return Err(String::from_utf8_lossy(&status.stderr).trim().to_string());
     }
-    capture_refresh(project_path)
+    capture_refresh(project_path, app)
 }
 
 /// The capture-health state for a Workspace.
@@ -486,9 +553,25 @@ pub fn capture_health(
     project_path: String,
     workspace_id: Option<String>,
     watchers: tauri::State<'_, super::git_watcher::GitWatcherState>,
+    capture: tauri::State<'_, CaptureState>,
 ) -> Result<atlas_checkpoint::CaptureHealth, String> {
     let root = std::path::Path::new(&project_path);
-    let store = open_store(&project_path)?;
+    // A reader, so a status poll never waits behind an import — and therefore
+    // one that cannot answer whether this process holds the writer lock. The
+    // registry is asked instead; a reader's own `is_writer` is always false and
+    // would report a second window on every single Workspace.
+    let Some(store) = open_reader(&project_path)? else {
+        // Nothing has ever been captured here. That is the `Off` state, and
+        // computing it needs no store.
+        return Ok(atlas_checkpoint::CaptureHealth {
+            state: atlas_checkpoint::HealthState::Off,
+            summary: "Session capture is off".into(),
+            issues: Vec::new(),
+            flagged_sessions: 0,
+            failed_rows: 0,
+            pending_rows: 0,
+        });
+    };
 
     let expects_watcher = atlas_checkpoint::git::is_repository(root);
     let watcher_attached = expects_watcher
@@ -497,7 +580,11 @@ pub fn capture_health(
     atlas_checkpoint::evaluate_health(
         &store,
         &project_path,
-        atlas_checkpoint::HostSignals { watcher_attached, expects_watcher },
+        atlas_checkpoint::HostSignals {
+            watcher_attached,
+            expects_watcher,
+            is_writer: capture.holds_writer_lock(root),
+        },
     )
     .map_err(|e| e.to_string())
 }
@@ -513,7 +600,9 @@ pub fn artifacts_sessions(
     project_path: String,
     workspace_id: Option<String>,
 ) -> Result<Vec<atlas_checkpoint::SessionSummary>, String> {
-    let store = open_store(&project_path)?;
+    let Some(store) = open_reader(&project_path)? else {
+        return Ok(Vec::new());
+    };
     let workspace_id = workspace_id.unwrap_or_else(|| project_path.clone());
     atlas_checkpoint::session_summaries(&store, &workspace_id).map_err(|e| e.to_string())
 }
@@ -530,7 +619,9 @@ pub fn artifacts_session(
     session_id: String,
 ) -> Result<Option<atlas_checkpoint::SessionDetail>, String> {
     let root = std::path::Path::new(&project_path).to_path_buf();
-    let store = open_store(&project_path)?;
+    let Some(store) = open_reader(&project_path)? else {
+        return Ok(None);
+    };
 
     // A Session usually carries a handful of Checkpoints, but one `git show` per
     // Checkpoint is still a process spawn each. Resolving them once up front
@@ -585,7 +676,8 @@ pub fn capture_register_cloud(
     slug: String,
     app: AppHandle,
 ) -> Result<atlas_checkpoint::Binding, String> {
-    let store = open_store(&project_path)?;
+    let handle = app.state::<CaptureState>().writer(std::path::Path::new(&project_path))?;
+    let store = handle.lock().expect("session store");
     let binding = store
         .binding()
         .map_err(|e| e.to_string())?
@@ -685,7 +777,8 @@ pub fn capture_connect(
     slug: String,
     app: AppHandle,
 ) -> Result<atlas_checkpoint::Binding, String> {
-    let store = open_store(&project_path)?;
+    let handle = app.state::<CaptureState>().writer(std::path::Path::new(&project_path))?;
+    let store = handle.lock().expect("session store");
     store
         .set_cloud_binding(&org_id, &slug)
         .map_err(|e| e.to_string())?;
@@ -705,7 +798,8 @@ pub fn capture_connect(
 /// otherwise know what they are about to publish.
 #[tauri::command]
 pub fn capture_promotion_preview(project_path: String) -> Result<PromotionPreview, String> {
-    let store = open_store(&project_path)?;
+    let store = open_reader(&project_path)?
+        .ok_or("enable capture for this Workspace first")?;
     let sessions = store
         .sessions_for_workspace(&project_path)
         .map_err(|e| e.to_string())?;
@@ -752,7 +846,8 @@ pub fn capture_promote(
     // as it was: still Local, still captured, nothing sent.
     capture_register_cloud(project_path.clone(), org_id, slug, app.clone())?;
 
-    let store = open_store(&project_path)?;
+    let handle = app.state::<CaptureState>().writer(std::path::Path::new(&project_path))?;
+    let store = handle.lock().expect("session store");
     let moved = store
         .promote_local_rows(&project_path)
         .map_err(|e| e.to_string())?;
@@ -793,8 +888,22 @@ fn sync_config<'a>(
 ///
 /// A second window holding the writer lock still gets a readable store, so the
 /// popover renders; only the write paths refuse.
-fn open_store(project_path: &str) -> Result<Store, String> {
-    Store::open(atlas_checkpoint::atlas_dir(project_path)).map_err(|e| e.to_string())
+/// A read-only view of a Workspace's store, or `None` if it has none.
+///
+/// Its own connection, and deliberately **not** the writer: reading must never
+/// contend for the writer lock, and must never wait behind a multi-minute import
+/// holding the shared writing store. WAL makes both safe.
+///
+/// `None` rather than an empty store, because opening one would create it —
+/// and then merely looking at the Artifacts tab would plant an `.atlas/`
+/// directory in a Workspace nobody enabled.
+fn open_reader(project_path: &str) -> Result<Option<Store>, String> {
+    if !enabled_on_disk(Path::new(project_path)) {
+        return Ok(None);
+    }
+    Store::open_reader(atlas_checkpoint::atlas_dir(project_path))
+        .map(Some)
+        .map_err(|e| e.to_string())
 }
 
 /// Which capture path a session came from.
@@ -810,9 +919,58 @@ fn source_for(plugin_id: &str) -> Source {
     }
 }
 
-/// Owns every Workspace's store and does all the writing, in order.
-fn worker(rx: mpsc::Receiver<Job>, drain_token: TokenProvider) {
-    let mut stores: HashMap<PathBuf, Option<Store>> = HashMap::new();
+/// Has capture ever been enabled here?
+///
+/// Answered from the filesystem rather than from the store, because opening the
+/// store is itself what creates it. This is the guard that keeps an unbound
+/// Workspace free of an `.atlas/` directory it never asked for.
+fn enabled_on_disk(root: &Path) -> bool {
+    atlas_checkpoint::atlas_dir(root).join("sessions.db").exists()
+}
+
+/// Open (once) the process's writing store for a Workspace root.
+///
+/// Shared by the worker and by every write command, which is the whole point —
+/// see [`StoreRegistry`]. A Workspace whose store cannot be opened at all is
+/// reported and not retried on this call; the next one tries again.
+fn open_in(stores: &StoreRegistry, root: &Path) -> Result<StoreHandle, String> {
+    let mut registry = stores.lock().expect("store registry");
+    if let Some(handle) = registry.get(root) {
+        return Ok(handle.clone());
+    }
+
+    let store = Store::open(atlas_checkpoint::atlas_dir(root)).map_err(|e| {
+        tracing::error!(
+            target: "atlas::capture",
+            workspace = %root.display(),
+            "session store unavailable: {e}"
+        );
+        e.to_string()
+    })?;
+
+    let is_writer = store.is_writer();
+    if !is_writer {
+        // A genuinely different process owns this Workspace. Deferring is the
+        // whole point of the lock: two writers corrupt the outbox state machine.
+        tracing::info!(
+            target: "atlas::capture",
+            workspace = %root.display(),
+            "another Atlas process is recording this workspace; capture deferred"
+        );
+    }
+
+    let handle = StoreHandle { store: Arc::new(Mutex::new(store)), is_writer };
+    registry.insert(root.to_path_buf(), handle.clone());
+    Ok(handle)
+}
+
+/// Does all the writing, in order.
+///
+/// The stores are owned by the shared registry rather than by this thread. The
+/// worker takes a store's mutex for the duration of one job and releases it, so
+/// a write command issued while the worker is idle does not have to wait for the
+/// worker to notice — and, more importantly, does not open a competing store.
+fn worker(rx: mpsc::Receiver<Job>, drain_token: TokenProvider, stores: StoreRegistry) {
     // Session ids are assigned by the store on first write and reused after.
     let mut session_ids: HashMap<String, String> = HashMap::new();
 
@@ -825,14 +983,22 @@ fn worker(rx: mpsc::Receiver<Job>, drain_token: TokenProvider) {
         let job = match rx.recv_timeout(IMPORT_SCAN_INTERVAL) {
             Ok(job) => job,
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                for root in stores.keys().cloned().collect::<Vec<_>>() {
-                    if let Some(Some(store)) = stores.get_mut(&root) {
-                        import_for(store, &root);
-                        // Reconnecting requires no action from the developer:
-                        // the same tick that scans for transcripts retries the
-                        // outbox.
-                        drain_for(store, &root, &drain_token);
-                    }
+                let open: Vec<(PathBuf, StoreHandle)> = stores
+                    .lock()
+                    .expect("store registry")
+                    .iter()
+                    .filter(|(_, handle)| handle.is_writer)
+                    .map(|(root, handle)| (root.clone(), handle.clone()))
+                    .collect();
+                // The registry lock is released before the work starts: an
+                // import can run for minutes, and holding the map would stall
+                // every other Workspace behind one of them.
+                for (root, handle) in open {
+                    let mut store = handle.store.lock().expect("session store");
+                    import_for(&mut store, &root);
+                    // Reconnecting requires no action from the developer: the
+                    // same tick that scans for transcripts retries the outbox.
+                    drain_for(&mut store, &root, &drain_token);
                 }
                 continue;
             }
@@ -854,41 +1020,26 @@ fn worker(rx: mpsc::Receiver<Job>, drain_token: TokenProvider) {
                 (Some(binding.clone()), binding.workspace_root.clone())
             }
         };
-        let store = stores.entry(root.clone()).or_insert_with(|| {
-            match Store::open(atlas_checkpoint::atlas_dir(&root)) {
-                Ok(store) => {
-                    if !store.is_writer() {
-                        // Another window owns this Workspace. Deferring is the
-                        // whole point of the lock: two writers corrupt the
-                        // outbox state machine.
-                        tracing::info!(
-                            target: "atlas::capture",
-                            workspace = %root.display(),
-                            "another window is recording this workspace; capture deferred"
-                        );
-                    }
-                    Some(store)
-                }
-                Err(e) => {
-                    tracing::error!(
-                        target: "atlas::capture",
-                        workspace = %root.display(),
-                        "session store unavailable: {e}"
-                    );
-                    None
-                }
-            }
-        });
 
-        let Some(store) = store.as_mut() else { continue };
-        if !store.is_writer() {
+        // Capture is opt-in, and the check has to happen *before* the store is
+        // opened. `Store::open` creates `.atlas/` — so opening first and reading
+        // the binding second put an empty database in every directory the
+        // developer had ever run an agent in, which is precisely the surprise
+        // the binding check below was written to avoid. Only `capture_enable`
+        // creates the store; until it has, there is nothing here to record to.
+        if !enabled_on_disk(&root) {
             continue;
         }
 
-        // Capture is opt-in per Workspace, and pausing it must actually stop new
-        // records. An unbound Workspace records nothing at all: the developer
-        // has not asked for it, and writing a store for every directory they
-        // ever opened an agent in would be a surprise rather than a feature.
+        let Ok(handle) = open_in(&stores, &root) else { continue };
+        if !handle.is_writer {
+            continue;
+        }
+        let mut guard = handle.store.lock().expect("session store");
+        let store = &mut *guard;
+
+        // Bound but paused must also stop new records, and that answer does
+        // live in the store.
         let Ok(Some(workspace)) = store.binding() else {
             continue;
         };
