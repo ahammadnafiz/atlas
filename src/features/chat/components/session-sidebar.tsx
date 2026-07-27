@@ -13,7 +13,7 @@ import { toast } from "sonner";
 import { cn } from "@/lib/utils";
 import { stripInjectedContext } from "@/features/chat/lib/atlas-context";
 import { openNewAgentChat } from "@/features/chat/lib/open-agent-session";
-import { isBusyAgentStatus } from "@/types/agent";
+import { isBusyAgentStatus, agentTypeFromPluginId } from "@/types/agent";
 import { ClaudeIcon, CodexIcon } from "@/components/agent-icons";
 import { AtlasLoader } from "@/components/atlas-loader";
 import { timeAgo } from "@/lib/time-ago";
@@ -762,7 +762,12 @@ export function SessionSidebar({ tabId }: SessionSidebarProps) {
       hydrateSessionSnapshot(targetTabId, snapshot.status, snapshot.plan);
       // Seed the composer mode picker from the resumed session's advertised
       // modes (Codex). Claude ignores these in favour of its own pill.
-      setAcpModes(targetTabId, snapshot.current_mode, snapshot.available_modes);
+      setAcpModes(
+        targetTabId,
+        snapshot.current_mode,
+        snapshot.available_modes,
+        agentTypeFromPluginId(snapshot.plugin_id)
+      );
       // Seed the ACP model picker too (Claude Code / Codex). On resume the agent
       // may not re-advertise models, so setAcpModels falls back to the cache.
       if (snapshot.available_models.length > 0) {

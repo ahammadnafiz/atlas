@@ -10,7 +10,15 @@
 
 import type { SessionModeInfo } from "@/types/agents";
 
-const key = (agentType: string) => `atlas:acp-modes:${agentType}`;
+// v2: builds before this shipped a cache that could be written under the WRONG
+// agent — a stale Claude binding snapshotted while the tab had already been
+// relabelled to Codex stored Claude's modes (default/acceptEdits/plan/…) under
+// `codex`. Seeding from that left Codex on a mode id it does not have, so the
+// picker pill fell back to the literal "Mode" and every pick was rejected by the
+// agent. The version segment retires those poisoned entries instead of asking
+// people to clear storage; `setAcpModes` now gates the write on the snapshot's
+// own plugin id so they cannot be rewritten.
+const key = (agentType: string) => `atlas:acp-modes:v2:${agentType}`;
 
 export interface CachedAcpModes {
   currentMode: string | null;
@@ -23,7 +31,14 @@ export function loadCachedAcpModes(agentType: string): CachedAcpModes | null {
     const raw = localStorage.getItem(key(agentType));
     if (!raw) return null;
     const v = JSON.parse(raw) as CachedAcpModes;
-    if (Array.isArray(v?.availableModes) && v.availableModes.length > 0) return v;
+    if (!Array.isArray(v?.availableModes) || v.availableModes.length === 0) return null;
+    // A current mode that isn't one of the available ones is not usable: the
+    // picker would render its "Mode" fallback and the first pick would push an
+    // id the agent rejects. Keep the list, drop the orphan.
+    if (v.currentMode && !v.availableModes.some((m) => m.id === v.currentMode)) {
+      return { ...v, currentMode: null };
+    }
+    return v;
   } catch {
     // corrupt / unavailable storage — treat as a cache miss
   }

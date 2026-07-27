@@ -5,7 +5,7 @@ import { agents, ensureAgent, CODEX_PLUGIN_ID, CERSEI_PLUGIN_ID, DEFAULT_PLUGIN_
 import { loadCachedAcpModes } from "../lib/acp-modes-cache";
 import { warmAcpModels, otherAcpAgent } from "../lib/warm-acp-models";
 import type { ImageAttachment, SessionKey } from "@/types/agents";
-import { hasInFlightToolCalls, isBusyAgentStatus } from "@/types/agent";
+import { hasInFlightToolCalls, isBusyAgentStatus, agentTypeFromPluginId } from "@/types/agent";
 import {
   composePrompt,
   type MentionData,
@@ -242,7 +242,12 @@ export function ChatPanel({ tabId }: ChatPanelProps) {
             if (modes.length > 0) {
               useChatStore
                 .getState()
-                .actions.setAcpModes(tabId, snap.current_mode, modes);
+                .actions.setAcpModes(
+                  tabId,
+                  snap.current_mode,
+                  modes,
+                  agentTypeFromPluginId(snap.plugin_id)
+                );
             }
             // Seed the ACP model picker (Claude Code / Codex) from the snapshot's
             // advertised models. Empty when the agent exposes no model selection.
