@@ -299,10 +299,10 @@ function Header({ detail }: { detail: Detail }) {
           <span className="font-mono">
             {facts.length > 0 && <span className="pr-2 font-sans">·</span>}
             {s.insertions > 0 && (
-              <span className="text-[var(--status-success)]">+{s.insertions}</span>
+              <span className="text-[var(--stat-added)]">+{s.insertions}</span>
             )}
             {s.insertions > 0 && s.deletions > 0 && " / "}
-            {s.deletions > 0 && <span className="text-[var(--status-error)]">-{s.deletions}</span>}
+            {s.deletions > 0 && <span className="text-[var(--stat-removed)]">-{s.deletions}</span>}
           </span>
         )}
       </div>
@@ -649,13 +649,13 @@ function Checkpoint({ entry }: { entry: TimelineEntry }) {
       {(entry.insertions > 0 || entry.deletions > 0) && (
         <span className="shrink-0 font-mono text-[11px]">
           {entry.insertions > 0 && (
-            <span className="text-[var(--status-success)]">+{entry.insertions}</span>
+            <span className="text-[var(--stat-added)]">+{entry.insertions}</span>
           )}
           {entry.insertions > 0 && entry.deletions > 0 && (
             <span className="text-[var(--text-ghost)]"> / </span>
           )}
           {entry.deletions > 0 && (
-            <span className="text-[var(--status-error)]">-{entry.deletions}</span>
+            <span className="text-[var(--stat-removed)]">-{entry.deletions}</span>
           )}
         </span>
       )}
