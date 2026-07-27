@@ -116,7 +116,7 @@ pub fn walk_new_commits(
     };
 
     let cursor = store.commit_cursor(workspace_id)?;
-    let candidates = store.link_candidates(workspace_id)?;
+    let mut candidates = store.link_candidates(workspace_id)?;
 
     if cursor.is_none() && candidates.is_empty() {
         // A first walk with nothing that could possibly link — the moment
@@ -148,7 +148,7 @@ pub fn walk_new_commits(
 
     for commit in &commits {
         outcome.checkpoints_created +=
-            link_commit(store, repo, commit, &candidates, branch.as_deref(), mode)?;
+            link_commit(store, repo, commit, &mut candidates, branch.as_deref(), mode)?;
 
         // Advance per commit rather than once at the end: a crash mid-walk then
         // resumes from the last commit whose Checkpoints are durably written,
@@ -191,7 +191,7 @@ fn link_commit(
     store: &Store,
     repo: &Path,
     commit_sha: &str,
-    candidates: &[LinkCandidate],
+    candidates: &mut [LinkCandidate],
     branch: Option<&str>,
     mode: WorkspaceMode,
 ) -> Result<usize> {
@@ -234,7 +234,7 @@ fn evaluate_commit(
     repo: &Path,
     commit_sha: &str,
     info: &git::CommitInfo,
-    candidates: &[LinkCandidate],
+    candidates: &mut [LinkCandidate],
     branch: Option<&str>,
     mode: WorkspaceMode,
 ) -> Result<usize> {
@@ -247,7 +247,7 @@ fn evaluate_commit(
     let mut stats = None;
     let mut patch_cache: Option<Option<String>> = None;
 
-    for candidate in candidates {
+    for candidate in candidates.iter_mut() {
         // Never link a commit to a Session that started after the commit was
         // created — the commit cannot contain work from a Session that did not
         // exist yet. This is what makes the bounded recovery re-scan safe:
@@ -292,9 +292,24 @@ fn evaluate_commit(
         // the commit resolved that path: work that landed (or was displaced)
         // must stop nominating the Session, or every later commit touching the
         // same file — purely human work included — would link to it forever.
-        // Consumed under the touch-side spelling, which is the one the store
-        // matches on.
-        store.consume_touches(&candidate.session_id, commit_sha, &matches.touched)?;
+        //
+        // Consumed under the touch-side spelling (the one the store matches
+        // on), and only up to the commit's own time: a touch made *after* this
+        // commit is later work the commit cannot have settled, and it stays
+        // live for the next commit — which is exactly how one Session spanning
+        // several commits produces one Checkpoint each. One second of slack
+        // covers git's second-resolution timestamps.
+        //
+        // Pruned from the in-memory candidate too: this walk's remaining
+        // commits share the candidate list, and a backlog walked in one batch
+        // (Atlas reopened after days away) must see the same consumption a
+        // commit-at-a-time walk would.
+        let up_to = chrono::DateTime::<chrono::Utc>::from_timestamp(info.commit_time + 1, 0)
+            .unwrap_or_else(chrono::Utc::now);
+        store.consume_touches(&candidate.session_id, commit_sha, &matches.touched, up_to)?;
+        candidate.touches.retain(|touch| {
+            !matches.touched.contains(&touch.path) || touch.created_at > up_to
+        });
     }
     Ok(created)
 }
@@ -304,8 +319,12 @@ struct PathMatches {
     /// Commit-side paths that passed the link rule — the Checkpoint's
     /// `files_touched`.
     linked: Vec<String>,
-    /// Touch-side paths the commit intersected at all, linked or not — the
-    /// paths this commit *settled*, and therefore the ones to consume.
+    /// Touch-side spellings of the linked paths — what consumption marks
+    /// spent. Only *linked* touches are consumed: a strict-arm mismatch means
+    /// the commit carries someone else's content for that path, and judging
+    /// the agent's touch "settled" on that evidence would let a commit that
+    /// merely predates the touch (a recovery re-scan, a same-second initial
+    /// commit) erase it before its real commit arrives.
     touched: Vec<String>,
 }
 
@@ -339,9 +358,9 @@ fn matching_paths(
             continue;
         };
 
-        matches.touched.push(touch.path.clone());
         if links(repo, commit_sha, change, touch) {
             matches.linked.push(change.path.clone());
+            matches.touched.push(touch.path.clone());
         }
     }
     matches.linked.sort();
@@ -362,9 +381,18 @@ fn links(repo: &Path, commit_sha: &str, change: &ChangedPath, touch: &FileTouch)
         return touch.deleted;
     }
 
-    if change.kind.existed_in_parent() {
+    if change.kind.existed_in_parent() && touch.existed_before {
         // The permissive arm. Humans routinely review and tweak agent output
         // before committing, and that is still agent-derived work.
+        //
+        // Both sides must agree the file predates the agent's write. Git's
+        // view alone is not enough: a file the agent *created* exists in the
+        // parent of every commit after the first one that carried it — so once
+        // a human replaced the agent's new file and committed, path-alone
+        // linking would credit every later human edit to the agent. When the
+        // touch says the agent created the file, only content can prove a
+        // commit carries the agent's work, so such touches always take the
+        // strict arm below.
         return true;
     }
 

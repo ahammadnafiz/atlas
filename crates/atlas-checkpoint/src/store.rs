@@ -1545,9 +1545,25 @@ impl Store {
         match existing {
             Some(target_id) if target_id != id => {
                 // The walk already created the row at the new sha. Keep that one
-                // (it carries the freshly-computed diff stats) and delete the
-                // stale row pointing at the rewritten-away commit.
-                tx.execute("DELETE FROM checkpoint WHERE id = ?1", [id])?;
+                // (it carries the freshly-computed diff stats). The stale row is
+                // deleted only if the server never saw it; a row already `sent`
+                // becomes an orphan tombstone that re-syncs, because deleting it
+                // locally would leave the server permanently claiming a live
+                // link to a commit that no longer exists.
+                let stale_state: String = tx.query_row(
+                    "SELECT sync_state FROM checkpoint WHERE id = ?1",
+                    [id],
+                    |row| row.get(0),
+                )?;
+                if stale_state == "sent" {
+                    tx.execute(
+                        "UPDATE checkpoint SET link_state = 'orphaned', sync_state = 'pending'
+                          WHERE id = ?1",
+                        [id],
+                    )?;
+                } else {
+                    tx.execute("DELETE FROM checkpoint WHERE id = ?1", [id])?;
+                }
                 tx.execute(
                     &format!(
                         "UPDATE checkpoint SET link_state = 'linked',
@@ -1730,11 +1746,19 @@ impl Store {
     /// them. From then on the touches no longer nominate the Session for later
     /// commits — the work landed; what happens to those files afterwards is not
     /// the Session's doing.
+    ///
+    /// Bounded by `up_to`: a commit consumes only touches that existed when it
+    /// was made. A Session that edits a file, sees it committed, edits it again
+    /// and sees that committed spans two commits — and must produce a
+    /// Checkpoint for each, even when both commits are walked in one batch
+    /// after Atlas was closed. The second touch postdates the first commit, so
+    /// the first commit cannot consume it.
     pub fn consume_touches(
         &self,
         session_id: &str,
         commit_sha: &str,
         paths: &[String],
+        up_to: DateTime<Utc>,
     ) -> Result<()> {
         if paths.is_empty() {
             return Ok(());
@@ -1744,8 +1768,9 @@ impl Store {
         for path in paths {
             tx.execute(
                 "UPDATE file_touch SET consumed_by_commit = ?3
-                  WHERE session_id = ?1 AND path = ?2 AND consumed_by_commit IS NULL",
-                rusqlite::params![session_id, path, commit_sha],
+                  WHERE session_id = ?1 AND path = ?2 AND consumed_by_commit IS NULL
+                    AND created_at <= ?4",
+                rusqlite::params![session_id, path, commit_sha, up_to.to_rfc3339()],
             )?;
         }
         tx.commit()?;

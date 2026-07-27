@@ -347,9 +347,16 @@ fn import_file(
             if value.get("isSidechain").and_then(serde_json::Value::as_bool) == Some(true) {
                 continue;
             }
+            // Meta lines are the harness talking to itself — injected context,
+            // command envelopes — not something the developer said. Importing
+            // them floods the timeline with machinery and, worse, lets a
+            // command caveat become a Session's title.
+            if value.get("isMeta").and_then(serde_json::Value::as_bool) == Some(true) {
+                continue;
+            }
 
             let created_at = line_timestamp(&value);
-            let turn = read_turn(&value);
+            let turn = read_turn(&value).filter(|t| !is_envelope(t));
             let tool_uses = read_tool_uses(&value);
             let tool_results = read_tool_results(&value);
             if turn.is_none() && tool_uses.is_empty() && tool_results.is_empty() {
@@ -534,6 +541,32 @@ struct ToolResult {
 }
 
 /// Pull a turn out of a transcript line, or `None` if it carries no content.
+/// Is this parsed turn a harness envelope rather than conversation?
+///
+/// Command wrappers, local-command caveats and interruption markers arrive as
+/// `user` lines but were never typed by a human. They are skipped entirely —
+/// as messages and, by consequence, as title sources: a board full of Sessions
+/// titled "<local-command-caveat>…" is the failure this exists to prevent.
+fn is_envelope(turn: &ImportedTurn) -> bool {
+    if turn.role != Role::User {
+        return false;
+    }
+    let body = turn.body.trim_start();
+    const ENVELOPE_PREFIXES: &[&str] = &[
+        "Caveat: The messages below",
+        "<local-command-caveat>",
+        "<local-command-stdout>",
+        "<command-name>",
+        "<command-message>",
+        "<bash-input>",
+        "<bash-stdout>",
+        "<bash-stderr>",
+        "<system-reminder>",
+        "[Request interrupted",
+    ];
+    ENVELOPE_PREFIXES.iter().any(|prefix| body.starts_with(prefix))
+}
+
 fn read_turn(value: &serde_json::Value) -> Option<ImportedTurn> {
     let kind = value.get("type").and_then(serde_json::Value::as_str)?;
     let role = match kind {

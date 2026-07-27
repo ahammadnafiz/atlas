@@ -299,21 +299,38 @@ fn two_sessions_contributing_to_one_commit_produce_two_checkpoints() {
 
 #[test]
 fn one_session_spanning_several_commits_produces_one_checkpoint_each() {
+    // The Session's *work* spans the commits: it touched three files, and the
+    // developer committed them separately. Each commit carries a distinct part
+    // of the Session's output, so each earns a Checkpoint.
+    //
+    // Deliberately NOT one touch followed by three commits mutating the same
+    // file — under consumption, a commit settles the touches it carries, and
+    // later commits re-editing that file are the developer's own work. Linking
+    // them was the unbounded-attribution defect, not the spec's intent.
     let fixture = Fixture::new();
-    fixture.write("src/lib.rs", "original");
+    fixture.write("src/a.rs", "original a");
+    fixture.write("src/b.rs", "original b");
+    fixture.write("src/c.rs", "original c");
     fixture.commit_all("initial");
     let mut store = fixture.store();
     fixture.walk(&store);
 
-    let session = session_wrote(&fixture, &mut store, "s1", "src/lib.rs", "v1", true);
+    let session = session_wrote(&fixture, &mut store, "s1", "src/a.rs", "agent a", true);
+    session_touched(&fixture, &mut store, "s1", "src/b.rs", Some("agent b"), true, false);
+    session_touched(&fixture, &mut store, "s1", "src/c.rs", Some("agent c"), true, false);
 
-    for (content, message) in [("v1", "first"), ("v2", "second"), ("v3", "third")] {
-        fixture.write("src/lib.rs", content);
+    for (path, content, message) in [
+        ("src/a.rs", "agent a", "first"),
+        ("src/b.rs", "agent b", "second"),
+        ("src/c.rs", "agent c", "third"),
+    ] {
+        fixture.write(path, content);
         fixture.commit_all(message);
     }
 
     fixture.walk(&store);
-    assert_eq!(store.checkpoints_for_session(&session).unwrap().len(), 3);
+    let checkpoints = store.checkpoints_for_session(&session).unwrap();
+    assert_eq!(checkpoints.len(), 3);
 }
 
 #[test]

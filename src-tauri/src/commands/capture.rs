@@ -772,7 +772,18 @@ pub async fn capture_import_preview(
         let Some(source) = transcript_source_for(root) else {
             return Ok(atlas_checkpoint::ImportPreview::default());
         };
-        Ok(atlas_checkpoint::import_preview(&source, mode))
+        // With a store at hand the preview excludes already-imported files and
+        // cross-source duplicates — the disclosure dialog must lead with what a
+        // confirm would actually publish, not the total sitting on disk.
+        Ok(match &store {
+            Some(s) => atlas_checkpoint::import::preview_with_store(
+                s,
+                &project_path,
+                &source,
+                mode,
+            ),
+            None => atlas_checkpoint::import_preview(&source, mode),
+        })
     })
     .await
     .map_err(|e| e.to_string())?
@@ -820,6 +831,13 @@ fn refresh_inner(
     app: &AppHandle,
 ) -> Result<Option<atlas_checkpoint::Binding>, String> {
     let root = std::path::Path::new(project_path);
+    // Refreshing detection must never be what plants `.atlas/` in a Workspace
+    // whose capture was never enabled — `git init` from the popover's offer
+    // runs this too, and opening the writer would create the store as a side
+    // effect. No store yet means nothing to refresh.
+    if !atlas_checkpoint::atlas_dir(root).join("sessions.db").exists() {
+        return Ok(None);
+    }
     let state = app.state::<CaptureState>();
     let handle = state.writer(root)?;
     let binding = {
@@ -1493,7 +1511,16 @@ fn enabled_on_disk(root: &Path) -> bool {
 fn open_in(stores: &StoreRegistry, root: &Path) -> Result<StoreHandle, String> {
     let mut registry = lock_ok(stores);
     if let Some(handle) = registry.get(root) {
-        return Ok(handle.clone());
+        if handle.is_writer {
+            return Ok(handle.clone());
+        }
+        // A reader-only handle means another process held the writer lock when
+        // we last looked. That process may have exited since — and caching the
+        // deferral forever would leave capture dead until restart while health
+        // keeps blaming a window that no longer exists. Re-attempt the lock:
+        // cheap when still held (immediate EXCLUSIVE failure), and the moment
+        // it frees, this process resumes recording.
+        registry.remove(root);
     }
 
     let store = Store::open(atlas_checkpoint::atlas_dir(root)).map_err(|e| {
@@ -1684,7 +1711,16 @@ fn process_job(
         // history links against stale shas the reconcile pass was about to
         // re-point. A rewrite moves refs exactly like a commit does, so both
         // run on the same trigger.
+        let mut mid_rewrite = false;
         match atlas_checkpoint::reconcile_rewrites(store, workspace_id, &root) {
+            Ok(outcome) if outcome.deferred => {
+                // A rebase is in flight. Reconciliation already refused to
+                // judge the half-rewritten history — and the walk below must
+                // not either: it would link the transient rebase commits via
+                // the permissive arm and consume touches against them. The
+                // post-rebase ref movement re-triggers both.
+                mid_rewrite = true;
+            }
             Ok(outcome) if outcome.is_mass_orphan() => tracing::warn!(
                 target: "atlas::capture",
                 orphaned = outcome.orphaned,
@@ -1707,7 +1743,7 @@ fn process_job(
 
         // New Checkpoints are new capture; a paused Workspace only reconciles
         // what it already recorded.
-        if capturing {
+        if capturing && !mid_rewrite {
             match atlas_checkpoint::walk_new_commits(store, workspace_id, &root, mode) {
                 Ok(outcome) if outcome.checkpoints_created > 0 => tracing::info!(
                     target: "atlas::capture",
@@ -1924,12 +1960,6 @@ fn drain_for(
     // the developer's directory layout to the whole Organisation. A Cloud
     // binding without either predates registration (or was half-bound by an
     // older build) and must not drain at all.
-    //
-    // NOTE: `SyncConfig` currently carries one `workspace_id`, used by the
-    // sync layer both to select rows (which must stay keyed on the local path)
-    // and to stamp `ArtifactBase.workspaceId`. Until the sync layer splits
-    // those, this gate guarantees a wire identity *exists* before anything is
-    // sent; carrying it on the payload is the sync layer's half.
     if binding.remote_workspace_id.is_none() && binding.slug.is_none() {
         warn_once_unregistered(root);
         return;
@@ -1943,18 +1973,7 @@ fn drain_for(
         }
     }
 
-    // Self-heal a promotion interrupted on an older build: a Cloud Workspace
-    // should have no `local` rows, and flipping strays is always correct.
-    // A no-op when clean.
     let workspace_key = root.to_string_lossy().to_string();
-    match store.heal_stranded_local_rows(&workspace_key) {
-        Ok(healed) if healed > 0 => tracing::info!(
-            target: "atlas::capture",
-            healed,
-            "re-queued rows stranded by an interrupted promotion"
-        ),
-        _ => {}
-    }
 
     let provider = token.clone();
     let mint_token = move || {

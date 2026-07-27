@@ -19,8 +19,9 @@ use crate::error::{Error, Result};
 pub const SCHEMA_VERSION: i64 = 6;
 
 pub fn migrate(conn: &Connection) -> Result<()> {
+    // Fast path, outside any transaction: the overwhelmingly common case is a
+    // database already at the current version.
     let found: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-
     if found > SCHEMA_VERSION {
         return Err(Error::SchemaTooNew {
             found,
@@ -31,26 +32,76 @@ pub fn migrate(conn: &Connection) -> Result<()> {
         return Ok(());
     }
 
-    if found < 1 {
-        conn.execute_batch(V1)?;
-    }
-    if found < 2 {
-        conn.execute_batch(V2)?;
-    }
-    if found < 3 {
-        conn.execute_batch(V3)?;
-    }
-    if found < 4 {
-        conn.execute_batch(V4)?;
-    }
-    if found < 5 {
-        conn.execute_batch(V5)?;
-    }
-    if found < 6 {
-        conn.execute_batch(V6)?;
-    }
+    // The migration itself runs inside one IMMEDIATE transaction, and the
+    // version is re-read *inside* it. Two connections — a writer and a reader,
+    // or two commands racing an open — both reach here believing the database
+    // is behind; without the lock and the re-check, both apply the same ALTER
+    // TABLEs and the loser fails with "duplicate column name" while the store
+    // reports itself unavailable. The IMMEDIATE lock serialises them, and the
+    // re-check turns the loser into a no-op. DDL is transactional in SQLite,
+    // so a failure mid-migration rolls back whole rather than leaving columns
+    // added with the version still behind — which would wedge every later open.
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    let result = (|| -> Result<()> {
+        let found: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        if found >= SCHEMA_VERSION {
+            return Ok(());
+        }
+        if found < 1 {
+            conn.execute_batch(V1)?;
+        }
+        if found < 2 {
+            conn.execute_batch(V2)?;
+        }
+        if found < 3 {
+            conn.execute_batch(V3)?;
+        }
+        if found < 4 {
+            conn.execute_batch(V4)?;
+        }
+        if found < 5 {
+            conn.execute_batch(V5)?;
+        }
+        if found < 6 {
+            apply_v6_tolerant(conn)?;
+        }
+        conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        Ok(())
+    })();
 
-    conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    match result {
+        Ok(()) => {
+            conn.execute_batch("COMMIT")?;
+            Ok(())
+        }
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(e)
+        }
+    }
+}
+
+/// Apply V6 one statement at a time, tolerating columns that already exist.
+///
+/// V6 is pure ALTER TABLE / CREATE INDEX IF NOT EXISTS. An earlier build ran
+/// these outside a transaction, so a crash or a concurrent-open race could add
+/// some columns and then fail before stamping the version — after which every
+/// re-run failed with "duplicate column name" and the store reported itself
+/// unavailable forever. Skipping exactly that error makes the migration
+/// idempotent for every tear shape while still surfacing anything real.
+fn apply_v6_tolerant(conn: &Connection) -> Result<()> {
+    for statement in V6.split(';') {
+        let statement = statement.trim();
+        if statement.is_empty() {
+            continue;
+        }
+        if let Err(e) = conn.execute_batch(&format!("{statement};")) {
+            if e.to_string().contains("duplicate column name") {
+                continue;
+            }
+            return Err(e.into());
+        }
+    }
     Ok(())
 }
 
