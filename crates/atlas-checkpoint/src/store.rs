@@ -285,19 +285,78 @@ impl Store {
     pub fn set_title_if_absent(&self, session_id: &str, title: &str) -> Result<()> {
         self.require_writer()?;
         self.conn.execute(
-            "UPDATE agent_session SET title = ?2, updated_at = ?3
-              WHERE id = ?1 AND (title IS NULL OR title = '')",
+            &format!(
+                "UPDATE agent_session SET title = ?2, updated_at = ?3{RESYNC_SESSION}
+                  WHERE id = ?1 AND (title IS NULL OR title = '')"
+            ),
             rusqlite::params![session_id, title, Utc::now().to_rfc3339()],
         )?;
         Ok(())
     }
 
+    /// Merge token totals into a Session's record.
+    ///
+    /// A merge rather than a replace, because the gauge and the split arrive on
+    /// different events: a `ContextUsage` gauge carries zeros for the split, and
+    /// replacing wholesale would let it erase a real usage split recorded
+    /// moments earlier. Non-zero fields win; a genuine larger cumulative value
+    /// always lands.
     pub fn set_token_totals(&self, session_id: &str, totals: &TokenTotals) -> Result<()> {
         self.require_writer()?;
-        let json = serde_json::to_string(totals).unwrap_or_else(|_| "{}".into());
+        let existing: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT token_totals FROM agent_session WHERE id = ?1",
+                [session_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let mut merged: TokenTotals = existing
+            .as_deref()
+            .and_then(|raw| serde_json::from_str(raw).ok())
+            .unwrap_or_default();
+
+        if totals.input_tokens > 0 {
+            merged.input_tokens = totals.input_tokens;
+        }
+        if totals.output_tokens > 0 {
+            merged.output_tokens = totals.output_tokens;
+        }
+        if totals.cache_creation_tokens > 0 {
+            merged.cache_creation_tokens = totals.cache_creation_tokens;
+        }
+        if totals.cache_read_tokens > 0 {
+            merged.cache_read_tokens = totals.cache_read_tokens;
+        }
+        if totals.context_used.is_some() {
+            merged.context_used = totals.context_used;
+        }
+        if totals.context_size.is_some() {
+            merged.context_size = totals.context_size;
+        }
+
+        let json = serde_json::to_string(&merged).unwrap_or_else(|_| "{}".into());
         self.conn.execute(
-            "UPDATE agent_session SET token_totals = ?2, updated_at = ?3 WHERE id = ?1",
+            &format!(
+                "UPDATE agent_session SET token_totals = ?2, updated_at = ?3{RESYNC_SESSION}
+                  WHERE id = ?1"
+            ),
             rusqlite::params![session_id, json, Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    /// Move a Session's `started_at` earlier, when a better source of truth
+    /// (the transcript's own timestamps) knows when it really began.
+    ///
+    /// Only ever moves backwards: live capture stamped "now" at first sighting,
+    /// and the transcript can only prove the conversation is older than that.
+    pub fn backdate_session(&self, session_id: &str, started_at: DateTime<Utc>) -> Result<()> {
+        self.require_writer()?;
+        self.conn.execute(
+            "UPDATE agent_session SET started_at = ?2
+              WHERE id = ?1 AND started_at > ?2",
+            rusqlite::params![session_id, started_at.to_rfc3339()],
         )?;
         Ok(())
     }
@@ -429,6 +488,10 @@ impl Store {
         let seq = next_seq(&tx)?;
         let id = format!("am-{}", uuid::Uuid::new_v4().simple());
         let now = Utc::now();
+        // Imported turns carry the transcript's own timestamp; live capture
+        // stamps now. The distinction is what keeps a year of imported history
+        // from all dating to the day the import ran.
+        let created_at = input.created_at.unwrap_or(now);
 
         tx.execute(
             "INSERT INTO agent_message
@@ -448,7 +511,7 @@ impl Store {
                 body_ref,
                 body_bytes,
                 content_hash,
-                now.to_rfc3339(),
+                created_at.to_rfc3339(),
                 input.sync_state.as_str(),
             ],
         )?;
@@ -463,14 +526,31 @@ impl Store {
     }
 
     /// Close a turn as completed.
+    ///
+    /// Only an `open` turn can complete. A turn reconciled to `aborted` after a
+    /// crash keeps that verdict — a later event with a recycled turn number must
+    /// not quietly erase the record that the original turn was torn.
     pub fn complete_turn(&self, session_id: &str, turn_seq: i64) -> Result<()> {
         self.require_writer()?;
         self.conn.execute(
             "UPDATE turn SET state = 'completed', ended_at = ?3
-              WHERE session_id = ?1 AND turn_seq = ?2",
+              WHERE session_id = ?1 AND turn_seq = ?2 AND state = 'open'",
             rusqlite::params![session_id, turn_seq, Utc::now().to_rfc3339()],
         )?;
         Ok(())
+    }
+
+    /// The highest turn number this Session has ever used.
+    ///
+    /// Seeds the in-memory counter after a restart, so a resumed conversation
+    /// continues from turn N+1 instead of colliding with the turns already
+    /// recorded.
+    pub fn max_turn_seq(&self, session_id: &str) -> Result<i64> {
+        Ok(self.conn.query_row(
+            "SELECT COALESCE(MAX(turn_seq), 0) FROM turn WHERE session_id = ?1",
+            [session_id],
+            |row| row.get(0),
+        )?)
     }
 
     pub fn messages_for_session(&self, session_id: &str) -> Result<Vec<Message>> {
@@ -480,6 +560,24 @@ impl Store {
         ))?;
         let rows = stmt.query_map([session_id], row_to_message)?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// How many Messages a Session holds. Index-only — no body is read.
+    pub fn message_count(&self, session_id: &str) -> Result<i64> {
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*) FROM agent_message WHERE session_id = ?1",
+            [session_id],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// How many tool calls a Session holds. Index-only.
+    pub fn tool_call_count(&self, session_id: &str) -> Result<i64> {
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*) FROM tool_call WHERE session_id = ?1",
+            [session_id],
+            |row| row.get(0),
+        )?)
     }
 
     /// Count messages by role and mode — the session-detail sidebar's numbers.
@@ -772,11 +870,13 @@ impl Store {
             .conn
             .query_row(
                 "SELECT workspace_id, root, mode, slug, org_id, root_commit_sha,
-                        fingerprint_is_shallow, git_url, enabled, created_at
+                        fingerprint_is_shallow, git_url, enabled, created_at,
+                        import_approved, drain_state, remote_workspace_id
                    FROM binding WHERE id = 1",
                 [],
                 |row| {
                     let mode: String = row.get(2)?;
+                    let drain_state: String = row.get(11)?;
                     Ok(Binding {
                         workspace_id: row.get(0)?,
                         root: row.get(1)?,
@@ -787,6 +887,9 @@ impl Store {
                         fingerprint_is_shallow: row.get::<_, i64>(6)? != 0,
                         git_url: row.get(7)?,
                         enabled: row.get::<_, i64>(8)? != 0,
+                        import_approved: row.get::<_, i64>(10)? != 0,
+                        drain_state: DrainGate::parse(&drain_state).unwrap_or(DrainGate::Ok),
+                        remote_workspace_id: row.get(12)?,
                         created_at: parse_time(row.get::<_, String>(9)?),
                     })
                 },
@@ -843,12 +946,79 @@ impl Store {
     /// Separate from [`Store::upsert_binding`] because it is a different event:
     /// binding is local and immediate, registration is a server round-trip that
     /// must succeed before anything local changes.
-    pub fn set_cloud_binding(&self, org_id: &str, slug: &str) -> Result<()> {
+    ///
+    /// Becoming Cloud revokes any earlier import approval — the disclosure class
+    /// changed, so the confirmation must be given again — and clears a stale
+    /// `not_authorized` drain gate, since this is a fresh registration.
+    pub fn set_cloud_binding(
+        &self,
+        org_id: &str,
+        slug: &str,
+        remote_workspace_id: Option<&str>,
+    ) -> Result<()> {
         self.require_writer()?;
         self.conn.execute(
-            "UPDATE binding SET mode = 'cloud', org_id = ?1, slug = ?2, updated_at = ?3
+            "UPDATE binding
+                SET mode = 'cloud', org_id = ?1, slug = ?2,
+                    remote_workspace_id = COALESCE(?3, remote_workspace_id),
+                    import_approved = 0, drain_state = 'ok', updated_at = ?4
               WHERE id = 1",
-            rusqlite::params![org_id, slug, Utc::now().to_rfc3339()],
+            rusqlite::params![org_id, slug, remote_workspace_id, Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    /// Promote to Cloud atomically: the binding flip and the row flip commit
+    /// together, so a crash can never leave a Cloud Workspace whose history is
+    /// stranded as `local` — invisible to the drain forever, after the user was
+    /// told it would be shared.
+    pub fn promote_to_cloud(
+        &self,
+        workspace_id: &str,
+        org_id: &str,
+        slug: &str,
+        remote_workspace_id: Option<&str>,
+    ) -> Result<i64> {
+        self.require_writer()?;
+        let now = Utc::now().to_rfc3339();
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "UPDATE binding
+                SET mode = 'cloud', org_id = ?1, slug = ?2,
+                    remote_workspace_id = COALESCE(?3, remote_workspace_id),
+                    import_approved = 0, drain_state = 'ok', updated_at = ?4
+              WHERE id = 1",
+            rusqlite::params![org_id, slug, remote_workspace_id, now],
+        )?;
+        let moved = promote_local_rows_in(&tx, workspace_id)?;
+        tx.commit()?;
+        Ok(moved)
+    }
+
+    /// Was promotion interrupted? A Cloud Workspace should have no `local` rows;
+    /// any that exist were stranded by a crash between registration and the row
+    /// flip on an older build, and flipping them is always correct.
+    pub fn heal_stranded_local_rows(&self, workspace_id: &str) -> Result<i64> {
+        self.require_writer()?;
+        promote_local_rows_in(&self.conn, workspace_id)
+    }
+
+    /// Record or revoke the bulk-import disclosure confirmation.
+    pub fn set_import_approved(&self, approved: bool) -> Result<()> {
+        self.require_writer()?;
+        self.conn.execute(
+            "UPDATE binding SET import_approved = ?1, updated_at = ?2 WHERE id = 1",
+            rusqlite::params![i64::from(approved), Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    /// Remember whether the server rejected this identity.
+    pub fn set_drain_state(&self, state: DrainGate) -> Result<()> {
+        self.require_writer()?;
+        self.conn.execute(
+            "UPDATE binding SET drain_state = ?1, updated_at = ?2 WHERE id = 1",
+            rusqlite::params![state.as_str(), Utc::now().to_rfc3339()],
         )?;
         Ok(())
     }
@@ -877,6 +1047,7 @@ impl Store {
     pub fn pending_artifacts(
         &self,
         workspace_id: &str,
+        wire_workspace_id: &str,
         org_id: &str,
         max_count: usize,
         max_bytes: usize,
@@ -885,6 +1056,25 @@ impl Store {
 
         let mut out: Vec<AtlasArtifact> = Vec::new();
         let mut bytes = 0usize;
+
+        // The byte ceiling is checked *before* appending, so a batch never
+        // overshoots the limit the server enforces — except for a single
+        // artifact that is alone over the ceiling, which still ships by itself
+        // rather than deadlocking the queue.
+        macro_rules! push_or_stop {
+            ($artifact:expr) => {{
+                let artifact = $artifact;
+                let cost = artifact.approx_bytes();
+                if !out.is_empty() && (out.len() >= max_count || bytes + cost > max_bytes) {
+                    return Ok(out);
+                }
+                bytes += cost;
+                out.push(artifact);
+                if out.len() >= max_count || bytes >= max_bytes {
+                    return Ok(out);
+                }
+            }};
+        }
 
         // Sessions first: a Message referencing a Session the server has not
         // seen is a dangling reference of a different kind.
@@ -897,13 +1087,29 @@ impl Store {
             .query_map(rusqlite::params![workspace_id, max_count as i64], row_to_session)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         for session in sessions {
-            let artifact = AtlasArtifact::AgentSession(SessionArtifact {
+            // The hash covers the fields that can change after a first send —
+            // title, totals, model — so a mutated Session re-sends as new
+            // content instead of being dropped by the server's replay dedupe.
+            let token_totals = serde_json::to_value(session.token_totals)
+                .unwrap_or(serde_json::Value::Null);
+            let content_hash = blobs::key_for(
+                format!(
+                    "{}:{}:{}:{}:{}",
+                    session.id,
+                    session.title.as_deref().unwrap_or(""),
+                    session.agent.as_deref().unwrap_or(""),
+                    session.model.as_deref().unwrap_or(""),
+                    token_totals
+                )
+                .as_bytes(),
+            );
+            push_or_stop!(AtlasArtifact::AgentSession(SessionArtifact {
                 base: ArtifactBase {
                     row_id: session.id.clone(),
                     org_id: org_id.to_string(),
-                    workspace_id: workspace_id.to_string(),
+                    workspace_id: wire_workspace_id.to_string(),
                     seq: 0,
-                    content_hash: blobs::key_for(session.id.as_bytes()),
+                    content_hash,
                     created_at: session.started_at.to_rfc3339(),
                 },
                 session_id: session.id.clone(),
@@ -912,32 +1118,35 @@ impl Store {
                 title: session.title.clone(),
                 agent: session.agent.clone(),
                 model: session.model.clone(),
-                token_totals: serde_json::to_value(session.token_totals)
-                    .unwrap_or(serde_json::Value::Null),
+                token_totals,
                 started_at: session.started_at.to_rfc3339(),
-            });
-            bytes += artifact.approx_bytes();
-            out.push(artifact);
-            if out.len() >= max_count || bytes >= max_bytes {
-                return Ok(out);
-            }
+            }));
         }
 
+        // Rows from aborted turns stay home: a turn the process died inside is
+        // not a completed turn, and uploading its fragments would present them
+        // to the Organisation as finished work. The abort verdict lives only in
+        // the local `turn` table, so the server could never learn otherwise.
         let mut stmt = self.conn.prepare(&format!(
-            "SELECT {MESSAGE_COLUMNS} FROM agent_message
+            "SELECT {MESSAGE_COLUMNS} FROM agent_message m
               WHERE sync_state = 'pending'
                 AND session_id IN (SELECT id FROM agent_session WHERE workspace_id = ?1)
+                AND NOT EXISTS (
+                    SELECT 1 FROM turn t
+                     WHERE t.session_id = m.session_id
+                       AND t.turn_seq = m.turn_seq
+                       AND t.state = 'aborted')
               ORDER BY seq LIMIT ?2"
         ))?;
         let messages = stmt
             .query_map(rusqlite::params![workspace_id, max_count as i64], row_to_message)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         for message in messages {
-            let artifact = AtlasArtifact::AgentMessage(MessageArtifact {
+            push_or_stop!(AtlasArtifact::AgentMessage(MessageArtifact {
                 base: ArtifactBase {
                     row_id: message.id.clone(),
                     org_id: org_id.to_string(),
-                    workspace_id: workspace_id.to_string(),
+                    workspace_id: wire_workspace_id.to_string(),
                     seq: message.seq,
                     content_hash: message.content_hash.clone(),
                     created_at: message.created_at.to_rfc3339(),
@@ -949,31 +1158,43 @@ impl Store {
                 preview: message.preview.clone(),
                 body: message.body.clone(),
                 body_ref: message.body_ref.clone(),
-            });
-            bytes += artifact.approx_bytes();
-            out.push(artifact);
-            if out.len() >= max_count || bytes >= max_bytes {
-                return Ok(out);
-            }
+            }));
         }
 
         let mut stmt = self.conn.prepare(&format!(
-            "SELECT {TOOL_CALL_COLUMNS} FROM tool_call
+            "SELECT {TOOL_CALL_COLUMNS} FROM tool_call c
               WHERE sync_state = 'pending'
                 AND session_id IN (SELECT id FROM agent_session WHERE workspace_id = ?1)
+                AND NOT EXISTS (
+                    SELECT 1 FROM turn t
+                     WHERE t.session_id = c.session_id
+                       AND t.turn_seq = c.turn_seq
+                       AND t.state = 'aborted')
               ORDER BY seq LIMIT ?2"
         ))?;
         let calls = stmt
             .query_map(rusqlite::params![workspace_id, max_count as i64], row_to_tool_call)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         for call in calls {
-            let artifact = AtlasArtifact::ToolCall(ToolCallArtifact {
+            // Status and payload refs change across a call's lifetime; hash them
+            // so a completed call re-sends over its earlier pending sighting.
+            let content_hash = blobs::key_for(
+                format!(
+                    "{}:{}:{}:{}",
+                    call.id,
+                    call.status.as_str(),
+                    call.result_ref.as_deref().unwrap_or(""),
+                    call.result.as_deref().unwrap_or("")
+                )
+                .as_bytes(),
+            );
+            push_or_stop!(AtlasArtifact::ToolCall(ToolCallArtifact {
                 base: ArtifactBase {
                     row_id: call.id.clone(),
                     org_id: org_id.to_string(),
-                    workspace_id: workspace_id.to_string(),
+                    workspace_id: wire_workspace_id.to_string(),
                     seq: call.seq,
-                    content_hash: blobs::key_for(call.id.as_bytes()),
+                    content_hash,
                     created_at: call.created_at.to_rfc3339(),
                 },
                 session_id: call.session_id.clone(),
@@ -988,12 +1209,7 @@ impl Store {
                 result: call.result.clone(),
                 result_ref: call.result_ref.clone(),
                 result_binary: call.result_binary,
-            });
-            bytes += artifact.approx_bytes();
-            out.push(artifact);
-            if out.len() >= max_count || bytes >= max_bytes {
-                return Ok(out);
-            }
+            }));
         }
 
         let mut stmt = self.conn.prepare(&format!(
@@ -1010,12 +1226,20 @@ impl Store {
                 base: ArtifactBase {
                     row_id: checkpoint.id.clone(),
                     org_id: org_id.to_string(),
-                    workspace_id: workspace_id.to_string(),
+                    workspace_id: wire_workspace_id.to_string(),
                     seq: 0,
-                    // (session, commit) is the Checkpoint's natural key, so the
-                    // dedupe hash is derived from it rather than from content.
+                    // (session, commit) is the Checkpoint's natural key; the
+                    // link state is folded in so a re-point or an orphaning
+                    // re-sends as changed content rather than being dropped by
+                    // the server's replay dedupe.
                     content_hash: blobs::key_for(
-                        format!("{}:{}", checkpoint.session_id, checkpoint.commit_sha).as_bytes(),
+                        format!(
+                            "{}:{}:{}",
+                            checkpoint.session_id,
+                            checkpoint.commit_sha,
+                            checkpoint.link_state.as_str()
+                        )
+                        .as_bytes(),
                     ),
                     created_at: checkpoint.created_at.to_rfc3339(),
                 },
@@ -1030,14 +1254,95 @@ impl Store {
                 insertions: checkpoint.insertions,
                 deletions: checkpoint.deletions,
             });
-            bytes += artifact.approx_bytes();
-            out.push(artifact);
-            if out.len() >= max_count || bytes >= max_bytes {
-                return Ok(out);
-            }
+            push_or_stop!(artifact);
         }
 
         Ok(out)
+    }
+
+    /// Mark every pending row that has exhausted its attempts as `failed`.
+    ///
+    /// This is what makes the poison-row guarantee real for *batch-level*
+    /// rejections, where the server never names the offending row: attempts
+    /// accrue per pass, and once a row crosses the cap it leaves the queue so
+    /// everything behind it drains. Returns how many rows were failed.
+    pub fn mark_exhausted_rows_failed(
+        &self,
+        workspace_id: &str,
+        max_attempts: i64,
+    ) -> Result<i64> {
+        self.require_writer()?;
+        let mut failed = 0i64;
+        failed += self.conn.execute(
+            "UPDATE agent_session SET sync_state = 'failed'
+              WHERE workspace_id = ?1 AND sync_state = 'pending' AND sync_attempts >= ?2",
+            rusqlite::params![workspace_id, max_attempts],
+        )? as i64;
+        for table in ["agent_message", "tool_call", "checkpoint"] {
+            failed += self.conn.execute(
+                &format!(
+                    "UPDATE {table} SET sync_state = 'failed'
+                      WHERE sync_state = 'pending' AND sync_attempts >= ?2
+                        AND session_id IN (SELECT id FROM agent_session WHERE workspace_id = ?1)"
+                ),
+                rusqlite::params![workspace_id, max_attempts],
+            )? as i64;
+        }
+        Ok(failed)
+    }
+
+    /// Give every `failed` row another chance: flip it back to `pending` with a
+    /// fresh attempt count. The `failed → pending` transition of the outbox
+    /// state machine — a deliberate human action, never automatic.
+    pub fn retry_failed_rows(&self, workspace_id: &str) -> Result<i64> {
+        self.require_writer()?;
+        let mut retried = 0i64;
+        retried += self.conn.execute(
+            "UPDATE agent_session SET sync_state = 'pending', sync_attempts = 0
+              WHERE workspace_id = ?1 AND sync_state = 'failed'",
+            [workspace_id],
+        )? as i64;
+        for table in ["agent_message", "tool_call", "checkpoint"] {
+            retried += self.conn.execute(
+                &format!(
+                    "UPDATE {table} SET sync_state = 'pending', sync_attempts = 0
+                      WHERE sync_state = 'failed'
+                        AND session_id IN (SELECT id FROM agent_session WHERE workspace_id = ?1)"
+                ),
+                [workspace_id],
+            )? as i64;
+        }
+        Ok(retried)
+    }
+
+    /// Re-key every row after the project folder moved.
+    ///
+    /// The Workspace's identity must survive renaming the repo folder: `.atlas/`
+    /// travels with the directory, but rows written under the old absolute path
+    /// would be invisible to every query keyed on the new one — the timeline,
+    /// the health counts and the promotion preview would all silently read as
+    /// empty. One transaction, so a crash re-keys nothing rather than half.
+    pub fn rekey_workspace(&self, old_workspace_id: &str, new_workspace_id: &str, new_root: &str) -> Result<()> {
+        if old_workspace_id == new_workspace_id {
+            return Ok(());
+        }
+        self.require_writer()?;
+        let now = Utc::now().to_rfc3339();
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "UPDATE agent_session SET workspace_id = ?2 WHERE workspace_id = ?1",
+            rusqlite::params![old_workspace_id, new_workspace_id],
+        )?;
+        tx.execute(
+            "UPDATE workspace_cursor SET workspace_id = ?2 WHERE workspace_id = ?1",
+            rusqlite::params![old_workspace_id, new_workspace_id],
+        )?;
+        tx.execute(
+            "UPDATE binding SET workspace_id = ?1, root = ?2, updated_at = ?3 WHERE id = 1",
+            rusqlite::params![new_workspace_id, new_root, now],
+        )?;
+        tx.commit()?;
+        Ok(())
     }
 
     /// Mark a row as durably accepted by the server.
@@ -1084,29 +1389,18 @@ impl Store {
         Ok(())
     }
 
-    /// Flip every `local` row to `pending`.
+    /// Flip every `local` row to `pending`, atomically.
     ///
     /// Promotion's whole mechanism. There is deliberately **no separate backfill
     /// path**: the accumulated history joins the same queue as everything else,
-    /// so there is one drain to keep correct rather than two.
+    /// so there is one drain to keep correct rather than two. Prefer
+    /// [`Store::promote_to_cloud`], which also flips the binding in the same
+    /// transaction.
     pub fn promote_local_rows(&self, workspace_id: &str) -> Result<i64> {
         self.require_writer()?;
-        let mut moved = 0i64;
-        moved += self.conn.execute(
-            "UPDATE agent_session SET sync_state = 'pending'
-              WHERE workspace_id = ?1 AND sync_state = 'local'",
-            [workspace_id],
-        )? as i64;
-        for table in ["agent_message", "tool_call", "checkpoint"] {
-            moved += self.conn.execute(
-                &format!(
-                    "UPDATE {table} SET sync_state = 'pending'
-                      WHERE sync_state = 'local'
-                        AND session_id IN (SELECT id FROM agent_session WHERE workspace_id = ?1)"
-                ),
-                [workspace_id],
-            )? as i64;
-        }
+        let tx = self.conn.unchecked_transaction()?;
+        let moved = promote_local_rows_in(&tx, workspace_id)?;
+        tx.commit()?;
         Ok(moved)
     }
 
@@ -1218,12 +1512,63 @@ impl Store {
     }
 
     /// Re-point a Checkpoint at the commit now carrying its change.
-    pub fn relink_checkpoint(&self, id: &str, commit_sha: &str) -> Result<()> {
+    ///
+    /// If a row for `(session, commit_sha)` already exists — the walk saw the
+    /// rewritten commit before reconciliation ran, which is the production
+    /// ordering — the stale row is **absorbed** into it rather than UPDATE-ing
+    /// into a UNIQUE violation that would wedge reconciliation for every later
+    /// pass. A row that was already `sent` flips back to `pending` so the
+    /// Organisation timeline learns the commit moved.
+    pub fn relink_checkpoint(&self, id: &str, commit_sha: &str, branch: Option<&str>) -> Result<()> {
         self.require_writer()?;
-        self.conn.execute(
-            "UPDATE checkpoint SET commit_sha = ?2, link_state = 'linked' WHERE id = ?1",
-            rusqlite::params![id, commit_sha],
-        )?;
+        let tx = self.conn.unchecked_transaction()?;
+
+        let session_id: Option<String> = tx
+            .query_row(
+                "SELECT session_id FROM checkpoint WHERE id = ?1",
+                [id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(session_id) = session_id else {
+            return Ok(());
+        };
+
+        let existing: Option<String> = tx
+            .query_row(
+                "SELECT id FROM checkpoint WHERE session_id = ?1 AND commit_sha = ?2",
+                rusqlite::params![session_id, commit_sha],
+                |row| row.get(0),
+            )
+            .optional()?;
+
+        match existing {
+            Some(target_id) if target_id != id => {
+                // The walk already created the row at the new sha. Keep that one
+                // (it carries the freshly-computed diff stats) and delete the
+                // stale row pointing at the rewritten-away commit.
+                tx.execute("DELETE FROM checkpoint WHERE id = ?1", [id])?;
+                tx.execute(
+                    &format!(
+                        "UPDATE checkpoint SET link_state = 'linked',
+                                branch = COALESCE(?2, branch){RESYNC_ROW}
+                          WHERE id = ?1"
+                    ),
+                    rusqlite::params![target_id, branch],
+                )?;
+            }
+            _ => {
+                tx.execute(
+                    &format!(
+                        "UPDATE checkpoint SET commit_sha = ?2, link_state = 'linked',
+                                branch = COALESCE(?3, branch){RESYNC_ROW}
+                          WHERE id = ?1"
+                    ),
+                    rusqlite::params![id, commit_sha, branch],
+                )?;
+            }
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -1231,11 +1576,13 @@ impl Store {
     ///
     /// Never deletes the row and never drops the Session link: losing the link
     /// is a real event the record should be honest about, and it is recoverable
-    /// if the commit becomes reachable again.
+    /// if the commit becomes reachable again. A row already `sent` flips back to
+    /// `pending`, because the Organisation timeline claiming a live link to a
+    /// vanished commit is exactly the confident lie orphaning exists to avoid.
     pub fn orphan_checkpoint(&self, id: &str) -> Result<()> {
         self.require_writer()?;
         self.conn.execute(
-            "UPDATE checkpoint SET link_state = 'orphaned' WHERE id = ?1",
+            &format!("UPDATE checkpoint SET link_state = 'orphaned'{RESYNC_ROW} WHERE id = ?1"),
             [id],
         )?;
         Ok(())
@@ -1283,6 +1630,33 @@ impl Store {
         Ok(())
     }
 
+    /// Record what the last reconciliation pass did (a small JSON note), so the
+    /// capture-health signal can surface a mass-orphan or a wedged pass instead
+    /// of leaving it in a log file nobody reads.
+    pub fn set_reconcile_note(&self, workspace_id: &str, note: &str) -> Result<()> {
+        self.require_writer()?;
+        self.conn.execute(
+            "INSERT INTO workspace_cursor (workspace_id, last_seen_commit, recovered, reconcile_note, updated_at)
+             VALUES (?1, NULL, 0, ?2, ?3)
+             ON CONFLICT (workspace_id) DO UPDATE
+                SET reconcile_note = ?2, updated_at = ?3",
+            rusqlite::params![workspace_id, note, Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    pub fn reconcile_note(&self, workspace_id: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT reconcile_note FROM workspace_cursor WHERE workspace_id = ?1",
+                [workspace_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten())
+    }
+
     /// Did the last walk have to recover its cursor by re-scanning?
     pub fn cursor_recovered(&self, workspace_id: &str) -> Result<bool> {
         Ok(self
@@ -1297,26 +1671,85 @@ impl Store {
             != 0)
     }
 
-    /// Live Sessions in a Workspace, with the files each left behind.
+    /// Live Sessions in a Workspace, with the *unconsumed* files each left
+    /// behind.
     ///
     /// Only live Sessions: an imported one has no write-time `existed_before`,
     /// and the link rule cannot honestly run without it.
-    pub fn link_candidates(&self, workspace_id: &str) -> Result<Vec<(String, Vec<FileTouch>)>> {
+    ///
+    /// Only unconsumed touches: once a commit has carried a touch's work, that
+    /// touch is spent. Without consumption, every future commit that happens to
+    /// modify the same path — including purely human work months later, and
+    /// teammate commits arriving via pull — would be attributed to the Session
+    /// forever. This mirrors the carry-forward rule in Entire's link engine,
+    /// which is the load-bearing half of the asymmetric rule.
+    pub fn link_candidates(&self, workspace_id: &str) -> Result<Vec<LinkCandidate>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id FROM agent_session WHERE workspace_id = ?1 AND source IN ('acp', 'cersei')",
+            "SELECT id, started_at FROM agent_session
+              WHERE workspace_id = ?1 AND source IN ('acp', 'cersei')",
         )?;
-        let ids: Vec<String> = stmt
-            .query_map([workspace_id], |row| row.get::<_, String>(0))?
+        let ids: Vec<(String, String)> = stmt
+            .query_map([workspace_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
 
         let mut out = Vec::new();
-        for id in ids {
-            let touches = self.latest_file_touches(&id)?;
+        for (id, started_at) in ids {
+            let touches = self.unconsumed_file_touches(&id)?;
             if !touches.is_empty() {
-                out.push((id, touches));
+                out.push(LinkCandidate {
+                    session_id: id,
+                    started_at: parse_time(started_at),
+                    touches,
+                });
             }
         }
         Ok(out)
+    }
+
+    /// The last touch of each path in a turn that no commit has consumed yet.
+    fn unconsumed_file_touches(&self, session_id: &str) -> Result<Vec<FileTouch>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {FILE_TOUCH_COLUMNS} FROM file_touch
+              WHERE session_id = ?1
+                AND consumed_by_commit IS NULL
+                AND seq IN (
+                    SELECT MAX(seq) FROM file_touch
+                     WHERE session_id = ?1 GROUP BY turn_seq, path
+                )
+              ORDER BY seq"
+        ))?;
+        let rows = stmt.query_map([session_id], row_to_file_touch)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Mark a Session's touches on these paths as consumed by a commit.
+    ///
+    /// Called after the walk links (or deliberately skips) a commit carrying
+    /// them. From then on the touches no longer nominate the Session for later
+    /// commits — the work landed; what happens to those files afterwards is not
+    /// the Session's doing.
+    pub fn consume_touches(
+        &self,
+        session_id: &str,
+        commit_sha: &str,
+        paths: &[String],
+    ) -> Result<()> {
+        if paths.is_empty() {
+            return Ok(());
+        }
+        self.require_writer()?;
+        let tx = self.conn.unchecked_transaction()?;
+        for path in paths {
+            tx.execute(
+                "UPDATE file_touch SET consumed_by_commit = ?3
+                  WHERE session_id = ?1 AND path = ?2 AND consumed_by_commit IS NULL",
+                rusqlite::params![session_id, path, commit_sha],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     // ── Maintenance ─────────────────────────────────────────────────────────
@@ -1399,6 +1832,22 @@ impl Store {
     }
 }
 
+/// Appended to an UPDATE's SET list: a row the server already accepted flips
+/// back to `pending` when its content changes, so the Organisation's copy does
+/// not go permanently stale. A `local` row stays `local`.
+const RESYNC_SESSION: &str =
+    ", sync_state = CASE WHEN sync_state = 'sent' THEN 'pending' ELSE sync_state END";
+const RESYNC_ROW: &str =
+    ", sync_state = CASE WHEN sync_state = 'sent' THEN 'pending' ELSE sync_state END";
+
+/// A live Session nominated for the link rule by touches no commit has
+/// consumed yet.
+pub struct LinkCandidate {
+    pub session_id: String,
+    pub started_at: DateTime<Utc>,
+    pub touches: Vec<FileTouch>,
+}
+
 /// Everything needed to write one Message.
 pub struct MessageInput<'a> {
     pub session_id: &'a str,
@@ -1411,6 +1860,10 @@ pub struct MessageInput<'a> {
     /// calling here, so there is exactly one place that can be forgotten.
     pub body: &'a str,
     pub sync_state: SyncState,
+    /// When this turn actually happened. `None` means "now" — live capture.
+    /// The importer passes the transcript's own timestamp so history keeps its
+    /// real dates.
+    pub created_at: Option<DateTime<Utc>>,
 }
 
 /// A tool call's result payload, which is not always text.
@@ -1510,6 +1963,29 @@ fn row_to_file_touch(row: &rusqlite::Row<'_>) -> rusqlite::Result<FileTouch> {
         out_of_repo: row.get::<_, i64>(9)? != 0,
         created_at: parse_time(row.get::<_, String>(10)?),
     })
+}
+
+/// Flip every `local` row of a Workspace to `pending`, on any connection-like
+/// handle — the shared body of [`Store::promote_to_cloud`],
+/// [`Store::promote_local_rows`] and [`Store::heal_stranded_local_rows`].
+fn promote_local_rows_in(conn: &Connection, workspace_id: &str) -> Result<i64> {
+    let mut moved = 0i64;
+    moved += conn.execute(
+        "UPDATE agent_session SET sync_state = 'pending'
+          WHERE workspace_id = ?1 AND sync_state = 'local'",
+        [workspace_id],
+    )? as i64;
+    for table in ["agent_message", "tool_call", "checkpoint"] {
+        moved += conn.execute(
+            &format!(
+                "UPDATE {table} SET sync_state = 'pending'
+                  WHERE sync_state = 'local'
+                    AND session_id IN (SELECT id FROM agent_session WHERE workspace_id = ?1)"
+            ),
+            [workspace_id],
+        )? as i64;
+    }
+    Ok(moved)
 }
 
 /// Which table a row id belongs to.

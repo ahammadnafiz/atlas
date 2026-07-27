@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  atlas-redact:
+    name: atlas-redact tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/atlas-redact
+      - name: Test
+        working-directory: crates/atlas-redact
+        run: cargo test
+      - name: Clippy
+        working-directory: crates/atlas-redact
+        run: cargo clippy --all-targets -- -D warnings
+
+  atlas-checkpoint:
+    name: atlas-checkpoint tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/atlas-checkpoint
+      # The integration seam drives real git repositories.
+      - name: Configure git identity for test repos
+        run: |
+          git config --global user.name "CI"
+          git config --global user.email "ci@example.invalid"
+      - name: Test
+        working-directory: crates/atlas-checkpoint
+        run: cargo test
+      - name: Clippy
+        working-directory: crates/atlas-checkpoint
+        run: cargo clippy --all-targets -- -D warnings
+
+  typecheck:
+    name: frontend typecheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - name: Install
+        run: bun install --frozen-lockfile
+      - name: Typecheck
+        run: bunx tsc --noEmit

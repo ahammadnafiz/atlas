@@ -3,8 +3,10 @@
 use std::path::Path;
 
 use atlas_checkpoint::model::WorkspaceMode;
+use atlas_checkpoint::tools::ToolName;
 use atlas_checkpoint::{
-    import_all, import_preview, Capture, Role, SessionKey, Source, Store, TranscriptSource,
+    import_all, import_preview, Capture, Role, SessionKey, Source, Store, ToolStatus,
+    TranscriptSource,
 };
 
 const WORKSPACE: &str = "ws-atlas";
@@ -15,10 +17,15 @@ fn store_in(root: &Path) -> Store {
 
 /// One Claude Code transcript line.
 fn line(kind: &str, uuid: &str, text: &str) -> String {
+    line_at(kind, uuid, text, "2026-07-01T10:00:00.000Z")
+}
+
+/// One Claude Code transcript line, with its own timestamp.
+fn line_at(kind: &str, uuid: &str, text: &str, timestamp: &str) -> String {
     serde_json::json!({
         "type": kind,
         "uuid": uuid,
-        "timestamp": "2026-07-01T10:00:00.000Z",
+        "timestamp": timestamp,
         "message": { "role": kind, "content": text, "model": "opus-5" },
     })
     .to_string()
@@ -116,6 +123,40 @@ fn several_transcripts_import_as_several_sessions() {
     assert_eq!(outcome.files_seen, 3);
     assert_eq!(outcome.sessions_imported, 3);
     assert_eq!(store.sessions_for_workspace(WORKSPACE).unwrap().len(), 3);
+}
+
+// ── Transcript timestamps ───────────────────────────────────────────────────
+
+#[test]
+fn imported_history_keeps_its_real_dates_not_the_import_date() {
+    // Ordering, day grouping and the promotion preview all read these back;
+    // a year of history dating from the day the import ran defeats "day one
+    // looks like month six".
+    let dir = tempfile::tempdir().unwrap();
+    let transcripts = dir.path().join("transcripts");
+    transcript(
+        &transcripts,
+        "sess-old",
+        &[
+            line_at("user", "u1", "An old question", "2025-02-03T09:15:00.000Z"),
+            line_at("assistant", "a1", "An old answer", "2025-02-03T09:16:30.000Z"),
+        ],
+    );
+
+    let mut store = store_in(dir.path());
+    import_all(&mut store, WORKSPACE, &TranscriptSource::new(&transcripts), WorkspaceMode::Local)
+        .unwrap();
+
+    let session = &store.sessions_for_workspace(WORKSPACE).unwrap()[0];
+    assert_eq!(
+        session.started_at.to_rfc3339(),
+        "2025-02-03T09:15:00+00:00",
+        "the session starts when the transcript says it did"
+    );
+
+    let messages = store.messages_for_session(&session.id).unwrap();
+    assert_eq!(messages[0].created_at.to_rfc3339(), "2025-02-03T09:15:00+00:00");
+    assert_eq!(messages[1].created_at.to_rfc3339(), "2025-02-03T09:16:30+00:00");
 }
 
 // ── Redaction ───────────────────────────────────────────────────────────────
@@ -264,6 +305,114 @@ fn a_transcript_appearing_after_the_first_pass_is_picked_up() {
     assert_eq!(store.sessions_for_workspace(WORKSPACE).unwrap().len(), 2);
 }
 
+// ── Tool calls from transcripts ─────────────────────────────────────────────
+
+/// A conversation whose assistant runs two tools — one succeeds, one fails —
+/// with a secret in the arguments and an identifier that must survive.
+fn a_conversation_with_tools(secret: &str) -> String {
+    let user = line("user", "u1", "Run the tests and read the config");
+    let uses = serde_json::json!({
+        "type": "assistant",
+        "uuid": "a1",
+        "timestamp": "2026-07-01T10:01:00.000Z",
+        "message": { "model": "opus-5", "content": [
+            { "type": "text", "text": "Running them now." },
+            { "type": "tool_use", "id": "toolu_ok", "name": "Bash",
+              "input": { "command": "cargo test", "password": secret,
+                         "message_id": "xJ3kQ9vB2mZ7pL5rT8wN4cF6yH1sD0gA",
+                         "host": "db.internal", "user": "app" } },
+            { "type": "tool_use", "id": "toolu_bad", "name": "Read",
+              "input": { "file_path": "/tmp/missing.toml" } },
+        ] },
+    })
+    .to_string();
+    let results = serde_json::json!({
+        "type": "user",
+        "uuid": "u2",
+        "timestamp": "2026-07-01T10:02:00.000Z",
+        "message": { "content": [
+            { "type": "tool_result", "tool_use_id": "toolu_ok",
+              "content": [{ "type": "text", "text": "test result: ok" }] },
+            { "type": "tool_result", "tool_use_id": "toolu_bad",
+              "content": "No such file", "is_error": true },
+        ] },
+    })
+    .to_string();
+    format!("{user}\n{uses}\n{results}")
+}
+
+#[test]
+fn tool_use_and_tool_result_blocks_import_as_tool_call_rows() {
+    // An explicit ATL-91 acceptance criterion: "tool calls as rows with status
+    // where the transcript records it". Without them every imported Session
+    // renders with empty facets.
+    let dir = tempfile::tempdir().unwrap();
+    let transcripts = dir.path().join("transcripts");
+    std::fs::create_dir_all(&transcripts).unwrap();
+    // Assembled at runtime so the fixture never contains a greppable secret.
+    let secret = ["hun", "ter2"].concat();
+    std::fs::write(
+        transcripts.join("sess-tools.jsonl"),
+        format!("{}\n", a_conversation_with_tools(&secret)),
+    )
+    .unwrap();
+
+    let mut store = store_in(dir.path());
+    import_all(&mut store, WORKSPACE, &TranscriptSource::new(&transcripts), WorkspaceMode::Local)
+        .unwrap();
+
+    let session = &store.sessions_for_workspace(WORKSPACE).unwrap()[0];
+    let calls = store.tool_calls_for_session(&session.id).unwrap();
+    assert_eq!(calls.len(), 2);
+
+    let ok = calls.iter().find(|c| c.tool_name == ToolName::Bash).expect("the Bash call");
+    assert_eq!(ok.status, ToolStatus::Completed);
+    assert_eq!(
+        String::from_utf8(store.tool_call_result(ok).unwrap().unwrap()).unwrap(),
+        "test result: ok"
+    );
+
+    let bad = calls.iter().find(|c| c.tool_name == ToolName::Read).expect("the Read call");
+    assert_eq!(bad.status, ToolStatus::Failed, "is_error maps to Failed");
+
+    // The facet counts are what the sidebar renders; they must not be empty for
+    // imported Sessions.
+    let counts = store.tool_call_counts(&session.id).unwrap();
+    assert_eq!(counts.iter().map(|(_, c)| c).sum::<i64>(), 2);
+
+    // Redaction applied identically: the quoted credential is gone, the
+    // identifier the JSON walk protects survives.
+    let args = ok.arguments.as_deref().unwrap();
+    assert!(!args.contains(&secret), "{args}");
+    assert!(args.contains("xJ3kQ9vB2mZ7pL5rT8wN4cF6yH1sD0gA"), "{args}");
+}
+
+#[test]
+fn re_importing_a_transcript_with_tools_does_not_duplicate_the_calls() {
+    // The block id is the idempotency key; a grown-file re-read must update,
+    // not append.
+    let dir = tempfile::tempdir().unwrap();
+    let transcripts = dir.path().join("transcripts");
+    std::fs::create_dir_all(&transcripts).unwrap();
+    let secret = ["hun", "ter2"].concat();
+    let body = a_conversation_with_tools(&secret);
+    std::fs::write(transcripts.join("sess-tools.jsonl"), format!("{body}\n")).unwrap();
+    let source = TranscriptSource::new(&transcripts);
+
+    let mut store = store_in(dir.path());
+    import_all(&mut store, WORKSPACE, &source, WorkspaceMode::Local).unwrap();
+    // The file grows, forcing a full re-read.
+    std::fs::write(
+        transcripts.join("sess-tools.jsonl"),
+        format!("{body}\n{}\n", line("assistant", "a2", "All done.")),
+    )
+    .unwrap();
+    import_all(&mut store, WORKSPACE, &source, WorkspaceMode::Local).unwrap();
+
+    let session = &store.sessions_for_workspace(WORKSPACE).unwrap()[0];
+    assert_eq!(store.tool_calls_for_session(&session.id).unwrap().len(), 2);
+}
+
 // ── Robustness ──────────────────────────────────────────────────────────────
 
 #[test]
@@ -296,6 +445,78 @@ fn malformed_lines_are_skipped_and_counted_and_the_file_still_imports() {
         2,
         "the good lines still import"
     );
+}
+
+#[test]
+fn a_uuid_less_transcript_imported_twice_does_not_duplicate() {
+    // Claude Code lines carry `uuid` today, but the importer must survive
+    // transcripts that do not: without an idempotency key, every growing-file
+    // re-read would duplicate everything before the growth.
+    let dir = tempfile::tempdir().unwrap();
+    let transcripts = dir.path().join("transcripts");
+    std::fs::create_dir_all(&transcripts).unwrap();
+    let bare = |kind: &str, text: &str| {
+        serde_json::json!({
+            "type": kind,
+            "message": { "content": text, "model": "opus-5" },
+        })
+        .to_string()
+    };
+    let first = bare("user", "first prompt without a uuid");
+    std::fs::write(transcripts.join("sess-bare.jsonl"), format!("{first}\n")).unwrap();
+    let source = TranscriptSource::new(&transcripts);
+
+    let mut store = store_in(dir.path());
+    import_all(&mut store, WORKSPACE, &source, WorkspaceMode::Local).unwrap();
+
+    // The file grows; the whole file is re-read.
+    std::fs::write(
+        transcripts.join("sess-bare.jsonl"),
+        format!("{first}\n{}\n", bare("assistant", "a reply, also without a uuid")),
+    )
+    .unwrap();
+    import_all(&mut store, WORKSPACE, &source, WorkspaceMode::Local).unwrap();
+
+    let session = &store.sessions_for_workspace(WORKSPACE).unwrap()[0];
+    let messages = store.messages_for_session(&session.id).unwrap();
+    assert_eq!(messages.len(), 2, "the first line must not import twice");
+}
+
+#[test]
+fn an_io_error_mid_file_does_not_claim_the_unread_tail() {
+    // `BufReader::lines` yields Err for a non-UTF-8 line, which ends the pass.
+    // Progress must not be recorded as the full file size, or the tail after
+    // the error would be skipped forever.
+    let dir = tempfile::tempdir().unwrap();
+    let transcripts = dir.path().join("transcripts");
+    std::fs::create_dir_all(&transcripts).unwrap();
+    let good = line("user", "u1", "Before the corruption");
+    let mut bytes = format!("{good}\n").into_bytes();
+    bytes.extend_from_slice(&[0xff, 0xfe, 0xfd]); // not UTF-8
+    bytes.extend_from_slice(b"\n");
+    std::fs::write(transcripts.join("sess-torn.jsonl"), &bytes).unwrap();
+    let source = TranscriptSource::new(&transcripts);
+
+    let mut store = store_in(dir.path());
+    import_all(&mut store, WORKSPACE, &source, WorkspaceMode::Local).unwrap();
+
+    let session = &store.sessions_for_workspace(WORKSPACE).unwrap()[0];
+    assert_eq!(store.messages_for_session(&session.id).unwrap().len(), 1);
+
+    // The file was not marked done, so the next pass re-examines it rather
+    // than treating it as unchanged — and the re-read duplicates nothing.
+    let second = import_all(&mut store, WORKSPACE, &source, WorkspaceMode::Local).unwrap();
+    assert_eq!(second.skipped_unchanged, 0, "an unfinished file is not 'done'");
+    assert_eq!(store.messages_for_session(&session.id).unwrap().len(), 1);
+
+    // Once the file is repaired, the tail imports.
+    std::fs::write(
+        transcripts.join("sess-torn.jsonl"),
+        format!("{good}\n{}\n", line("assistant", "a1", "After the repair")),
+    )
+    .unwrap();
+    import_all(&mut store, WORKSPACE, &source, WorkspaceMode::Local).unwrap();
+    assert_eq!(store.messages_for_session(&session.id).unwrap().len(), 2);
 }
 
 #[test]
@@ -443,6 +664,72 @@ fn the_preview_reports_real_numbers_for_the_confirmation() {
         preview.is_bulk_disclosure,
         "importing into a Cloud Workspace publishes months of terminal conversations"
     );
+}
+
+#[test]
+fn the_preview_counts_what_an_import_would_actually_take() {
+    // The dialog must not promise 3 sessions when 2 will be skipped — one
+    // already imported, one already captured live under another source.
+    let dir = tempfile::tempdir().unwrap();
+    let transcripts = dir.path().join("transcripts");
+    for id in ["already-imported", "captured-live", "genuinely-new"] {
+        transcript(&transcripts, id, &a_conversation());
+    }
+    let source = TranscriptSource::new(&transcripts);
+    let mut store = store_in(dir.path());
+
+    // One captured live via ACP first...
+    {
+        let mut capture = Capture::new(&mut store, WorkspaceMode::Local);
+        capture
+            .record_prompt(
+                &SessionKey {
+                    workspace_id: WORKSPACE.into(),
+                    source: Source::Acp,
+                    native_session_id: "captured-live".into(),
+                },
+                "live in Atlas",
+                1,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+    }
+    // ...and one imported by hiding the others, so only it is marked done.
+    let hidden = dir.path().join("hidden");
+    std::fs::create_dir_all(&hidden).unwrap();
+    for id in ["captured-live", "genuinely-new"] {
+        std::fs::rename(
+            transcripts.join(format!("{id}.jsonl")),
+            hidden.join(format!("{id}.jsonl")),
+        )
+        .unwrap();
+    }
+    import_all(&mut store, WORKSPACE, &source, WorkspaceMode::Local).unwrap();
+    for id in ["captured-live", "genuinely-new"] {
+        std::fs::rename(
+            hidden.join(format!("{id}.jsonl")),
+            transcripts.join(format!("{id}.jsonl")),
+        )
+        .unwrap();
+    }
+
+    let preview = atlas_checkpoint::import::preview_with_store(
+        &store,
+        WORKSPACE,
+        &source,
+        WorkspaceMode::Cloud,
+    );
+    assert_eq!(preview.session_count, 3, "everything on disk");
+    assert_eq!(
+        preview.new_session_count, 1,
+        "only the genuinely new file would import"
+    );
+
+    // Without a store the preview cannot know better and says so honestly.
+    let blind = import_preview(&source, WorkspaceMode::Cloud);
+    assert_eq!(blind.new_session_count, blind.session_count);
 }
 
 #[test]

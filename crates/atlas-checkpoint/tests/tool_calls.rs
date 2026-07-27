@@ -357,6 +357,126 @@ fn a_secret_in_the_arguments_is_absent_too() {
 }
 
 #[test]
+fn a_quoted_low_entropy_credential_in_json_arguments_is_redacted() {
+    // `{"password": "hunter2"}` is invisible to every flat layer: the entropy
+    // layer needs long tokens, the credential regex cannot match a quoted key.
+    // Only the JSON walk catches it — so the arguments must go through it.
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = store_in(dir.path());
+    let session_id = started(&mut store);
+    let mut capture = Capture::new(&mut store, WorkspaceMode::Local);
+
+    // Assembled at runtime so the fixture never contains a greppable secret.
+    let secret = ["hun", "ter2"].concat();
+    let arguments = serde_json::json!({
+        "host": "db.internal",
+        "user": "app",
+        "password": secret,
+    })
+    .to_string();
+    capture
+        .record_tool_call(
+            &session_id,
+            ToolCallContent {
+                turn_seq: 1,
+                native_call_id: Some("tc-1"),
+                tool_name: ToolName::Other,
+                title: Some("Connect to the database"),
+                kind: None,
+                status: ToolStatus::Completed,
+                locations: &no_locations(),
+                arguments: Some(&arguments),
+                result: None,
+            },
+        )
+        .unwrap();
+
+    let stored = store.tool_calls_for_session(&session_id).unwrap();
+    let args = stored[0].arguments.as_deref().unwrap();
+    assert!(!args.contains(&secret), "{args}");
+    assert!(args.contains("[REDACTED]"), "{args}");
+    // The envelope survives: the walk redacts leaves, not structure.
+    assert!(args.contains("db.internal"), "{args}");
+}
+
+#[test]
+fn json_identifiers_in_arguments_survive_redaction() {
+    // The flat entropy layer would shred a message id into [REDACTED]; the JSON
+    // walk's structural skip-list exists precisely to keep it.
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = store_in(dir.path());
+    let session_id = started(&mut store);
+    let mut capture = Capture::new(&mut store, WorkspaceMode::Local);
+
+    let id_value = "xJ3kQ9vB2mZ7pL5rT8wN4cF6yH1sD0gA";
+    let arguments =
+        serde_json::json!({ "message_id": id_value, "command": "cargo test" }).to_string();
+    capture
+        .record_tool_call(
+            &session_id,
+            ToolCallContent {
+                turn_seq: 1,
+                native_call_id: Some("tc-1"),
+                tool_name: ToolName::Bash,
+                title: None,
+                kind: Some("execute"),
+                status: ToolStatus::Completed,
+                locations: &no_locations(),
+                arguments: Some(&arguments),
+                result: None,
+            },
+        )
+        .unwrap();
+
+    let stored = store.tool_calls_for_session(&session_id).unwrap();
+    let args = stored[0].arguments.as_deref().unwrap();
+    assert!(args.contains(id_value), "identifier destroyed: {args}");
+    assert!(args.contains("cargo test"), "{args}");
+}
+
+#[test]
+fn a_json_shaped_tool_result_is_redacted_json_aware() {
+    // Results frequently print JSON — a `cat` of a config file, an API reply.
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = store_in(dir.path());
+    let session_id = started(&mut store);
+    let mut capture = Capture::new(&mut store, WorkspaceMode::Local);
+
+    let secret = ["hun", "ter2"].concat();
+    let result = serde_json::json!({
+        "host": "db.internal",
+        "user": "app",
+        "password": secret,
+        "request_id": "xJ3kQ9vB2mZ7pL5rT8wN4cF6yH1sD0gA",
+    })
+    .to_string();
+    capture
+        .record_tool_call(
+            &session_id,
+            ToolCallContent {
+                turn_seq: 1,
+                native_call_id: Some("tc-1"),
+                tool_name: ToolName::Bash,
+                title: None,
+                kind: Some("execute"),
+                status: ToolStatus::Completed,
+                locations: &no_locations(),
+                arguments: None,
+                result: Some(result.as_bytes()),
+            },
+        )
+        .unwrap();
+
+    let calls = store.tool_calls_for_session(&session_id).unwrap();
+    let stored = String::from_utf8(store.tool_call_result(&calls[0]).unwrap().unwrap()).unwrap();
+    assert!(!stored.contains(&secret), "{stored}");
+    assert!(
+        stored.contains("xJ3kQ9vB2mZ7pL5rT8wN4cF6yH1sD0gA"),
+        "identifier destroyed: {stored}"
+    );
+}
+
+#[test]
 fn a_binary_result_is_stored_intact_marked_binary_and_round_trips_byte_identically() {
     // Lossily decoding it to scan would corrupt the payload on the way back out,
     // and there is no secret to find in bytes that cannot be read as text.

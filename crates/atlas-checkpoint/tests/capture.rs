@@ -36,6 +36,7 @@ fn assistant(turn_seq: i64, body: &str) -> TurnContent {
         role: Role::Assistant,
         mode: Mode::Text,
         body: body.to_string(),
+        created_at: None,
     }
 }
 
@@ -197,6 +198,7 @@ fn role_and_mode_are_columns_so_the_sidebar_counts_need_no_body_read() {
                 role: Role::Assistant,
                 mode: Mode::Thinking,
                 body: "Considering a token bucket versus a leaky bucket.".into(),
+                created_at: None,
             },
         )
         .unwrap();
@@ -384,6 +386,95 @@ fn two_concurrent_sessions_in_one_workspace_stay_separate() {
 }
 
 #[test]
+fn a_resubmitted_prompt_does_not_duplicate_the_user_message() {
+    // A frontend retry of the send, or a re-processed delta: same turn, same
+    // text. The prompt has no agent-issued id, so capture synthesises a
+    // deterministic one — without it every retry would insert a second row.
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = store_in(dir.path());
+    let mut capture = Capture::new(&mut store, WorkspaceMode::Local);
+
+    let first = capture
+        .record_prompt(&key("s"), "Add rate limiting", 1, None, None, None)
+        .unwrap();
+    let second = capture
+        .record_prompt(&key("s"), "Add rate limiting", 1, None, None, None)
+        .unwrap();
+    assert_eq!(first, second);
+
+    let prompts = store
+        .messages_for_session(&first)
+        .unwrap()
+        .into_iter()
+        .filter(|m| m.role == Role::User)
+        .count();
+    assert_eq!(prompts, 1, "a retried send is one prompt, not two");
+}
+
+#[test]
+fn distinct_prompts_on_later_turns_still_record() {
+    // The synthesised id must dedupe retries without swallowing real prompts.
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = store_in(dir.path());
+    let mut capture = Capture::new(&mut store, WorkspaceMode::Local);
+
+    let session_id = capture
+        .record_prompt(&key("s"), "First question", 1, None, None, None)
+        .unwrap();
+    capture
+        .record_prompt(&key("s"), "Second question", 2, None, None, None)
+        .unwrap();
+    // Same turn number resubmitted with edited text is a different prompt too.
+    capture
+        .record_prompt(&key("s"), "Second question, edited", 2, None, None, None)
+        .unwrap();
+
+    let prompts = store
+        .messages_for_session(&session_id)
+        .unwrap()
+        .into_iter()
+        .filter(|m| m.role == Role::User)
+        .count();
+    assert_eq!(prompts, 3);
+}
+
+#[test]
+fn a_turn_recorded_with_its_own_timestamp_keeps_it() {
+    // The importer passes the transcript's clock; live capture passes None and
+    // gets "now". This is what keeps a year of imported history from all dating
+    // to the day the import ran.
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = store_in(dir.path());
+    let mut capture = Capture::new(&mut store, WorkspaceMode::Local);
+
+    let session_id = capture.record_prompt(&key("s"), "hi", 1, None, None, None).unwrap();
+    let then = chrono::DateTime::parse_from_rfc3339("2025-03-04T05:06:07Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    capture
+        .record_turn(
+            &session_id,
+            TurnContent {
+                turn_seq: 1,
+                native_message_id: Some("m-1".into()),
+                role: Role::Assistant,
+                mode: Mode::Text,
+                body: "an old answer".into(),
+                created_at: Some(then),
+            },
+        )
+        .unwrap();
+
+    let stored = store
+        .messages_for_session(&session_id)
+        .unwrap()
+        .into_iter()
+        .find(|m| m.role == Role::Assistant)
+        .unwrap();
+    assert_eq!(stored.created_at, then);
+}
+
+#[test]
 fn re_processing_the_same_turn_does_not_duplicate_the_message() {
     let dir = tempfile::tempdir().unwrap();
     let mut store = store_in(dir.path());
@@ -396,6 +487,7 @@ fn re_processing_the_same_turn_does_not_duplicate_the_message() {
         role: Role::Assistant,
         mode: Mode::Text,
         body: "the answer".into(),
+        created_at: None,
     };
 
     assert!(capture.record_turn(&session_id, content.clone()).unwrap().is_some());

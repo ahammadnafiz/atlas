@@ -101,6 +101,18 @@ impl GitWatcherState {
         self.watchers.read().contains_key(workspace_id)
     }
 
+    /// Is any watcher attached for this repository root?
+    ///
+    /// The registry is keyed by the workspace UUID the frontend supplies, but
+    /// health callers only reliably know the project path — and looking a path
+    /// up in a UUID-keyed map answered `false` forever, turning an omitted
+    /// optional parameter into a permanent false "capture stopped". Each
+    /// watcher also remembers its root, so liveness is answerable by either
+    /// key.
+    pub fn is_watching_root(&self, root: &Path) -> bool {
+        self.watchers.read().values().any(|w| w.root == root)
+    }
+
     /// Shared handle for the watcher closure to invalidate the cache
     /// from outside `impl GitWatcherState`. Arc-cloning is constant
     /// time; the closure ends up owning a second Arc and writes
@@ -128,12 +140,16 @@ pub async fn git_watch_start(
 ) -> Result<(), String> {
     let key = workspace_id.unwrap_or_else(|| project_path.clone());
     let root = PathBuf::from(&project_path);
-    let dot_git = root.join(".git");
-    if !dot_git.is_dir() {
+    // `.git` may be a directory (an ordinary repository) or a file carrying a
+    // `gitdir:` pointer (a linked worktree). Both are valid repositories, and
+    // refusing the file form left every worktree permanently unwatched — with
+    // the health signal telling the user to "reopen the Workspace", which
+    // could never fix it.
+    let Some(git_dirs) = resolve_git_dirs(&root) else {
         // Not a git project — leave any existing watcher alone (caller
         // may switch projects in/out of a non-repo).
         return Ok(());
-    }
+    };
 
     // Idempotent: if this workspace already watches the same root (e.g. on a
     // switch back), don't drop + recreate the watcher.
@@ -202,12 +218,15 @@ pub async fn git_watch_start(
             )
             .map_err(|e| format!("failed to create git watcher: {e}"))?;
 
-            // Targeted watches — see module doc for rationale.
-            let dot_git = root_for_task.join(".git");
-            let head = dot_git.join("HEAD");
-            let packed_refs = dot_git.join("packed-refs");
-            let refs_dir = dot_git.join("refs");
-            let index = dot_git.join("index");
+            // Targeted watches — see module doc for rationale. For a linked
+            // worktree, HEAD and the index live in its private gitdir while
+            // refs and packed-refs live in the shared common dir; watching the
+            // shared refs also surfaces commits made from sibling worktrees,
+            // which the debounced walk handles as ordinary no-ops.
+            let head = git_dirs.git_dir.join("HEAD");
+            let packed_refs = git_dirs.common_dir.join("packed-refs");
+            let refs_dir = git_dirs.common_dir.join("refs");
+            let index = git_dirs.git_dir.join("index");
 
             for (label, path, recursive) in [
                 ("HEAD", head, RecursiveMode::NonRecursive),
@@ -295,6 +314,50 @@ pub fn git_watch_status(
             root: None,
         },
     }
+}
+
+/// Where a repository's git metadata actually lives.
+struct GitDirs {
+    /// The repository's own gitdir: `.git/` for an ordinary checkout, or the
+    /// `.git/worktrees/<name>/` directory a worktree's `.git` file points at.
+    /// HEAD and the index live here.
+    git_dir: PathBuf,
+    /// The shared directory holding refs and packed-refs. Identical to
+    /// `git_dir` except for linked worktrees, whose `commondir` file points
+    /// back at the main repository's `.git/`.
+    common_dir: PathBuf,
+}
+
+/// Resolve the watchable git directories for a project root, accepting both an
+/// ordinary `.git/` directory and a worktree's `.git` gitdir-pointer file.
+fn resolve_git_dirs(root: &Path) -> Option<GitDirs> {
+    let dot_git = root.join(".git");
+    if dot_git.is_dir() {
+        return Some(GitDirs { git_dir: dot_git.clone(), common_dir: dot_git });
+    }
+    if !dot_git.is_file() {
+        return None;
+    }
+
+    // A gitdir pointer: `gitdir: /path/to/repo/.git/worktrees/<name>`.
+    let content = std::fs::read_to_string(&dot_git).ok()?;
+    let pointer = content.strip_prefix("gitdir:")?.trim();
+    let git_dir = {
+        let p = Path::new(pointer);
+        if p.is_absolute() { p.to_path_buf() } else { root.join(p) }
+    };
+    if !git_dir.is_dir() {
+        return None;
+    }
+
+    let common_dir = match std::fs::read_to_string(git_dir.join("commondir")) {
+        Ok(raw) => {
+            let p = Path::new(raw.trim());
+            if p.is_absolute() { p.to_path_buf() } else { git_dir.join(p) }
+        }
+        Err(_) => git_dir.clone(),
+    };
+    Some(GitDirs { git_dir, common_dir })
 }
 
 /// Allow other modules (e.g. `git_status` post-write or future

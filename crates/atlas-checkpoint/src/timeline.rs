@@ -109,6 +109,9 @@ pub struct TimelineEntry {
     /// The body was too large to inline and `text` is the preview.
     pub truncated: bool,
     pub body_bytes: i64,
+    /// Blob key of the full body when it was spilled — the handle the viewer
+    /// uses to fetch the rest on demand.
+    pub body_ref: Option<String>,
 
     // ── Tool calls ──────────────────────────────────────────────────────────
     /// Canonical name — `read`, `edit`, `bash`, … — not the wire name, which
@@ -120,7 +123,10 @@ pub struct TimelineEntry {
     /// Files the call touched, for the one-line summary next to the tool name.
     pub paths: Vec<String>,
     pub arguments: Option<String>,
+    pub arguments_ref: Option<String>,
     pub result: Option<String>,
+    /// Blob key of the full result when it was spilled.
+    pub result_ref: Option<String>,
     /// The result was binary and is not shown.
     pub result_binary: bool,
 
@@ -148,12 +154,15 @@ impl TimelineEntry {
             text: None,
             truncated: false,
             body_bytes: 0,
+            body_ref: None,
             tool_name: None,
             tool_title: None,
             tool_status: None,
             paths: Vec::new(),
             arguments: None,
+            arguments_ref: None,
             result: None,
+            result_ref: None,
             result_binary: false,
             commit_sha: None,
             commit_subject: None,
@@ -214,10 +223,13 @@ pub fn sessions(store: &Store, workspace_id: &str) -> Result<Vec<SessionSummary>
 }
 
 /// One Session's summary row.
+///
+/// Message and tool-call totals come from `COUNT(*)` over their covering
+/// indexes — the list view must never materialise a body just to `.len()` it.
+/// Checkpoint rows *are* fetched: a Session has a handful at most, and the
+/// branch list, line counts and file set live on them.
 fn summarize(store: &Store, session: &Session) -> Result<SessionSummary> {
     let checkpoints = store.checkpoints_for_session(&session.id)?;
-    let tool_calls = store.tool_calls_for_session(&session.id)?;
-    let messages = store.messages_for_session(&session.id)?;
 
     let mut branches: Vec<String> =
         checkpoints.iter().filter_map(|c| c.branch.clone()).collect();
@@ -240,8 +252,8 @@ fn summarize(store: &Store, session: &Session) -> Result<SessionSummary> {
         started_at: session.started_at.to_rfc3339(),
         updated_at: session.updated_at.to_rfc3339(),
         duration_seconds: (session.updated_at - session.started_at).num_seconds().max(0),
-        message_count: messages.len() as i64,
-        tool_call_count: tool_calls.len() as i64,
+        message_count: store.message_count(&session.id)?,
+        tool_call_count: store.tool_call_count(&session.id)?,
         checkpoint_count: checkpoints.len() as i64,
         branches,
         insertions: checkpoints.iter().map(|c| c.insertions).sum(),
@@ -372,6 +384,7 @@ fn message_entry(store: &Store, message: &Message) -> Result<Option<TimelineEntr
     entry.text = text.or_else(|| Some(message.preview.clone()));
     entry.truncated = truncated;
     entry.body_bytes = message.body_bytes;
+    entry.body_ref = message.body_ref.clone();
     Ok(Some(entry))
 }
 
@@ -392,6 +405,8 @@ fn tool_call_entry(
     entry.paths =
         touches.iter().filter(|t| t.tool_call_id == call.id).map(|t| t.path.clone()).collect();
     entry.arguments = call.arguments.clone();
+    entry.arguments_ref = call.arguments_ref.clone();
+    entry.result_ref = call.result_ref.clone();
     entry.result_binary = call.result_binary;
     if !call.result_binary {
         entry.result = match store.tool_call_result(call) {

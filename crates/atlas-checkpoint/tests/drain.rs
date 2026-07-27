@@ -26,6 +26,9 @@ use atlas_checkpoint::{
 };
 
 const WORKSPACE: &str = "ws-atlas";
+/// The server-assigned wire identity — deliberately distinct from the local
+/// row key above, so a test can assert the payload never carries the local one.
+const WIRE_WORKSPACE: &str = "rw-atlas-remote";
 const ORG: &str = "org-tryatlas";
 
 // ── A stub ingest server ────────────────────────────────────────────────────
@@ -39,26 +42,46 @@ enum Reply {
     Status(u16),
     /// Accept, but only once the token has been refreshed.
     ExpireOnce,
+    /// 400 for any batch whose raw body contains this substring; accept the
+    /// rest. Content-based, so it models a server that rejects whole batches
+    /// without naming the offending row — the case the bisect exists for.
+    RejectContaining(String),
+    /// 429 with a `Retry-After` header of this many seconds.
+    RetryAfter(u64),
 }
 
 struct Stub {
     base_url: String,
     received: Arc<Mutex<Vec<AtlasArtifact>>>,
     blobs: Arc<Mutex<Vec<String>>>,
+    ingest_calls: Arc<AtomicUsize>,
+    blob_calls: Arc<AtomicUsize>,
+    blob_tokens: Arc<Mutex<Vec<String>>>,
 }
 
 impl Stub {
     fn start(replies: Vec<Reply>, blob_status: u16) -> Self {
+        Self::start_full(replies, Vec::new(), blob_status)
+    }
+
+    /// `blob_replies` answers blob uploads by call index; `blob_status` is the
+    /// fallback once the list is exhausted.
+    fn start_full(replies: Vec<Reply>, blob_replies: Vec<u16>, blob_status: u16) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
         let base_url = format!("http://{}", listener.local_addr().unwrap());
         let received = Arc::new(Mutex::new(Vec::new()));
         let blobs = Arc::new(Mutex::new(Vec::new()));
         let ingest_calls = Arc::new(AtomicUsize::new(0));
+        let blob_calls = Arc::new(AtomicUsize::new(0));
+        let blob_tokens = Arc::new(Mutex::new(Vec::new()));
 
         let stub = Self {
             base_url,
             received: received.clone(),
             blobs: blobs.clone(),
+            ingest_calls: ingest_calls.clone(),
+            blob_calls: blob_calls.clone(),
+            blob_tokens: blob_tokens.clone(),
         };
 
         std::thread::spawn(move || {
@@ -68,10 +91,13 @@ impl Stub {
                 handle(
                     stream,
                     &replies,
+                    &blob_replies,
                     blob_status,
                     &received,
                     &blobs,
                     &ingest_calls,
+                    &blob_calls,
+                    &blob_tokens,
                     &mut seen_tokens,
                 );
             }
@@ -86,15 +112,31 @@ impl Stub {
     fn blob_keys(&self) -> Vec<String> {
         self.blobs.lock().unwrap().clone()
     }
+
+    fn ingest_calls(&self) -> usize {
+        self.ingest_calls.load(Ordering::SeqCst)
+    }
+
+    fn blob_calls(&self) -> usize {
+        self.blob_calls.load(Ordering::SeqCst)
+    }
+
+    fn blob_tokens(&self) -> Vec<String> {
+        self.blob_tokens.lock().unwrap().clone()
+    }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle(
     mut stream: TcpStream,
     replies: &[Reply],
+    blob_replies: &[u16],
     blob_status: u16,
     received: &Arc<Mutex<Vec<AtlasArtifact>>>,
     blobs: &Arc<Mutex<Vec<String>>>,
     ingest_calls: &Arc<AtomicUsize>,
+    blob_calls: &Arc<AtomicUsize>,
+    blob_tokens: &Arc<Mutex<Vec<String>>>,
     seen_tokens: &mut Vec<String>,
 ) {
     let mut reader = BufReader::new(stream.try_clone().unwrap());
@@ -130,14 +172,19 @@ fn handle(
 
     // Blob upload.
     if request_line.starts_with("PUT /blobs/") {
-        if let Some(key) = request_line
-            .split_whitespace()
-            .nth(1)
-            .and_then(|p| p.strip_prefix("/blobs/"))
-        {
-            blobs.lock().unwrap().push(key.to_string());
+        let call = blob_calls.fetch_add(1, Ordering::SeqCst);
+        let status = blob_replies.get(call).copied().unwrap_or(blob_status);
+        blob_tokens.lock().unwrap().push(token);
+        if (200..300).contains(&status) {
+            if let Some(key) = request_line
+                .split_whitespace()
+                .nth(1)
+                .and_then(|p| p.strip_prefix("/blobs/"))
+            {
+                blobs.lock().unwrap().push(key.to_string());
+            }
         }
-        respond(&mut stream, blob_status, "{}");
+        respond(&mut stream, status, "{}");
         return;
     }
 
@@ -209,6 +256,17 @@ fn handle(
             );
         }
         Reply::Status(code) => respond(&mut stream, code, "{}"),
+        Reply::RejectContaining(marker) => {
+            if String::from_utf8_lossy(&body).contains(marker.as_str()) {
+                respond(&mut stream, 400, "{}");
+            } else {
+                received.lock().unwrap().extend(artifacts);
+                respond(&mut stream, 202, "{}");
+            }
+        }
+        Reply::RetryAfter(secs) => {
+            respond_with_header(&mut stream, 429, &format!("Retry-After: {secs}"), "{}");
+        }
     }
 }
 
@@ -216,6 +274,15 @@ fn respond(stream: &mut TcpStream, status: u16, body: &str) {
     let _ = write!(
         stream,
         "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let _ = stream.flush();
+}
+
+fn respond_with_header(stream: &mut TcpStream, status: u16, header: &str, body: &str) {
+    let _ = write!(
+        stream,
+        "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\n{header}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
     let _ = stream.flush();
@@ -254,6 +321,7 @@ fn record(store: &mut Store, native_id: &str, body: &str) -> String {
                 role: Role::Assistant,
                 mode: atlas_checkpoint::Mode::Text,
                 body: body.to_string(),
+                created_at: None,
             },
         )
         .expect("turn");
@@ -265,6 +333,7 @@ fn config<'a>(base_url: &str, token: &'a dyn Fn() -> Option<String>) -> SyncConf
         base_url: base_url.to_string(),
         org_id: ORG.to_string(),
         workspace_id: WORKSPACE.to_string(),
+        wire_workspace_id: WIRE_WORKSPACE.to_string(),
         token,
         timeout: Duration::from_secs(5),
     }
@@ -308,6 +377,28 @@ fn no_author_field_is_ever_sent() {
         let json = serde_json::to_string(&artifact).unwrap();
         assert!(!json.contains("authorId"), "{json}");
         assert!(!json.contains("author_id"), "{json}");
+    }
+}
+
+#[test]
+fn the_wire_workspace_id_is_never_the_local_row_key() {
+    // The local row key is the project path — machine-specific, privacy-bearing,
+    // and useless to the server for converging two teammates onto one timeline.
+    // Every artifact must carry the registered wire identity instead.
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = cloud_store(dir.path());
+    record(&mut store, "s1", "hello");
+
+    let stub = Stub::start(vec![], 200);
+    let token = always_token();
+    drain(&store, &config(&stub.base_url, &token)).unwrap();
+
+    let artifacts = stub.artifacts();
+    assert!(!artifacts.is_empty());
+    for artifact in artifacts {
+        let json = serde_json::to_string(&artifact).unwrap();
+        assert!(json.contains(WIRE_WORKSPACE), "{json}");
+        assert!(!json.contains(&format!("\"{WORKSPACE}\"")), "{json}");
     }
 }
 
@@ -536,7 +627,7 @@ fn batches_respect_the_count_ceiling() {
     }
 
     let batch = store
-        .pending_artifacts(WORKSPACE, ORG, atlas_checkpoint::sync::MAX_BATCH_COUNT, usize::MAX)
+        .pending_artifacts(WORKSPACE, WIRE_WORKSPACE, ORG, atlas_checkpoint::sync::MAX_BATCH_COUNT, usize::MAX)
         .unwrap();
     assert!(batch.len() <= atlas_checkpoint::sync::MAX_BATCH_COUNT);
 }
@@ -551,10 +642,229 @@ fn batches_respect_the_byte_ceiling_independently_of_the_count() {
         record(&mut store, &format!("s{i}"), &"x".repeat(40_000));
     }
 
-    let batch = store.pending_artifacts(WORKSPACE, ORG, 100, 64 * 1024).unwrap();
+    let batch = store.pending_artifacts(WORKSPACE, WIRE_WORKSPACE, ORG, 100, 64 * 1024).unwrap();
     let bytes: usize = batch.iter().map(|a| a.approx_bytes()).sum();
     assert!(batch.len() < 100, "the byte ceiling bit before the count did");
     assert!(bytes < 512 * 1024, "batch was {bytes} bytes");
+}
+
+// ── Batch-level rejection: the bisect ───────────────────────────────────────
+
+#[test]
+fn a_batch_level_rejection_bisects_to_the_poison_row_and_the_rest_drain() {
+    // The server refuses whole batches without naming a row — today's contract.
+    // The drain must converge on the offender within one call: halve, retry,
+    // convict the single-row batch, and everything else still reaches the
+    // Organisation.
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = cloud_store(dir.path());
+    record(&mut store, "s1", "a perfectly fine answer");
+    record(&mut store, "s2", "poison marker that fails any batch carrying it");
+    record(&mut store, "s3", "another fine answer");
+
+    let stub = Stub::start(
+        vec![Reply::RejectContaining("poison marker".into()); 64],
+        200,
+    );
+    let token = always_token();
+    let outcome = drain(&store, &config(&stub.base_url, &token)).expect("drain converges");
+
+    assert_eq!(outcome.failed, 1, "exactly the poison row was convicted");
+    assert_eq!(outcome.sent, 8, "3 sessions + 6 messages, minus the poison");
+    assert_eq!(outcome.still_pending, 0, "nothing left stalled behind the poison");
+    assert_eq!(
+        store.row_count_in_state(WORKSPACE, atlas_checkpoint::SyncState::Failed).unwrap(),
+        1
+    );
+    assert!(
+        stub.ingest_calls() <= 12,
+        "convergence is bounded, took {} passes",
+        stub.ingest_calls()
+    );
+}
+
+#[test]
+fn convicted_rows_can_be_re_pended_and_then_drain() {
+    // The failed → pending transition of the outbox state machine: a deliberate
+    // retry gives every convicted row another chance.
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = cloud_store(dir.path());
+    record(&mut store, "s1", "rejected wholesale the first time");
+
+    let rejecting = Stub::start(vec![Reply::Status(400); 16], 200);
+    let token = always_token();
+    let first = drain(&store, &config(&rejecting.base_url, &token)).unwrap();
+
+    assert_eq!(first.failed, 3, "every row was convicted one by one");
+    assert_eq!(first.still_pending, 0);
+    assert_eq!(first.status, DrainStatus::Drained, "nothing pending remains");
+    assert!(
+        rejecting.ingest_calls() <= 8,
+        "conviction is bounded, took {} passes",
+        rejecting.ingest_calls()
+    );
+
+    assert_eq!(store.retry_failed_rows(WORKSPACE).unwrap(), 3);
+
+    let accepting = Stub::start(vec![], 200);
+    let second = drain(&store, &config(&accepting.base_url, &token)).unwrap();
+    assert_eq!(second.status, DrainStatus::Drained);
+    assert_eq!(second.sent, 3, "the re-pended rows drained");
+    assert_eq!(
+        store.row_count_in_state(WORKSPACE, atlas_checkpoint::SyncState::Failed).unwrap(),
+        0
+    );
+}
+
+// ── Auth on the blob path ───────────────────────────────────────────────────
+
+#[test]
+fn a_blob_upload_401_refreshes_the_token_and_the_drain_completes() {
+    // The multi-hour first drain expires tokens during the blob phase too, not
+    // only between pushes.
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = cloud_store(dir.path());
+    record(&mut store, "s1", &"log output\n".repeat(20_000));
+
+    let stub = Stub::start_full(vec![], vec![401], 200);
+    let calls = std::sync::atomic::AtomicUsize::new(0);
+    let token = move || {
+        let n = calls.fetch_add(1, Ordering::SeqCst);
+        Some(format!("token-{n}"))
+    };
+
+    let outcome = drain(&store, &config(&stub.base_url, &token)).unwrap();
+    assert_eq!(outcome.status, DrainStatus::Drained);
+    assert!(outcome.sent > 0, "the drain resumed after refreshing");
+    assert!(outcome.blobs_uploaded > 0, "the blob went up on the retry");
+
+    let tokens = stub.blob_tokens();
+    assert!(tokens.len() >= 2, "the blob upload was retried");
+    assert_ne!(tokens[0], tokens[1], "the retry carried a fresh token");
+}
+
+#[test]
+fn a_blob_upload_403_surfaces_not_authorized_and_rows_stay_pending() {
+    // Membership revoked mid-drain during the blob phase must be as terminal —
+    // and as visible — as on the push path, never silently deferred and
+    // reported as drained.
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = cloud_store(dir.path());
+    record(&mut store, "s1", &"log output\n".repeat(20_000));
+
+    let stub = Stub::start(vec![], 403);
+    let token = always_token();
+    let outcome = drain(&store, &config(&stub.base_url, &token)).unwrap();
+
+    assert_eq!(outcome.status, DrainStatus::NotAuthorized);
+    assert_eq!(outcome.sent, 0, "nothing was sent");
+    assert_eq!(outcome.failed, 0, "a 403 is not the rows' fault");
+    assert!(outcome.still_pending > 0, "rows stay pending, honestly reported");
+    assert!(stub.artifacts().is_empty());
+    assert_eq!(stub.blob_calls(), 1, "the drain stopped instead of retrying");
+}
+
+// ── Permanently unsendable rows ─────────────────────────────────────────────
+
+#[test]
+fn a_missing_local_blob_fails_its_row_and_everything_else_drains() {
+    // A deleted `.atlas/blobs` shard, or a database restored without its
+    // blobs: the bytes are gone, so the row is failed now rather than left as
+    // an eternal "1 pending" that never clears.
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = cloud_store(dir.path());
+    record(&mut store, "s1", &"log output\n".repeat(20_000));
+    record(&mut store, "s2", "a small answer that still drains");
+    std::fs::remove_dir_all(dir.path().join(".atlas").join("blobs")).expect("blobs deleted");
+
+    let stub = Stub::start(vec![], 200);
+    let token = always_token();
+    let outcome = drain(&store, &config(&stub.base_url, &token)).unwrap();
+
+    assert_eq!(outcome.failed, 1, "the blob-less row failed");
+    assert!(outcome.sent > 0, "everything else drained");
+    assert_eq!(outcome.still_pending, 0);
+    assert_eq!(outcome.status, DrainStatus::Drained, "an honest Drained: nothing pending remains");
+    assert_eq!(
+        store.row_count_in_state(WORKSPACE, atlas_checkpoint::SyncState::Failed).unwrap(),
+        1
+    );
+    for artifact in stub.artifacts() {
+        assert!(
+            artifact.blob_refs().is_empty(),
+            "the row with the missing blob was never sent"
+        );
+    }
+}
+
+// ── The 401 hot-loop guard ──────────────────────────────────────────────────
+
+#[test]
+fn a_persistent_401_refreshes_exactly_once_then_stops() {
+    // Every mint yields a byte-different JWT, so an unguarded "refresh and
+    // retry on 401" spins forever against a server that keeps rejecting the
+    // credential (clock skew, key rotation, audience mismatch).
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = cloud_store(dir.path());
+    record(&mut store, "s1", "hello");
+
+    let stub = Stub::start(vec![Reply::Status(401); 8], 200);
+    let calls = std::sync::atomic::AtomicUsize::new(0);
+    let token = move || {
+        let n = calls.fetch_add(1, Ordering::SeqCst);
+        Some(format!("token-{n}"))
+    };
+
+    let outcome = drain(&store, &config(&stub.base_url, &token)).unwrap();
+    assert_eq!(outcome.status, DrainStatus::NoCredential);
+    assert_eq!(
+        stub.ingest_calls(),
+        2,
+        "one original attempt plus exactly one refreshed retry"
+    );
+    assert!(outcome.still_pending > 0, "rows stay pending for a later, fixed credential");
+}
+
+// ── Batch construction edge ─────────────────────────────────────────────────
+
+#[test]
+fn a_single_artifact_over_the_byte_ceiling_still_ships_alone() {
+    // The ceiling is checked before appending, except when the batch is empty:
+    // one oversized artifact ships by itself rather than deadlocking the queue.
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = cloud_store(dir.path());
+    record(&mut store, "s1", &"x".repeat(10_000));
+
+    let mut passes = 0;
+    loop {
+        let batch = store.pending_artifacts(WORKSPACE, WIRE_WORKSPACE, ORG, 100, 1).unwrap();
+        if batch.is_empty() {
+            break;
+        }
+        assert_eq!(batch.len(), 1, "every artifact dwarfs the ceiling, so each ships alone");
+        store.mark_sent(batch[0].row_id()).unwrap();
+        passes += 1;
+        assert!(passes <= 10, "the queue drains rather than deadlocking");
+    }
+    assert_eq!(passes, 3, "session + prompt + response each shipped alone");
+}
+
+// ── Backoff hints ───────────────────────────────────────────────────────────
+
+#[test]
+fn a_429_carries_the_servers_retry_after_hint_into_the_outcome() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = cloud_store(dir.path());
+    record(&mut store, "s1", "hello");
+
+    let stub = Stub::start(vec![Reply::RetryAfter(7)], 200);
+    let token = always_token();
+    let outcome = drain(&store, &config(&stub.base_url, &token)).unwrap();
+
+    assert_eq!(outcome.status, DrainStatus::RateLimited);
+    assert_eq!(outcome.retry_after, Some(Duration::from_secs(7)));
+    assert_eq!(outcome.failed, 0, "a rate limit is not a poison row");
+    assert!(outcome.still_pending > 0);
 }
 
 // ── Local mode never drains ─────────────────────────────────────────────────

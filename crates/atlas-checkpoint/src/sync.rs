@@ -19,16 +19,31 @@
 //! # Failure is a state machine, not an error
 //!
 //! * **Offline / 5xx** — rows stay pending, backoff, nothing surfaces.
-//! * **429** — honoured with backoff. A rate limit is not a poison row.
-//! * **401** — the access token expired. Refresh and continue *mid-drain*:
-//!   tokens are short-lived and a post-promotion first drain runs far longer
-//!   than one token lifetime.
-//! * **403** — terminal. Removed from the Organisation, or the Workspace was
-//!   deleted. Retrying forever would be a permanent spinner; this stops and
-//!   says "no longer authorized". Local capture continues untouched.
+//! * **429** — honoured with backoff. A rate limit is not a poison row. The
+//!   server's `Retry-After` hint, when present, travels out in the outcome so
+//!   the host's scheduler can honour it instead of guessing.
+//! * **401** — the access token expired. Refresh **once per drain** and
+//!   continue *mid-drain*: tokens are short-lived and a post-promotion first
+//!   drain runs far longer than one token lifetime. Exactly once, because a
+//!   freshly-minted JWT always differs from the previous one — refreshing on
+//!   every 401 against a server that keeps saying 401 (clock skew, key
+//!   rotation, audience mismatch) is a hot loop, not a retry.
+//! * **403** — terminal, on the push path *and* the blob path. Removed from
+//!   the Organisation, or the Workspace was deleted. Retrying forever would be
+//!   a permanent spinner; this stops and says "no longer authorized". Local
+//!   capture continues untouched.
 //! * **A single bad row** — marked failed and skipped, so one malformed record
-//!   never stalls everything behind it.
+//!   never stalls everything behind it. Per-artifact results handle this when
+//!   the server sends them; when it rejects a whole batch without naming a
+//!   row, the drain **bisects**: the batch is halved and retried until a
+//!   single-row batch is refused, and that row is the convicted poison. As a
+//!   cross-invocation backstop, rows whose attempts exhaust [`MAX_ATTEMPTS`]
+//!   are retired to `failed` at the start of every drain.
+//! * **A blob missing locally, or permanently too large (413)** — a
+//!   permanently unsendable row. Marked failed immediately (the bytes are
+//!   gone, or will never fit), never deferred forever under a pending count.
 
+use std::collections::HashSet;
 use std::time::Duration;
 
 use crate::artifacts::*;
@@ -100,6 +115,9 @@ pub struct DrainOutcome {
     /// objects, logged so a future GC can reap them.
     pub orphaned_blobs: usize,
     pub still_pending: i64,
+    /// The server's `Retry-After` hint from a 429, when it sent one, so the
+    /// host's scheduler can honour it rather than guessing a backoff.
+    pub retry_after: Option<Duration>,
 }
 
 /// Everything the drain needs from the host.
@@ -112,7 +130,13 @@ pub struct DrainOutcome {
 pub struct SyncConfig<'a> {
     pub base_url: String,
     pub org_id: String,
+    /// Keys the local rows: the path they were written under.
     pub workspace_id: String,
+    /// Stamped into every artifact as `workspaceId` — the server-assigned
+    /// Workspace id (or slug fallback), never the local filesystem path, which
+    /// no teammate shares and which would leak the directory layout to the
+    /// whole Organisation.
+    pub wire_workspace_id: String,
     /// Mint or return a current access token. `None` means "not signed in",
     /// which parks the drain rather than failing it.
     pub token: &'a dyn Fn() -> Option<String>,
@@ -141,7 +165,15 @@ pub fn drain(store: &Store, config: &SyncConfig<'_>) -> Result<DrainOutcome> {
         blobs_uploaded: 0,
         orphaned_blobs: 0,
         still_pending: 0,
+        retry_after: None,
     };
+
+    // Cross-invocation backstop for the bisect below: a row whose attempts
+    // exhausted the cap leaves the queue before this pass builds its first
+    // batch, so convergence survives even a drain that keeps being interrupted
+    // before its in-call bisect finishes.
+    outcome.failed +=
+        store.mark_exhausted_rows_failed(&config.workspace_id, MAX_ATTEMPTS)? as usize;
 
     let Some(mut token) = (config.token)() else {
         outcome.status = DrainStatus::NoCredential;
@@ -151,11 +183,24 @@ pub fn drain(store: &Store, config: &SyncConfig<'_>) -> Result<DrainOutcome> {
 
     let client = config.client()?;
 
+    // One token refresh per drain invocation. A freshly-minted JWT always
+    // differs from the last (new `iat`), so "refresh whenever the server says
+    // 401" spins at full speed the moment the rejection is for any persistent
+    // reason. One refresh covers the legitimate case — expiry mid-drain — and
+    // a second consecutive 401 stops with `NoCredential`.
+    let mut refreshed = false;
+
+    // The bisect ladder. A batch-level rejection names no row, so the batch is
+    // halved and retried *within this call* until a single-row batch is
+    // refused — that row is the poison, marked failed, and the ladder resets.
+    let mut max_count = MAX_BATCH_COUNT;
+
     loop {
         let batch = store.pending_artifacts(
             &config.workspace_id,
+            &config.wire_workspace_id,
             &config.org_id,
-            MAX_BATCH_COUNT,
+            max_count,
             MAX_BATCH_BYTES,
         )?;
         if batch.is_empty() {
@@ -163,18 +208,78 @@ pub fn drain(store: &Store, config: &SyncConfig<'_>) -> Result<DrainOutcome> {
         }
 
         // Blob-first. A row is never sent before its payload is confirmed.
-        let mut deferred = Vec::new();
+        // Rows withheld from this push land in `deferred`; every deferral
+        // below also marks the row failed, so the next batch excludes it and
+        // the loop converges rather than spinning.
+        let mut deferred: HashSet<String> = HashSet::new();
         for artifact in &batch {
-            for key in artifact.blob_refs() {
-                match upload_blob(&client, config, &token, store, key) {
-                    Ok(true) => outcome.blobs_uploaded += 1,
-                    Ok(false) => {}
-                    Err(status) => {
-                        // The row stays pending. Sending it now would put a
-                        // dangling reference in a shared timeline.
-                        deferred.push(artifact.row_id().to_string());
-                        if matches!(status, DrainStatus::Offline | DrainStatus::RateLimited) {
-                            outcome.status = status;
+            'blobs: for key in artifact.blob_refs() {
+                loop {
+                    match upload_blob(&client, config, &token, store, key) {
+                        Ok(true) => {
+                            outcome.blobs_uploaded += 1;
+                            break;
+                        }
+                        Ok(false) => break,
+                        Err(BlobError::MissingLocally) => {
+                            // The bytes are gone — a deleted `.atlas/blobs`
+                            // shard, a database restored without its blobs.
+                            // Nothing will ever make this row sendable, so it
+                            // is failed now rather than deferred forever under
+                            // an eternal pending count.
+                            tracing::warn!(
+                                row = artifact.row_id(),
+                                blob = key,
+                                "local blob missing; row marked failed"
+                            );
+                            store.record_attempt(artifact.row_id())?;
+                            store.mark_failed(artifact.row_id())?;
+                            outcome.failed += 1;
+                            deferred.insert(artifact.row_id().to_string());
+                            break 'blobs;
+                        }
+                        Err(BlobError::TooLarge) => {
+                            // 413: this payload will never fit. A permanent
+                            // per-row failure, not a network blink.
+                            tracing::warn!(
+                                row = artifact.row_id(),
+                                blob = key,
+                                "blob rejected as too large; row marked failed"
+                            );
+                            store.record_attempt(artifact.row_id())?;
+                            store.mark_failed(artifact.row_id())?;
+                            outcome.failed += 1;
+                            deferred.insert(artifact.row_id().to_string());
+                            break 'blobs;
+                        }
+                        Err(BlobError::Unauthenticated) => {
+                            if refresh_once(config, &mut token, &mut refreshed) {
+                                // Retry this same blob with the fresh token.
+                                continue;
+                            }
+                            outcome.status = DrainStatus::NoCredential;
+                            outcome.still_pending = store
+                                .row_count_in_state(&config.workspace_id, SyncState::Pending)?;
+                            return Ok(outcome);
+                        }
+                        Err(BlobError::NotAuthorized) => {
+                            // Terminal for the whole drain, exactly as on the
+                            // push path — never silently deferred and reported
+                            // as drained.
+                            outcome.status = DrainStatus::NotAuthorized;
+                            outcome.still_pending = store
+                                .row_count_in_state(&config.workspace_id, SyncState::Pending)?;
+                            return Ok(outcome);
+                        }
+                        Err(BlobError::RateLimited { retry_after }) => {
+                            outcome.status = DrainStatus::RateLimited;
+                            outcome.retry_after = retry_after;
+                            outcome.still_pending = store
+                                .row_count_in_state(&config.workspace_id, SyncState::Pending)?;
+                            return Ok(outcome);
+                        }
+                        Err(BlobError::Offline) => {
+                            outcome.status = DrainStatus::Offline;
                             outcome.still_pending = store
                                 .row_count_in_state(&config.workspace_id, SyncState::Pending)?;
                             return Ok(outcome);
@@ -185,80 +290,100 @@ pub fn drain(store: &Store, config: &SyncConfig<'_>) -> Result<DrainOutcome> {
         }
         let ready: Vec<AtlasArtifact> = batch
             .into_iter()
-            .filter(|a| !deferred.contains(&a.row_id().to_string()))
+            .filter(|a| !deferred.contains(a.row_id()))
             .collect();
         if ready.is_empty() {
-            break;
+            // Every row in this batch was failed in the blob phase; the next
+            // batch excludes them, so continuing makes progress.
+            continue;
         }
 
         match push(&client, config, &token, &ready) {
             Push::Accepted(results) => {
+                // An empty result body is the 202 contract: the whole batch
+                // was accepted. A *non-empty* body that omits a row is not
+                // acceptance — silence is never acknowledgement, so the row
+                // stays pending rather than being marked sent on a server
+                // that may have dropped it.
+                let whole_batch = results.is_empty();
+                let mut progressed = false;
+                let mut omitted: Vec<&AtlasArtifact> = Vec::new();
                 for artifact in &ready {
-                    let accepted = results
-                        .iter()
-                        .find(|r| r.row_id == artifact.row_id())
-                        // A server that returns no per-artifact results has
-                        // accepted the whole batch — the 202 contract.
-                        .map(|r| r.accepted)
-                        .unwrap_or(true);
-                    if accepted {
-                        store.mark_sent(artifact.row_id())?;
-                        outcome.sent += 1;
-                    } else {
-                        store.mark_failed(artifact.row_id())?;
-                        outcome.failed += 1;
-                        outcome.orphaned_blobs += artifact.blob_refs().len();
+                    match results.iter().find(|r| r.row_id == artifact.row_id()) {
+                        Some(r) if r.accepted => {
+                            store.mark_sent(artifact.row_id())?;
+                            outcome.sent += 1;
+                            progressed = true;
+                        }
+                        Some(_) => {
+                            store.mark_failed(artifact.row_id())?;
+                            outcome.failed += 1;
+                            outcome.orphaned_blobs += artifact.blob_refs().len();
+                            progressed = true;
+                        }
+                        None if whole_batch => {
+                            store.mark_sent(artifact.row_id())?;
+                            outcome.sent += 1;
+                            progressed = true;
+                        }
+                        None => omitted.push(artifact),
                     }
                 }
+                if !progressed {
+                    // The server said 2xx but named none of this batch's rows.
+                    // Retrying the identical batch in this call would spin;
+                    // count an attempt so the exhaustion backstop eventually
+                    // retires the rows, and stop here with an honest status.
+                    for artifact in &omitted {
+                        store.record_attempt(artifact.row_id())?;
+                    }
+                    outcome.status = DrainStatus::Offline;
+                    break;
+                }
+                max_count = MAX_BATCH_COUNT;
             }
             Push::Unauthenticated => {
                 // Short-lived tokens expire mid-drain as a matter of course:
                 // a post-promotion backlog runs far longer than one lifetime.
-                // Refresh once and retry the same batch.
-                match (config.token)() {
-                    Some(fresh) if fresh != token => {
-                        token = fresh;
-                        continue;
-                    }
-                    _ => {
-                        outcome.status = DrainStatus::NoCredential;
-                        break;
-                    }
+                // Refresh once and retry the same batch; a second consecutive
+                // 401 means the credential itself is not accepted.
+                if refresh_once(config, &mut token, &mut refreshed) {
+                    continue;
                 }
+                outcome.status = DrainStatus::NoCredential;
+                break;
             }
             Push::Forbidden => {
                 outcome.status = DrainStatus::NotAuthorized;
                 break;
             }
-            Push::RateLimited => {
+            Push::RateLimited { retry_after } => {
                 outcome.status = DrainStatus::RateLimited;
+                outcome.retry_after = retry_after;
                 break;
             }
             Push::Rejected => {
                 // The whole batch was refused without per-artifact detail.
                 // Bisect rather than give up: the alternative is failing a
-                // hundred good rows because one is malformed. A single-artifact
-                // batch that is still refused is the poison row itself.
+                // hundred good rows because one is malformed.
                 if ready.len() == 1 {
-                    store.record_attempt(ready[0].row_id())?;
-                    if store.attempts(ready[0].row_id())? >= MAX_ATTEMPTS {
-                        store.mark_failed(ready[0].row_id())?;
-                        outcome.failed += 1;
-                        outcome.orphaned_blobs += ready[0].blob_refs().len();
-                    } else {
-                        // Leave it pending but stop this pass, so one bad row
-                        // cannot spin the loop.
-                        outcome.status = DrainStatus::Offline;
-                        break;
-                    }
+                    // The minimal batch was still refused: this row itself is
+                    // the poison. A 4xx on a single-row payload is
+                    // deterministic — retrying it would only stall the queue
+                    // behind it. `retry_failed_rows` is the deliberate,
+                    // human-driven road back.
+                    let row = ready[0].row_id();
+                    tracing::warn!(row, "server rejected a single-row batch; row marked failed");
+                    store.record_attempt(row)?;
+                    store.mark_failed(row)?;
+                    outcome.failed += 1;
+                    outcome.orphaned_blobs += ready[0].blob_refs().len();
+                    max_count = MAX_BATCH_COUNT;
                 } else {
-                    for artifact in &ready {
-                        store.record_attempt(artifact.row_id())?;
-                    }
-                    // The next pass takes a smaller batch, converging on the
-                    // offending row.
-                    outcome.status = DrainStatus::Offline;
-                    break;
+                    // Halve and retry *now*, within this call. Attempts are
+                    // counted only against a convicted row — never against the
+                    // good rows that happened to share its batch.
+                    max_count = (ready.len() / 2).max(1);
                 }
             }
             Push::Unreachable => {
@@ -272,6 +397,26 @@ pub fn drain(store: &Store, config: &SyncConfig<'_>) -> Result<DrainOutcome> {
     Ok(outcome)
 }
 
+/// Refresh the access token, at most once per drain invocation.
+///
+/// Returns whether a fresh, *different* token was installed. The once-guard is
+/// the point: minting always yields a byte-different JWT, so an unbounded
+/// "refresh and retry" against a server that keeps answering 401 is a
+/// full-speed hot loop on the capture worker's thread.
+fn refresh_once(config: &SyncConfig<'_>, token: &mut String, refreshed: &mut bool) -> bool {
+    if *refreshed {
+        return false;
+    }
+    *refreshed = true;
+    match (config.token)() {
+        Some(fresh) if fresh != *token => {
+            *token = fresh;
+            true
+        }
+        _ => false,
+    }
+}
+
 /// The server's verdict on one push.
 enum Push {
     Accepted(Vec<ArtifactResult>),
@@ -279,7 +424,7 @@ enum Push {
     Unauthenticated,
     /// 403 — terminal.
     Forbidden,
-    RateLimited,
+    RateLimited { retry_after: Option<Duration> },
     /// 4xx that is not an auth problem: the payload itself was refused.
     Rejected,
     /// No response at all, or 5xx.
@@ -316,28 +461,60 @@ fn push(
     match status.as_u16() {
         401 => Push::Unauthenticated,
         403 => Push::Forbidden,
-        429 => Push::RateLimited,
+        429 => Push::RateLimited { retry_after: parse_retry_after(&response) },
         // 5xx is the server's problem, not this row's.
         500..=599 => Push::Unreachable,
         _ => Push::Rejected,
     }
 }
 
+/// The delta-seconds form of a `Retry-After` header, when present.
+///
+/// The HTTP-date form is deliberately ignored — our server sends seconds, and
+/// a wrong parse would be worse than no hint.
+fn parse_retry_after(response: &reqwest::blocking::Response) -> Option<Duration> {
+    response
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .map(Duration::from_secs)
+}
+
+/// Why one blob upload could not complete.
+enum BlobError {
+    /// The blob cannot be read locally — the bytes are gone, so the row
+    /// referencing it is permanently unsendable.
+    MissingLocally,
+    /// 401 — the token may have expired; worth one refresh.
+    Unauthenticated,
+    /// 403 — terminal for the whole drain, same as on the push path.
+    NotAuthorized,
+    /// 413 — this payload will never fit; a permanent per-row failure.
+    TooLarge,
+    /// 429 — back off, honouring the server's hint when it sent one.
+    RateLimited { retry_after: Option<Duration> },
+    /// No response, 5xx, or anything else worth retrying later.
+    Offline,
+}
+
 /// Upload one blob if the server does not already have it.
 ///
 /// Returns `Ok(true)` when it was uploaded, `Ok(false)` when it was already
-/// there, and `Err(status)` when it could not be.
+/// there, and `Err` when it could not be — with enough shape for the drain to
+/// distinguish "this row is dead" from "stop the whole drain".
 fn upload_blob(
     client: &reqwest::blocking::Client,
     config: &SyncConfig<'_>,
     token: &str,
     store: &Store,
     key: &str,
-) -> std::result::Result<bool, DrainStatus> {
+) -> std::result::Result<bool, BlobError> {
     let Ok(bytes) = store.blobs().get(key) else {
-        // The blob is missing locally. Nothing can be done about it here, and
-        // blocking the whole drain on one lost payload helps nobody.
-        return Err(DrainStatus::NotAuthorized);
+        return Err(BlobError::MissingLocally);
     };
 
     let response = client
@@ -347,7 +524,7 @@ fn upload_blob(
         .send();
 
     let Ok(response) = response else {
-        return Err(DrainStatus::Offline);
+        return Err(BlobError::Offline);
     };
     let status = response.status();
     if status.is_success() {
@@ -356,9 +533,11 @@ fn upload_blob(
     match status.as_u16() {
         // Content-addressed: already present is success.
         409 => Ok(false),
-        401 | 403 => Err(DrainStatus::NotAuthorized),
-        429 => Err(DrainStatus::RateLimited),
-        _ => Err(DrainStatus::Offline),
+        401 => Err(BlobError::Unauthenticated),
+        403 => Err(BlobError::NotAuthorized),
+        413 => Err(BlobError::TooLarge),
+        429 => Err(BlobError::RateLimited { retry_after: parse_retry_after(&response) }),
+        _ => Err(BlobError::Offline),
     }
 }
 

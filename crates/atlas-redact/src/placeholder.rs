@@ -32,6 +32,9 @@ const PLACEHOLDER_VALUES: &[&str] = &[
     "none",
     "null",
     "unset",
+    // Boolean literals: `"use_token": true` names a flag, not a credential.
+    "true",
+    "false",
 ];
 
 /// The inside of a `<…>` doc placeholder: lowercase words joined by `-`/`_`.

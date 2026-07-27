@@ -50,17 +50,42 @@ impl BlobStore {
         let parent = path.parent().expect("blob path always has a parent");
         fs::create_dir_all(parent).map_err(|e| Error::Blob(format!("{}: {e}", parent.display())))?;
 
-        // Write to a temp name and rename, so a reader never observes a
-        // half-written blob under a key that claims to be complete.
+        // Write to a temp name, fsync, and rename, so a reader never observes a
+        // half-written blob under a key that claims to be complete. The fsync is
+        // load-bearing: on power loss a rename can be durable while the data
+        // blocks are not, leaving a truncated file under the final key — and
+        // because `put` short-circuits on `exists()`, a corrupt blob under a
+        // content-addressed key would never be repaired.
         let temp = path.with_extension("tmp");
-        fs::write(&temp, bytes).map_err(|e| Error::Blob(format!("{}: {e}", temp.display())))?;
+        {
+            use std::io::Write;
+            let mut file = fs::File::create(&temp)
+                .map_err(|e| Error::Blob(format!("{}: {e}", temp.display())))?;
+            file.write_all(bytes)
+                .map_err(|e| Error::Blob(format!("{}: {e}", temp.display())))?;
+            file.sync_all()
+                .map_err(|e| Error::Blob(format!("{}: {e}", temp.display())))?;
+        }
         fs::rename(&temp, &path).map_err(|e| Error::Blob(format!("{}: {e}", path.display())))?;
+        // Best-effort directory fsync so the rename itself survives power loss.
+        if let Ok(dir) = fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
         Ok(key)
     }
 
     pub fn get(&self, key: &str) -> Result<Vec<u8>> {
         let path = self.path_for(key);
-        fs::read(&path).map_err(|e| Error::Blob(format!("{}: {e}", path.display())))
+        let bytes = fs::read(&path).map_err(|e| Error::Blob(format!("{}: {e}", path.display())))?;
+        // A blob whose content no longer hashes to its key is torn — most likely
+        // a crash between the data write and its fsync on an older build. Delete
+        // it so the next `put` of the same content can heal the key, and report
+        // the corruption instead of returning garbage as the recorded payload.
+        if key_for(&bytes) != key {
+            let _ = fs::remove_file(&path);
+            return Err(Error::Blob(format!("blob {key} is corrupt and was removed")));
+        }
+        Ok(bytes)
     }
 
     pub fn exists(&self, key: &str) -> bool {

@@ -10,7 +10,10 @@
 //! * a second Atlas window holds the writer lock, so this one is not capturing;
 //! * a redaction failure flagged a Session nobody is looking at;
 //! * rows are stuck in a failed sync state;
-//! * the git watcher died, so commits stop being linked.
+//! * the git watcher died, so commits stop being linked;
+//! * the capture worker thread died, so nothing is being recorded at all;
+//! * the server revoked this identity, so the drain stopped;
+//! * a history rewrite orphaned Checkpoints in bulk.
 //!
 //! The fix is not error handling scattered across all of them. It is **one
 //! state, per Workspace, with a reason** — computed here from what the store
@@ -23,7 +26,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
-use crate::model::SyncState;
+use crate::model::{DrainGate, SyncState, WorkspaceMode};
 use crate::store::Store;
 
 /// How capture is doing for one Workspace.
@@ -92,7 +95,7 @@ pub struct CaptureHealth {
 /// liveness must be checked against actual watcher state**, never inferred from
 /// "no events lately", because a quiet repository and a dead watcher are
 /// indistinguishable from the event stream.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 pub struct HostSignals {
     /// Whether a git watcher is currently attached for this Workspace, as
     /// reported by the watcher registry itself.
@@ -100,13 +103,37 @@ pub struct HostSignals {
     /// Whether this Workspace *needs* a watcher — a non-git Workspace never has
     /// one and is perfectly healthy without it.
     pub expects_watcher: bool,
-    /// Whether **this process** holds the Workspace's writer lock.
+    /// This process's claim on the Workspace's writer lock, tri-state:
+    ///
+    /// * `None` — this process never opened the store. **Not** evidence of a
+    ///   second window; a health poll before the first capture event lands here,
+    ///   and reporting "another window is recording" for it was a permanent
+    ///   false alarm on every freshly-started process.
+    /// * `Some(false)` — an acquisition genuinely lost to another process.
+    /// * `Some(true)` — this process holds the lock.
     ///
     /// Passed in rather than read off the store, because health is evaluated
     /// against a read-only connection that never asked for the lock — asking it
     /// would always answer "no" and report a second window that does not exist.
     /// Only the host's store registry knows the real answer.
-    pub is_writer: bool,
+    pub holds_writer: Option<bool>,
+    /// Whether the capture worker thread is alive. A dead worker is total
+    /// silent capture loss — every job path funnels through it.
+    pub worker_alive: bool,
+}
+
+impl Default for HostSignals {
+    fn default() -> Self {
+        Self {
+            watcher_attached: false,
+            expects_watcher: false,
+            holds_writer: None,
+            // A default of `false` would light the worst alarm on every caller
+            // that never wired the signal; absence of evidence is not a dead
+            // worker.
+            worker_alive: true,
+        }
+    }
 }
 
 /// Compute the current health of a Workspace.
@@ -121,19 +148,32 @@ pub fn evaluate(store: &Store, workspace_id: &str, host: HostSignals) -> Result<
     // writer lock for something nobody asked to record: three alarms for a
     // Workspace whose only real state is "not set up yet". That turns the first
     // thing a new user sees into an incident.
-    match store.binding()? {
+    let binding = match store.binding()? {
         None => return off(store, workspace_id, "Session capture is off"),
         Some(binding) if !binding.is_capturing() => {
             return off(store, workspace_id, "Session capture is paused")
         }
-        Some(_) => {}
-    }
+        Some(binding) => binding,
+    };
 
     let mut issues = Vec::new();
 
     // ── Stopped: not recording at all ───────────────────────────────────────
 
-    if !host.is_writer {
+    if !host.worker_alive {
+        issues.push(HealthIssue {
+            state: HealthState::Stopped,
+            reason: "Atlas's capture worker has stopped, so nothing new is being recorded."
+                .into(),
+            next_step: "Restart Atlas to resume recording. What was already captured is safe."
+                .into(),
+        });
+    }
+
+    // Only a *lost* acquisition is another window. `None` means this process
+    // simply has not opened the store yet — nothing is recording, and nothing
+    // is claiming to, which is not a fault.
+    if host.holds_writer == Some(false) {
         issues.push(HealthIssue {
             state: HealthState::Stopped,
             reason: "Another Atlas window is recording this Workspace.".into(),
@@ -164,6 +204,22 @@ pub fn evaluate(store: &Store, workspace_id: &str, host: HostSignals) -> Result<
     }
 
     // ── Degraded: recording, but something needs attention ──────────────────
+
+    // Degraded rather than Stopped, deliberately: capture itself keeps
+    // recording locally and nothing is lost — only the drain is gated, so
+    // "capture stopped" would be a lie that teaches users to ignore the red
+    // state. The reason still says plainly that nothing is reaching the team.
+    if binding.mode == WorkspaceMode::Cloud && binding.drain_state == DrainGate::NotAuthorized {
+        issues.push(HealthIssue {
+            state: HealthState::Degraded,
+            reason: "No longer authorized to sync with your Organisation — new work stays on \
+                     this machine."
+                .into(),
+            next_step: "Reconnect or re-register this Workspace to resume syncing. Capture \
+                        itself continues."
+                .into(),
+        });
+    }
 
     let flagged_sessions = store.flagged_session_count(workspace_id)?;
     if flagged_sessions > 0 {
@@ -202,6 +258,10 @@ pub fn evaluate(store: &Store, workspace_id: &str, host: HostSignals) -> Result<
         });
     }
 
+    if let Some(issue) = reconcile_issue(store, workspace_id)? {
+        issues.push(issue);
+    }
+
     let pending_rows = store.row_count_in_state(workspace_id, SyncState::Pending)?;
 
     // Worst first, so the summary and the indicator agree.
@@ -216,6 +276,54 @@ pub fn evaluate(store: &Store, workspace_id: &str, host: HostSignals) -> Result<
         failed_rows,
         pending_rows,
     })
+}
+
+/// Surface what the last Checkpoint-reconciliation pass recorded, when it was
+/// noteworthy: a mass orphan (a history-wide rewrite detached Checkpoints in
+/// bulk — correct behaviour, but the developer should learn *why* their
+/// timeline just changed) or a pass that could not complete.
+///
+/// The note is a small JSON blob written by the reconcile pass. Parsed
+/// tolerantly: an absent, empty or unreadable note is simply no issue — this
+/// signal must never itself become a failure path.
+fn reconcile_issue(store: &Store, workspace_id: &str) -> Result<Option<HealthIssue>> {
+    let Some(note) = store.reconcile_note(workspace_id)? else {
+        return Ok(None);
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&note) else {
+        return Ok(None);
+    };
+
+    let count = |key: &str| value.get(key).and_then(serde_json::Value::as_u64).unwrap_or(0);
+
+    let orphaned = count("orphaned");
+    if orphaned as usize >= crate::checkpoint::MASS_ORPHAN_THRESHOLD {
+        return Ok(Some(HealthIssue {
+            state: HealthState::Degraded,
+            reason: format!(
+                "A history rewrite detached {orphaned} Checkpoint{} from their commits.",
+                plural(orphaned as i64)
+            ),
+            next_step: "No action needed — the Session links are kept, and a Checkpoint relinks \
+                        by itself if its commit becomes reachable again."
+                .into(),
+        }));
+    }
+
+    let failed = count("failed");
+    if failed > 0 {
+        return Ok(Some(HealthIssue {
+            state: HealthState::Degraded,
+            reason: format!(
+                "The last Checkpoint reconciliation could not finish for {failed} Checkpoint{}.",
+                plural(failed as i64)
+            ),
+            next_step: "It retries on the next repository change. Some Checkpoints may point at \
+                        rewritten commits until then."
+                .into(),
+        }));
+    }
+    Ok(None)
 }
 
 /// Health for a Workspace that is not recording on purpose.
@@ -284,5 +392,12 @@ mod tests {
     #[test]
     fn a_healthy_workspace_still_reports_its_pending_count() {
         assert_eq!(summarize(HealthState::Ok, &[], 47), "47 pending");
+    }
+
+    #[test]
+    fn default_host_signals_raise_no_alarms_on_their_own() {
+        let host = HostSignals::default();
+        assert_eq!(host.holds_writer, None, "no claim is not a lost claim");
+        assert!(host.worker_alive, "absence of evidence is not a dead worker");
     }
 }

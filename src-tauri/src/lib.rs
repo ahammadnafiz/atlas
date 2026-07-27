@@ -380,6 +380,8 @@ pub fn run() {
             commands::capture::capture_promote,
             commands::capture::capture_connect_options,
             commands::capture::capture_connect,
+            commands::capture::capture_activate,
+            commands::capture::capture_retry_failed,
             commands::capture::artifacts_sessions,
             commands::capture::artifacts_session,
             commands::git_watcher::git_watch_status,

@@ -126,6 +126,36 @@ fn the_provider_layer_carries_no_rule_for_a_publishable_key() {
 }
 
 #[test]
+fn json_fragments_with_ordinary_keys_survive_the_flat_pass() {
+    // The quoted-key credential form must not turn every JSON snippet quoted in
+    // prose into placeholder soup: numeric limits, flags and counter fields are
+    // the bread and butter of tool arguments.
+    for input in [
+        r#"{"max_tokens": 4096, "temperature": 0.7}"#,
+        r#"retrying with {"use_token": true} after the 429"#,
+        r#"config was {"token_count": 51234} at the time"#,
+        r#"{"role": "assistant", "stop_reason": "end_turn"}"#,
+    ] {
+        assert_untouched(input);
+    }
+}
+
+#[test]
+fn a_url_field_keeps_its_host_and_path() {
+    // `url`/`uri` values skip the entropy layer (a long signed path is not a
+    // secret) but are still scanned for embedded credentials — and a clean link
+    // must come through byte-identical.
+    for input in [
+        r#"{"url":"https://example.com/very/long/path"}"#,
+        r#"{"uri":"https://docs.example.com/guides/2026/setting-up-redaction?section=layers"}"#,
+    ] {
+        let out = redact_json(input);
+        assert_eq!(out.text, input, "over-redacted: {}", out.text);
+        assert_eq!(out.counts.total(), 0);
+    }
+}
+
+#[test]
 fn json_structure_field_names_and_ids_survive() {
     let input = r#"{"session_id":"xJ3kQ9vB2mZ7pL5rT8wN4cF6yH1sD0gA","file_path":"/Users/nafiz/dev/atlas/src/lib.rs","role":"assistant"}"#;
     let out = redact_json(input);

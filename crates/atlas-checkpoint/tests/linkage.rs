@@ -64,6 +64,25 @@ impl Fixture {
         self.git(&["rev-parse", "HEAD"]).trim().to_string()
     }
 
+    /// Commit with an explicit (historical) commit date.
+    fn commit_all_at(&self, message: &str, date: &str) -> String {
+        self.git(&["add", "-A"]);
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(self.path())
+            .env("GIT_COMMITTER_DATE", date)
+            .env("GIT_AUTHOR_DATE", date)
+            .args(["commit", "-m", message])
+            .output()
+            .expect("git runs");
+        assert!(
+            output.status.success(),
+            "git commit failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        self.git(&["rev-parse", "HEAD"]).trim().to_string()
+    }
+
     fn store(&self) -> Store {
         Store::open(self.path().join(".atlas")).expect("store opens")
     }
@@ -395,30 +414,30 @@ fn agent_work_committed_directly_on_the_receiving_branch_still_links() {
 
 #[test]
 fn a_rename_only_commit_links_via_the_pre_rename_path() {
-    // The agent's work did land; the path just moved.
+    // The agent's work did land; the path just moved before anything committed
+    // it. The commit carries the work under the *new* path, the Session touched
+    // the *old* one, and rename detection is what connects them.
     let fixture = Fixture::new();
-    fixture.write("src/old.rs", "original content long enough for rename detection\n");
+    let original = "fn shared() {}\nfn also_shared() {}\nfn still_shared() {}\nfn original() {}\n";
+    fixture.write("src/old.rs", original);
     fixture.commit_all("initial");
     let mut store = fixture.store();
     fixture.walk(&store);
 
-    let content = "agent content long enough for rename detection\n";
+    // Mostly-unchanged content, so git's rename detection still pairs the two
+    // paths even though the edit and the move land in the same commit.
+    let content = "fn shared() {}\nfn also_shared() {}\nfn still_shared() {}\nfn agent() {}\n";
     fixture.write("src/old.rs", content);
     let session = session_wrote(&fixture, &mut store, "s1", "src/old.rs", content, true);
-    fixture.commit_all("agent edit");
-    fixture.walk(&store);
-    let before = store.checkpoints_for_session(&session).unwrap().len();
 
+    // The developer moves the file before committing the agent's edit.
     fixture.git(&["mv", "src/old.rs", "src/new.rs"]);
-    fixture.commit_all("rename");
+    let commit = fixture.commit_all("rename");
     fixture.walk(&store);
 
     let checkpoints = store.checkpoints_for_session(&session).unwrap();
-    assert_eq!(
-        checkpoints.len(),
-        before + 1,
-        "the rename commit should link via the pre-rename path"
-    );
+    assert_eq!(checkpoints.len(), 1, "the rename commit links via the pre-rename path");
+    assert_eq!(checkpoints[0].commit_sha, commit);
 }
 
 #[test]
@@ -691,6 +710,189 @@ fn a_commit_touching_thousands_of_paths_completes_promptly() {
         started.elapsed()
     );
     assert_eq!(store.checkpoints_for_session(&session).unwrap().len(), 1);
+}
+
+// ── Consumption: work that landed stops nominating the Session ──────────────
+
+#[test]
+fn a_later_human_commit_to_the_same_path_does_not_link() {
+    // Once a commit carried the Session's work on a path, that touch is spent.
+    // Without consumption, every future commit to a hot file — purely human
+    // work included — would be attributed to the Session forever.
+    let fixture = Fixture::new();
+    fixture.write("src/lib.rs", "original");
+    fixture.commit_all("initial");
+    let mut store = fixture.store();
+    fixture.walk(&store);
+
+    fixture.write("src/lib.rs", "agent version");
+    let session = session_wrote(&fixture, &mut store, "s1", "src/lib.rs", "agent version", true);
+    fixture.commit_all("agent change");
+    fixture.walk(&store);
+    assert_eq!(store.checkpoints_for_session(&session).unwrap().len(), 1);
+
+    // Months later, the developer rewrites the file entirely by hand.
+    fixture.write("src/lib.rs", "purely human work");
+    fixture.commit_all("my own rewrite");
+    fixture.walk(&store);
+
+    assert_eq!(
+        store.checkpoints_for_session(&session).unwrap().len(),
+        1,
+        "human-only commits must not accrete onto old Sessions"
+    );
+}
+
+#[test]
+fn a_replaced_new_file_settles_the_path_so_later_commits_do_not_link() {
+    // The strict arm already refuses the replacing commit; consumption is what
+    // stops the *next* commit — where the file now pre-exists and the
+    // permissive arm would otherwise claim it — from linking human work.
+    let fixture = Fixture::new();
+    fixture.write("seed", "seed");
+    fixture.commit_all("initial");
+    let mut store = fixture.store();
+    fixture.walk(&store);
+
+    let session = session_wrote(&fixture, &mut store, "s1", "src/new.rs", "agent wrote this", false);
+    fixture.write("src/new.rs", "human wrote this instead");
+    fixture.commit_all("my own implementation");
+    fixture.walk(&store);
+    assert!(store.checkpoints_for_session(&session).unwrap().is_empty());
+
+    fixture.write("src/new.rs", "human keeps editing");
+    fixture.commit_all("more of my own work");
+    fixture.walk(&store);
+
+    assert!(
+        store.checkpoints_for_session(&session).unwrap().is_empty(),
+        "a displaced touch must not resurface through the permissive arm"
+    );
+}
+
+// ── Time bound: commits older than the Session never link ───────────────────
+
+#[test]
+fn a_recovery_re_scan_never_links_commits_that_predate_the_session() {
+    // The bounded re-scan replays historical commits through the link rule.
+    // Commits created before the Session existed cannot contain its work — and
+    // they must not consume its touches either, or the real commit would later
+    // find nothing to link.
+    let fixture = Fixture::new();
+    fixture.write("src/lib.rs", "ancient one");
+    fixture.commit_all_at("ancient 1", "2020-01-01T00:00:00Z");
+    fixture.write("src/lib.rs", "ancient two");
+    fixture.commit_all_at("ancient 2", "2020-01-02T00:00:00Z");
+
+    let mut store = fixture.store();
+    let session = session_wrote(&fixture, &mut store, "s1", "src/lib.rs", "agent version", true);
+
+    // First walk: no cursor, so the bounded re-scan examines the historical
+    // commits — same path, but they predate the Session.
+    fixture.walk(&store);
+    assert!(
+        store.checkpoints_for_session(&session).unwrap().is_empty(),
+        "commits made before the Session started must never link to it"
+    );
+
+    // And the touches survived: the commit that actually carries the work links.
+    fixture.write("src/lib.rs", "agent version");
+    fixture.commit_all("the real agent commit");
+    fixture.walk(&store);
+    assert_eq!(store.checkpoints_for_session(&session).unwrap().len(), 1);
+}
+
+// ── Merge side branches ─────────────────────────────────────────────────────
+
+#[test]
+fn side_branch_commits_made_while_atlas_was_closed_are_linked_at_the_merge_walk() {
+    // The first-parent walk never traverses a side branch the cursor sat past.
+    // When the merge arrives, the commits it brought in are evaluated — so the
+    // work links at the commit that produced it, and the merge itself still
+    // creates nothing.
+    let fixture = Fixture::new();
+    fixture.write("base", "base");
+    fixture.commit_all("initial");
+    let mut store = fixture.store();
+    fixture.walk(&store);
+
+    // Work happens on a side branch with Atlas closed: no walk sees it.
+    fixture.git(&["checkout", "-b", "side"]);
+    fixture.write("side.rs", "original\n");
+    fixture.commit_all("side base");
+    fixture.write("side.rs", "agent change\n");
+    let session = session_wrote(&fixture, &mut store, "s1", "side.rs", "agent change\n", true);
+    let side_commit = fixture.commit_all("agent work on side");
+
+    fixture.git(&["checkout", "main"]);
+    fixture.write("main.rs", "main");
+    fixture.commit_all("main work");
+    fixture.git(&["merge", "--no-ff", "side", "-m", "merge side"]);
+    let merge = fixture.git(&["rev-parse", "HEAD"]).trim().to_string();
+
+    fixture.walk(&store);
+    let checkpoints = store.checkpoints_for_session(&session).unwrap();
+    assert_eq!(checkpoints.len(), 1, "the side-branch work links exactly once");
+    assert_eq!(checkpoints[0].commit_sha, side_commit, "at the commit that produced it");
+    assert!(
+        store.checkpoints_for_commit(&merge).unwrap().is_empty(),
+        "the merge commit itself gets no Checkpoint"
+    );
+
+    // Re-walking the same history (a recovery re-scan) double-counts nothing.
+    store
+        .set_commit_cursor(WORKSPACE, "0000000000000000000000000000000000000000", false)
+        .unwrap();
+    fixture.walk(&store);
+    assert_eq!(store.checkpoints_for_session(&session).unwrap().len(), 1);
+    assert!(store.checkpoints_for_commit(&merge).unwrap().is_empty());
+}
+
+// ── Content filters ─────────────────────────────────────────────────────────
+
+#[test]
+fn a_normalising_repo_still_matches_the_strict_arm_through_content_filters() {
+    // With `text eol=crlf` (any CRLF-normalising setup), the committed blob is
+    // LF while the agent wrote CRLF into the worktree. A raw byte comparison
+    // would silently fail the strict arm on every agent-created file; the
+    // checkout-form comparison is what keeps the ATL-83 criterion true.
+    let fixture = Fixture::new();
+    fixture.write(".gitattributes", "*.txt text eol=crlf\n");
+    fixture.commit_all("attributes");
+    let mut store = fixture.store();
+    fixture.walk(&store);
+
+    let content = "line one\r\nline two\r\n";
+    fixture.write("notes.txt", content);
+    let session = session_wrote(&fixture, &mut store, "s1", "notes.txt", content, false);
+    fixture.commit_all("add notes");
+    fixture.walk(&store);
+
+    assert_eq!(
+        store.checkpoints_for_session(&session).unwrap().len(),
+        1,
+        "CRLF normalisation must not defeat the strict arm"
+    );
+}
+
+// ── The empty first walk ────────────────────────────────────────────────────
+
+#[test]
+fn the_first_walk_with_nothing_to_link_just_records_the_cursor() {
+    // Enabling capture on a repository with history, before any Session exists:
+    // there is nothing to link, so the walk starts the cursor at HEAD rather
+    // than examining hundreds of commits on the command path.
+    let fixture = Fixture::new();
+    for i in 0..3 {
+        fixture.write("a.rs", &format!("v{i}"));
+        fixture.commit_all(&format!("commit {i}"));
+    }
+    let head = fixture.git(&["rev-parse", "HEAD"]).trim().to_string();
+
+    let store = fixture.store();
+    let outcome = fixture.walk(&store);
+    assert_eq!(outcome.commits_seen, 0, "no per-commit examination");
+    assert_eq!(store.commit_cursor(WORKSPACE).unwrap().as_deref(), Some(head.as_str()));
 }
 
 // ── Imported Sessions ───────────────────────────────────────────────────────

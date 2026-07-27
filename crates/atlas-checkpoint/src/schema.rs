@@ -16,7 +16,7 @@ use rusqlite::Connection;
 use crate::error::{Error, Result};
 
 /// Bump when adding a migration, and add the matching arm in [`migrate`].
-pub const SCHEMA_VERSION: i64 = 5;
+pub const SCHEMA_VERSION: i64 = 6;
 
 pub fn migrate(conn: &Connection) -> Result<()> {
     let found: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
@@ -45,6 +45,9 @@ pub fn migrate(conn: &Connection) -> Result<()> {
     }
     if found < 5 {
         conn.execute_batch(V5)?;
+    }
+    if found < 6 {
+        conn.execute_batch(V6)?;
     }
 
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -378,6 +381,39 @@ CREATE TABLE IF NOT EXISTS import_progress (
 );
 "#;
 
+const V6: &str = r#"
+-- The Cloud bulk-import disclosure is a real gate, not ceremony: the background
+-- transcript scan must refuse to import for a Cloud Workspace until the user has
+-- explicitly confirmed the disclosure. Local needs no approval and the flag is
+-- set at enable time.
+ALTER TABLE binding ADD COLUMN import_approved INTEGER NOT NULL DEFAULT 0;
+
+-- 'ok' or 'not_authorized'. Losing Organisation membership is a terminal state
+-- the drain must remember across ticks and restarts — not an infinite 30-second
+-- retry loop — and the capture-health signal needs to render it.
+ALTER TABLE binding ADD COLUMN drain_state TEXT NOT NULL DEFAULT 'ok';
+
+-- The server-assigned Workspace id from registration. The wire identity of every
+-- artifact: without it two teammates' pushes can never converge on one timeline,
+-- and the local filesystem path would leak to the whole Organisation.
+ALTER TABLE binding ADD COLUMN remote_workspace_id TEXT;
+
+-- Link-rule consumption. Once a commit has carried a touch's work, that touch is
+-- spent: without this, a Session's touches link every future commit that happens
+-- to modify the same path — for the lifetime of the store — and human work gets
+-- confidently attributed to a long-dead Session.
+ALTER TABLE file_touch ADD COLUMN consumed_by_commit TEXT;
+
+CREATE INDEX IF NOT EXISTS idx_file_touch_unconsumed
+    ON file_touch (session_id, path)
+    WHERE consumed_by_commit IS NULL;
+
+-- What the last reconciliation pass did, as a small JSON note. A history-wide
+-- rewrite that orphans half the timeline must surface through the capture-health
+-- signal, not vanish into a log file.
+ALTER TABLE workspace_cursor ADD COLUMN reconcile_note TEXT;
+"#;
+
 /// Index names the store guarantees. Exposed so a test can assert they survived
 /// a migration — an index silently dropped is a full scan nobody notices until
 /// a developer with a year of history opens the board.
@@ -399,4 +435,5 @@ pub const REQUIRED_INDEXES: &[&str] = &[
     "idx_checkpoint_session",
     "idx_checkpoint_patch",
     "idx_checkpoint_outbox",
+    "idx_file_touch_unconsumed",
 ];

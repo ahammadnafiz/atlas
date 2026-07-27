@@ -27,15 +27,49 @@
 //! Getting either half wrong is invisible. Too strict and the feature quietly
 //! records almost nothing; too loose and it confidently attributes human work to
 //! an agent. The asymmetry is the whole design.
+//!
+//! Two bounds keep the rule honest over time:
+//!
+//! * **Touches are consumed.** Once a commit has settled a touched path —
+//!   linked it, or displaced it (the human replaced the agent's new file) —
+//!   that touch stops nominating the Session for later commits. Without this,
+//!   every future commit to a hot file, including purely human work months
+//!   later and teammate commits arriving via pull, would be attributed to the
+//!   Session forever. This is the carry-forward rule from Entire's link engine,
+//!   and it is the load-bearing half of the design.
+//! * **Time.** A commit is never linked to a Session that started after the
+//!   commit was created, which is what makes the bounded recovery re-scan safe:
+//!   historical commits that predate every Session can neither link nor consume.
+//!
+//! # Merges
+//!
+//! The walk follows the first parent and a merge commit itself creates no
+//! Checkpoints — linking a merge would credit every merged-in change a second
+//! time, under a commit that did not produce it, and `git pull` creates merge
+//! commits constantly. The side branch's *own* commits are not lost, though:
+//! when the walk encounters a merge it evaluates the commits the merge brought
+//! in (`first-parent..second-parent`, merges excluded) through the same link
+//! rule, so work committed on a side branch while Atlas was closed and then
+//! merged is linked exactly once, at the commit that actually produced it.
 
 use std::collections::HashMap;
 use std::path::Path;
 
+use chrono::Utc;
+
 use crate::blobs;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::git::{self, ChangedPath};
 use crate::model::{FileTouch, WorkspaceMode};
-use crate::store::{CheckpointInput, Store};
+use crate::store::{CheckpointInput, LinkCandidate, Store};
+
+/// A git read that should have worked did not — lock contention, a mid-gc
+/// window, antivirus interference. The walk must stop *before* the cursor
+/// advances past the commit it could not examine, so the next pass re-examines
+/// it; swallowing this as "no Checkpoints" would leave a permanent silent hole.
+fn git_unavailable(err: git::GitError) -> Error {
+    Error::Storage(format!("git observation failed: {err}"))
+}
 
 /// How far back to re-scan when the cursor cannot be resolved.
 ///
@@ -82,6 +116,18 @@ pub fn walk_new_commits(
     };
 
     let cursor = store.commit_cursor(workspace_id)?;
+    let candidates = store.link_candidates(workspace_id)?;
+
+    if cursor.is_none() && candidates.is_empty() {
+        // A first walk with nothing that could possibly link — the moment
+        // capture is enabled on a repository with history. Examining up to
+        // [`RECOVERY_SCAN_LIMIT`] commits would spawn git subprocesses per
+        // commit to conclude nothing, on the command path of the enable click.
+        // Just start the cursor at HEAD.
+        store.set_commit_cursor(workspace_id, &head, false)?;
+        return Ok(WalkOutcome::default());
+    }
+
     let (commits, recovered) = resolve_range(repo, cursor.as_deref(), &head);
     if commits.is_empty() {
         // Still record the cursor, so a Workspace whose first walk finds nothing
@@ -93,7 +139,6 @@ pub fn walk_new_commits(
         });
     }
 
-    let candidates = store.link_candidates(workspace_id)?;
     let branch = git::current_branch(repo);
     let mut outcome = WalkOutcome {
         commits_seen: commits.len(),
@@ -139,77 +184,129 @@ fn resolve_range(repo: &Path, cursor: Option<&str>, head: &str) -> (Vec<String>,
 /// Evaluate one commit against every candidate Session.
 ///
 /// Returns how many Checkpoints it produced — zero is the ordinary case for a
-/// hand-written commit and must never be treated as an error.
+/// hand-written commit and must never be treated as an error. A **git failure**
+/// is an `Err`, never a zero: the caller advances the cursor on `Ok`, and a
+/// commit skipped over a transient failure would never be examined again.
 fn link_commit(
     store: &Store,
     repo: &Path,
     commit_sha: &str,
-    candidates: &[(String, Vec<FileTouch>)],
+    candidates: &[LinkCandidate],
     branch: Option<&str>,
     mode: WorkspaceMode,
 ) -> Result<usize> {
-    // A merge creates no Checkpoints.
-    //
-    // Following only the first parent stops the *side branch's commits* being
-    // walked a second time, but it does not stop the **merge commit itself**
-    // from carrying all of that work in its first-parent diff — so linking a
-    // merge would credit every merged-in change again, under a commit that did
-    // not produce it. `git pull` creates merge commits constantly, so this would
-    // roughly double the Checkpoints on any branch that pulls.
-    //
-    // The trade-off is stated rather than hidden: work committed on a side
-    // branch that this walk never traversed (because the cursor sat on the
-    // trunk the whole time) is not linked at the merge either. That follows from
-    // the `--first-parent` ruling and is the accepted cost of never
-    // double-counting — a missing link is recoverable, a wrong one silently
-    // corrupts a shared timeline.
-    if git::commit_info(repo, commit_sha)
-        .map(|info| info.is_merge())
-        .unwrap_or(false)
-    {
+    if candidates.is_empty() {
+        // Nothing can link and nothing can be consumed. Skipping the git reads
+        // outright is what keeps a walk over a Session-less range free.
         return Ok(0);
     }
 
-    let Ok(changed) = git::changed_paths(repo, commit_sha) else {
-        return Ok(0);
-    };
+    let info = git::commit_info(repo, commit_sha).map_err(git_unavailable)?;
+
+    // A merge itself creates no Checkpoints: its first-parent diff carries every
+    // merged-in change again, under a commit that did not produce them, and
+    // `git pull` creates merge commits constantly. The side branch's own commits
+    // — which the first-parent walk deliberately skipped — are evaluated here
+    // instead, so work committed on a side branch while Atlas was closed and
+    // then merged still links, exactly once, at the commit that produced it.
+    // Touch consumption and the `(Session, commit)` key make re-seeing an
+    // already-walked side branch harmless.
+    if info.is_merge() {
+        let mut created = 0;
+        let first_parent = &info.parents[0];
+        for side_parent in &info.parents[1..] {
+            let sides = git::merge_side_commits(repo, first_parent, side_parent, RECOVERY_SCAN_LIMIT)
+                .map_err(git_unavailable)?;
+            for side in sides {
+                let side_info = git::commit_info(repo, &side).map_err(git_unavailable)?;
+                created += evaluate_commit(store, repo, &side, &side_info, candidates, branch, mode)?;
+            }
+        }
+        return Ok(created);
+    }
+
+    evaluate_commit(store, repo, commit_sha, &info, candidates, branch, mode)
+}
+
+/// Run the link rule for one non-merge commit, and consume what it settled.
+fn evaluate_commit(
+    store: &Store,
+    repo: &Path,
+    commit_sha: &str,
+    info: &git::CommitInfo,
+    candidates: &[LinkCandidate],
+    branch: Option<&str>,
+    mode: WorkspaceMode,
+) -> Result<usize> {
+    let changed = git::changed_paths(repo, commit_sha).map_err(git_unavailable)?;
     if changed.is_empty() {
         return Ok(0);
     }
 
     let mut created = 0;
-    let mut info = None;
     let mut stats = None;
-    let mut patch = None;
+    let mut patch_cache: Option<Option<String>> = None;
 
-    for (session_id, touches) in candidates {
-        let matched = matching_paths(repo, commit_sha, &changed, touches);
-        if matched.is_empty() {
+    for candidate in candidates {
+        // Never link a commit to a Session that started after the commit was
+        // created — the commit cannot contain work from a Session that did not
+        // exist yet. This is what makes the bounded recovery re-scan safe:
+        // historical commits predating every Session neither link nor consume.
+        // (`>=` at second granularity: git timestamps have one-second
+        // resolution, and a commit made within the Session's starting second is
+        // legitimately its work.)
+        if info.commit_time < candidate.started_at.timestamp() {
             continue;
         }
 
-        // Deferred until we know there is something to record: `git show` on
-        // every commit in a large walk is the difference between detection being
-        // free and being felt.
-        let info = info.get_or_insert_with(|| git::commit_info(repo, commit_sha).ok());
-        let stats = stats.get_or_insert_with(|| git::line_stats(repo, commit_sha));
-        let patch = patch.get_or_insert_with(|| git::patch_id(repo, commit_sha));
+        let matches = matching_paths(repo, commit_sha, &changed, &candidate.touches);
+        if matches.touched.is_empty() {
+            continue;
+        }
 
-        store.upsert_checkpoint(CheckpointInput {
-            session_id,
-            commit_sha,
-            patch_id: patch.as_deref(),
-            branch,
-            git_author_name: info.as_ref().map(|i| i.author_name.as_str()),
-            git_author_email: info.as_ref().map(|i| i.author_email.as_str()),
-            files_touched: &matched,
-            insertions: stats.0,
-            deletions: stats.1,
-            sync_state: mode.initial_sync_state(),
-        })?;
-        created += 1;
+        if !matches.linked.is_empty() {
+            // Deferred until we know there is something to record: `git show`
+            // on every commit in a large walk is the difference between
+            // detection being free and being felt.
+            let (insertions, deletions) =
+                *stats.get_or_insert_with(|| git::line_stats(repo, commit_sha));
+            let patch = patch_cache.get_or_insert_with(|| git::patch_id(repo, commit_sha));
+
+            store.upsert_checkpoint(CheckpointInput {
+                session_id: &candidate.session_id,
+                commit_sha,
+                patch_id: patch.as_deref(),
+                branch,
+                git_author_name: Some(info.author_name.as_str()),
+                git_author_email: Some(info.author_email.as_str()),
+                files_touched: &matches.linked,
+                insertions,
+                deletions,
+                sync_state: mode.initial_sync_state(),
+            })?;
+            created += 1;
+        }
+
+        // Consume every touch this commit settled — linked or not. A strict-arm
+        // mismatch means the human replaced the agent's file, and either way
+        // the commit resolved that path: work that landed (or was displaced)
+        // must stop nominating the Session, or every later commit touching the
+        // same file — purely human work included — would link to it forever.
+        // Consumed under the touch-side spelling, which is the one the store
+        // matches on.
+        store.consume_touches(&candidate.session_id, commit_sha, &matches.touched)?;
     }
     Ok(created)
+}
+
+/// What one commit and one Session's touches agreed on.
+struct PathMatches {
+    /// Commit-side paths that passed the link rule — the Checkpoint's
+    /// `files_touched`.
+    linked: Vec<String>,
+    /// Touch-side paths the commit intersected at all, linked or not — the
+    /// paths this commit *settled*, and therefore the ones to consume.
+    touched: Vec<String>,
 }
 
 /// The paths on which this Session and this commit agree, under the link rule.
@@ -218,7 +315,7 @@ fn matching_paths(
     commit_sha: &str,
     changed: &[ChangedPath],
     touches: &[FileTouch],
-) -> Vec<String> {
+) -> PathMatches {
     // Keyed case-insensitively. The primary development filesystem on macOS is
     // case-insensitive while git is case-sensitive, so a byte comparison of
     // `Foo.rs` against `foo.rs` quietly fails, no Checkpoint forms, and nothing
@@ -229,7 +326,7 @@ fn matching_paths(
         .map(|touch| (touch.path.to_lowercase(), touch))
         .collect();
 
-    let mut matched = Vec::new();
+    let mut matches = PathMatches { linked: Vec::new(), touched: Vec::new() };
     for change in changed {
         // A rename carries the agent's work under its *pre*-rename path: the
         // agent edited the file, the commit moved it. Either spelling counts.
@@ -242,13 +339,16 @@ fn matching_paths(
             continue;
         };
 
+        matches.touched.push(touch.path.clone());
         if links(repo, commit_sha, change, touch) {
-            matched.push(change.path.clone());
+            matches.linked.push(change.path.clone());
         }
     }
-    matched.sort();
-    matched.dedup();
-    matched
+    matches.linked.sort();
+    matches.linked.dedup();
+    matches.touched.sort();
+    matches.touched.dedup();
+    matches
 }
 
 /// The rule itself.
@@ -277,7 +377,21 @@ fn links(repo: &Path, commit_sha: &str, change: &ChangedPath, touch: &FileTouch)
     let Some(committed) = git::blob_at(repo, commit_sha, &change.path) else {
         return false;
     };
-    &blobs::key_for(&committed) == expected
+    if &blobs::key_for(&committed) == expected {
+        return true;
+    }
+
+    // The raw bytes differ — but the touch hashed what the agent wrote into the
+    // *worktree*, and on a repository with content filters (CRLF conversion,
+    // `text=auto`) the committed blob is legitimately a different byte string
+    // for the same content. Compare against the blob's checkout form before
+    // declaring a mismatch, so a Windows-style repo does not silently fail the
+    // strict arm on every agent-created file. Filters that are not invertible
+    // from the blob side (ident expansion, LFS pointers) remain a genuine gap.
+    match git::blob_at_filtered(repo, commit_sha, &change.path) {
+        Some(filtered) => &blobs::key_for(&filtered) == expected,
+        None => false,
+    }
 }
 
 /// Are there Checkpoints for this Workspace whose commit has gone missing?
@@ -289,7 +403,13 @@ pub fn has_unreachable_checkpoints(store: &Store, workspace_id: &str, repo: &Pat
     Ok(store
         .checkpoints_for_workspace(workspace_id)?
         .into_iter()
-        .any(|cp| cp.link_state == LinkState::Linked && !git::is_reachable(repo, &cp.commit_sha)))
+        // A failed probe reads as "still reachable" here: this is only a cheap
+        // pre-check, and it must never nominate a Checkpoint for orphaning on
+        // the strength of a probe that did not run.
+        .any(|cp| {
+            cp.link_state == LinkState::Linked
+                && !git::is_reachable(repo, &cp.commit_sha).unwrap_or(true)
+        }))
 }
 
 /// What one reconciliation pass did.
@@ -303,6 +423,11 @@ pub struct ReconcileOutcome {
     pub orphaned: usize,
     /// Previously orphaned, and reachable again — a reverted force-push.
     pub recovered: usize,
+    /// Checkpoints this pass could not decide about — a reachability probe or
+    /// the patch-id scan failed, or a store write refused. Skipped, never
+    /// orphaned on a failure, and re-examined on the next pass. One row's
+    /// failure never aborts the rest of the pass.
+    pub failed: usize,
     /// Reconciliation was skipped because a rewrite was still in progress.
     pub deferred: bool,
 }
@@ -362,19 +487,49 @@ pub fn reconcile_rewrites(store: &Store, workspace_id: &str, repo: &Path) -> Res
     }
 
     // Built once for the whole pass rather than per Checkpoint — an interactive
-    // rebase touches every Checkpoint on the branch at the same time.
-    let mut patch_ids: Option<std::collections::HashMap<String, Vec<String>>> = None;
+    // rebase touches every Checkpoint on the branch at the same time. A failed
+    // build must not read as an *empty* map: "no candidates" becomes "no match,
+    // orphan", and a transient git failure must never orphan anything — so the
+    // failure is remembered and every re-match this pass is skipped instead.
+    enum PatchMap {
+        Unbuilt,
+        Ready(std::collections::HashMap<String, Vec<String>>),
+        Unavailable,
+    }
+    let mut patch_ids = PatchMap::Unbuilt;
+
+    // Several Checkpoints can share one commit (two Sessions, one commit), and
+    // a pass runs on every ref movement — probe each sha once, not once per row.
+    let mut probes: HashMap<String, Option<bool>> = HashMap::new();
 
     for checkpoint in checkpoints {
-        let reachable = git::is_reachable(repo, &checkpoint.commit_sha);
+        // `None` means the probe itself failed. That is "unknown", never
+        // "unreachable": skip the row this pass, count it, and let the next
+        // ref movement retry — orphaning on a failed probe is how a lock-file
+        // collision rewrites a developer's timeline.
+        let reachable = match probes.get(&checkpoint.commit_sha) {
+            Some(cached) => *cached,
+            None => {
+                let probed = git::is_reachable(repo, &checkpoint.commit_sha).ok();
+                probes.insert(checkpoint.commit_sha.clone(), probed);
+                probed
+            }
+        };
+        let Some(reachable) = reachable else {
+            outcome.failed += 1;
+            continue;
+        };
 
         match checkpoint.link_state {
             // A previously orphaned Checkpoint whose commit is reachable again —
             // a reverted force-push. Re-link it rather than leaving the record
             // pessimistic.
             LinkState::Orphaned if reachable => {
-                store.relink_checkpoint(&checkpoint.id, &checkpoint.commit_sha)?;
-                outcome.recovered += 1;
+                let branch = branch_hint(repo, &checkpoint.commit_sha, checkpoint.branch.as_deref());
+                match store.relink_checkpoint(&checkpoint.id, &checkpoint.commit_sha, branch.as_deref()) {
+                    Ok(()) => outcome.recovered += 1,
+                    Err(_) => outcome.failed += 1,
+                }
                 continue;
             }
             LinkState::Orphaned => continue,
@@ -386,31 +541,99 @@ pub fn reconcile_rewrites(store: &Store, workspace_id: &str, repo: &Path) -> Res
         let Some(patch_id) = &checkpoint.patch_id else {
             // No patch-id means an empty diff, which can neither donate nor
             // receive a re-point.
-            store.orphan_checkpoint(&checkpoint.id)?;
-            outcome.orphaned += 1;
+            match store.orphan_checkpoint(&checkpoint.id) {
+                Ok(()) => outcome.orphaned += 1,
+                Err(_) => outcome.failed += 1,
+            }
             continue;
         };
 
-        let map = patch_ids
-            .get_or_insert_with(|| git::patch_id_map(repo, RECOVERY_SCAN_LIMIT));
+        if matches!(patch_ids, PatchMap::Unbuilt) {
+            patch_ids = match git::patch_id_map(repo, RECOVERY_SCAN_LIMIT) {
+                Ok(map) => PatchMap::Ready(map),
+                Err(_) => PatchMap::Unavailable,
+            };
+        }
+        let map = match &patch_ids {
+            PatchMap::Ready(map) => map,
+            _ => {
+                outcome.failed += 1;
+                continue;
+            }
+        };
 
         match resolve_candidate(repo, map.get(patch_id), checkpoint.branch.as_deref()) {
             Some(commit) => {
-                store.relink_checkpoint(&checkpoint.id, &commit)?;
-                outcome.relinked += 1;
+                let branch = branch_hint(repo, &commit, checkpoint.branch.as_deref());
+                match store.relink_checkpoint(&checkpoint.id, &commit, branch.as_deref()) {
+                    Ok(()) => outcome.relinked += 1,
+                    Err(_) => outcome.failed += 1,
+                }
             }
             None => {
                 // A squash collapses several patches into one that matches none
                 // of them; a differently-resolved conflict changes the diff.
                 // Both are honest orphans — saying so beats attaching to the
                 // wrong commit, which silently corrupts a shared timeline.
-                store.orphan_checkpoint(&checkpoint.id)?;
-                outcome.orphaned += 1;
+                match store.orphan_checkpoint(&checkpoint.id) {
+                    Ok(()) => outcome.orphaned += 1,
+                    Err(_) => outcome.failed += 1,
+                }
             }
         }
     }
 
+    record_reconcile_note(store, workspace_id, &outcome)?;
     Ok(outcome)
+}
+
+/// Persist what this pass did, when a developer needs to hear about it.
+///
+/// A mass orphan or a partly-failed pass is written as a small JSON note the
+/// capture-health signal surfaces — a timeline that changes wholesale with the
+/// explanation living only in a log file is the same as no explanation. A clean
+/// pass zeroes the note rather than leaving the old alarm standing, so the
+/// signal reports current state, not history.
+fn record_reconcile_note(store: &Store, workspace_id: &str, outcome: &ReconcileOutcome) -> Result<()> {
+    let noteworthy = outcome.is_mass_orphan() || outcome.failed > 0;
+    if noteworthy {
+        let note = serde_json::json!({
+            "orphaned": outcome.orphaned,
+            "relinked": outcome.relinked,
+            "failed": outcome.failed,
+            "at": Utc::now().to_rfc3339(),
+        });
+        store.set_reconcile_note(workspace_id, &note.to_string())?;
+    } else if store.reconcile_note(workspace_id)?.is_some() {
+        let clear = serde_json::json!({
+            "orphaned": 0,
+            "relinked": 0,
+            "failed": 0,
+            "at": Utc::now().to_rfc3339(),
+        });
+        store.set_reconcile_note(workspace_id, &clear.to_string())?;
+    }
+    Ok(())
+}
+
+/// The branch to record on a re-pointed Checkpoint, when it is cheap to know.
+///
+/// Prefers the branch the Checkpoint already recorded when the commit is still
+/// on it; otherwise a commit on exactly one branch names itself. Anything
+/// ambiguous returns `None`, which leaves the recorded branch untouched rather
+/// than guessing — the branch field feeds the timeline filter and future
+/// cherry-pick tie-breaks, so a stale value is better than a wrong one.
+fn branch_hint(repo: &Path, sha: &str, recorded: Option<&str>) -> Option<String> {
+    let branches = git::branches_containing(repo, sha);
+    if let Some(recorded) = recorded {
+        if branches.iter().any(|branch| branch == recorded) {
+            return Some(recorded.to_string());
+        }
+    }
+    match branches.len() {
+        1 => Some(branches.into_iter().next().expect("len checked")),
+        _ => None,
+    }
 }
 
 /// Pick the commit a Checkpoint should re-point at, or `None` to orphan.

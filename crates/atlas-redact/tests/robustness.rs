@@ -37,11 +37,38 @@ fn redacting_already_redacted_content_is_a_no_op() {
 
 #[test]
 fn json_redaction_is_idempotent_too() {
-    let input = r#"{"content":"API_KEY=supersecretvalue123","client_secret":"hunter2xyz"}"#;
-    let once = redact_json(input);
-    let twice = redact_json(&once.text);
-    assert_eq!(twice.text, once.text);
-    assert_eq!(twice.counts.total(), 0);
+    let inputs = [
+        r#"{"content":"API_KEY=supersecretvalue123","client_secret":"hunter2xyz"}"#,
+        // The link-preserving url path: only the password is replaced, and the
+        // replacement must be invisible to a second pass.
+        r#"{"url":"postgres://app:hunter2@db/x"}"#,
+        r#"{"uri":"mysql://db.internal/app?user=svc&password=hunter2"}"#,
+        // The unconditional bare-password key.
+        r#"{"password":"hunter2"}"#,
+    ];
+    for input in inputs {
+        let once = redact_json(input);
+        let twice = redact_json(&once.text);
+        assert_eq!(twice.text, once.text, "second pass changed the output for {input:?}");
+        assert_eq!(twice.counts.total(), 0, "second pass re-redacted for {input:?}");
+    }
+}
+
+#[test]
+fn flat_redaction_of_json_fragments_is_idempotent() {
+    // The quoted-key credential form, exercised through the flat pass — a JSON
+    // fragment inside prose never reaches the walker.
+    let inputs = [
+        r#"the tool sent {"password": "hunter2"} and failed"#,
+        r#"config was password: "hunter2" at the time"#,
+    ];
+    for input in inputs {
+        let once = redact(input);
+        assert!(!once.text.contains("hunter2"), "secret survived: {}", once.text);
+        let twice = redact(&once.text);
+        assert_eq!(twice.text, once.text, "second pass changed the output for {input:?}");
+        assert_eq!(twice.counts.total(), 0, "second pass re-redacted for {input:?}");
+    }
 }
 
 #[test]

@@ -29,21 +29,42 @@
 //! `spawn_blocking` would also let two turns land out of order. A single worker
 //! thread behind an unbounded channel gets both properties: `on_event` returns
 //! immediately, and turns are written in the order they happened.
+//!
+//! **Streamed bodies are accumulated, not sampled.** `MessageAppended` carries
+//! only the *first* streamed chunk of an assistant or thinking message; the rest
+//! arrives as `TextChunk` / `ThinkingChunk` deltas. Recording at
+//! `MessageAppended` time would therefore store every streamed response
+//! truncated to its opening tokens — so the middleware accumulates per message
+//! id and submits the completed bodies when the turn finishes.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 use atlas_agents::{
     MessageRole, OutboundMiddleware, SessionDelta, SessionDeltaEnvelope, ToolCallStatus,
 };
+use atlas_checkpoint::model::DrainGate;
 use atlas_checkpoint::tools::{extract_paths, resolve_path, ResolvedPath, ToolName};
 use atlas_checkpoint::{
     Capture, FileWrite, Mode, Role, SessionKey, Source, Store, TokenTotals, ToolCallContent,
     ToolStatus, TurnContent, WorkspaceMode,
 };
 use tauri::{AppHandle, Manager};
+
+/// Lock a mutex, recovering from poisoning.
+///
+/// A panicked capture job poisons whatever mutex it held; the store's own
+/// transactionality is what guards consistency, not the poison flag — and
+/// letting one panic permanently kill every later capture command (the old
+/// `.expect("session store")` behaviour) turns a single bad payload into a
+/// dead recorder for the rest of the process.
+fn lock_ok<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 /// What the middleware knows about one agent session, learned at send time.
 ///
@@ -63,7 +84,10 @@ struct SessionBinding {
     model: Option<String>,
     cwd: String,
     /// The turn a message-appended delta belongs to. Message deltas carry no
-    /// turn identity of their own, so the send path stamps it here.
+    /// turn identity of their own, so the send path stamps it here. Seeded from
+    /// the store's `MAX(turn_seq)` on first sighting, so a conversation resumed
+    /// after a restart continues from turn N+1 instead of colliding with the
+    /// turns already recorded.
     turn_seq: i64,
 }
 
@@ -90,21 +114,20 @@ enum Job {
         locations: serde_json::Value,
         arguments: Option<String>,
         result: Option<String>,
-        /// Paths this call touches, with whether each existed *before* the agent
-        /// wrote — sampled on first sighting, because after the write the answer
-        /// is unknowable.
-        writes: Vec<PendingWrite>,
-        /// The call has finished, so the file on disk is now what the agent
-        /// left and can be hashed.
-        terminal: bool,
+        /// Files this call wrote, complete with the write-time hash — populated
+        /// only on the *first* terminal sighting, so repeated terminal upserts
+        /// cannot duplicate `file_touch` / `agent_edit` rows.
+        writes: Vec<CompletedWrite>,
         /// The patch an edit-shaped call applied, when the arguments carry one.
+        /// Recorded once per call, not once per path.
         patch: Option<String>,
     },
     /// Send everything pending for this Workspace.
     ///
     /// Progressive and interruptible by construction: each pass sends what it
     /// can and leaves the rest pending, so closing Atlas mid-backlog resumes
-    /// rather than restarting.
+    /// rather than restarting. An explicit drain bypasses the offline backoff —
+    /// it exists because a human just did something (promote, connect, retry).
     Drain {
         workspace_root: PathBuf,
     },
@@ -129,37 +152,102 @@ enum Job {
         binding: SessionBinding,
         totals: TokenTotals,
     },
+    /// The agent process for this session is gone; drop the worker's cached
+    /// session id so the map does not grow for the life of the process.
+    EndSession {
+        native_session_id: String,
+    },
 }
 
 /// A file a tool call is about to write, and what we knew before it did.
 #[derive(Clone)]
 struct PendingWrite {
     path: ResolvedPath,
+    /// Whether the file existed before the agent wrote.
+    ///
+    /// Sampled at first sighting when that sighting precedes the write. A path
+    /// that first appears only on a terminal (post-write) update has an
+    /// *unknowable* answer — recorded as `false`, never `true`: the strict arm
+    /// of the link rule (content match required) can miss a link, but the
+    /// permissive arm (path alone) crediting the agent for a file a human wrote
+    /// is exactly the false attribution the rule exists to prevent.
     existed_before: bool,
+}
+
+/// A finished write, hashed on the emit thread at the terminal sighting.
+///
+/// Hashing here rather than on the worker matters when the worker is busy (a
+/// multi-minute import or drain): by the time the job is dequeued the developer
+/// may have edited the file, and hashing *their* content as the agent's is the
+/// false-attribution direction the link rule's new-file arm depends on. The
+/// read is bounded by the file the agent just wrote.
+#[derive(Clone)]
+struct CompletedWrite {
+    path: ResolvedPath,
+    existed_before: bool,
+    /// Hash of what the agent produced. `None` for a deletion.
+    sha256_after: Option<String>,
+    deleted: bool,
+}
+
+/// The sampling state for one tool call's writes.
+struct WriteSample {
+    writes: Vec<PendingWrite>,
+    /// The first terminal sighting has already carried these writes to the
+    /// worker; later terminal upserts (a late locations-only refresh) must not
+    /// record them again — `file_touch` / `agent_edit` have no idempotency key.
+    recorded: bool,
+}
+
+/// A message being streamed, accumulated until the turn finishes.
+struct PendingMessage {
+    id: String,
+    role: Role,
+    mode: Mode,
+    body: String,
+}
+
+/// Everything a turn has streamed so far, plus the session binding as it stood
+/// when the turn's first message arrived — so a queued next prompt bumping the
+/// registry's `turn_seq` cannot re-stamp this turn's messages.
+struct PendingTurn {
+    binding: SessionBinding,
+    messages: Vec<PendingMessage>,
 }
 
 /// App-wide capture state: the session registry and the worker's channel.
 pub struct CaptureState {
     sessions: Mutex<HashMap<String, SessionBinding>>,
-    /// `existed_before` per (tool call, path), sampled the first time we see the
-    /// call and reused when it completes.
-    ///
-    /// This has to be sampled on the emit thread rather than on the worker: the
-    /// first-sighting delta arrives *before* the agent performs the write, and
-    /// that is the only moment the answer is knowable. A `stat` is microseconds,
-    /// so it does not meaningfully cost the hot path — unlike hashing the file,
-    /// which is deferred to the worker.
-    pending_writes: Mutex<HashMap<String, Vec<PendingWrite>>>,
+    /// Write sampling per tool call id — `existed_before` answers and whether
+    /// the call's writes have been recorded. Evicted when the session closes.
+    pending_writes: Mutex<HashMap<String, WriteSample>>,
+    /// Tool-call ids seen per session, so the write caches above can be evicted
+    /// when the session's agent disconnects.
+    session_calls: Mutex<HashMap<String, Vec<String>>>,
+    /// Streamed message accumulation per session, flushed at turn end.
+    pending_turns: Mutex<HashMap<String, PendingTurn>>,
     /// How the drain gets an access token. Shared with the worker.
     token: TokenProvider,
     /// Every writing session store this process has open.
     stores: StoreRegistry,
+    /// Set false when the worker thread dies (it should never — each job runs
+    /// under `catch_unwind` — but a dead worker is silent capture loss, which is
+    /// exactly what the health signal exists to make visible).
+    worker_alive: Arc<AtomicBool>,
     tx: mpsc::Sender<Job>,
 }
 
 /// A late-bound source of access tokens, shared between the command surface and
 /// the capture worker.
 type TokenProvider = Arc<Mutex<Option<Box<dyn Fn() -> Option<String> + Send>>>>;
+
+/// Per-root drain backoff, owned by the worker.
+struct DrainBackoff {
+    next_attempt: Instant,
+    delay: Duration,
+}
+
+type BackoffMap = Arc<Mutex<HashMap<PathBuf, DrainBackoff>>>;
 
 /// One writing [`Store`] per Workspace root, for the whole process.
 ///
@@ -201,19 +289,24 @@ impl CaptureState {
         let token_for_worker = token.clone();
         let stores: StoreRegistry = Arc::new(Mutex::new(HashMap::new()));
         let stores_for_worker = stores.clone();
+        let worker_alive = Arc::new(AtomicBool::new(true));
+        let alive_for_worker = worker_alive.clone();
         // Unbounded on purpose. A bounded channel would have to choose between
         // blocking the emit thread and dropping a turn, and both are worse than
         // holding a few queued turns in memory — the worker drains them in
         // milliseconds.
         std::thread::Builder::new()
             .name("atlas-capture".into())
-            .spawn(move || worker(rx, token_for_worker, stores_for_worker))
+            .spawn(move || worker(rx, token_for_worker, stores_for_worker, alive_for_worker))
             .expect("capture worker thread");
         Self {
             sessions: Mutex::new(HashMap::new()),
             pending_writes: Mutex::new(HashMap::new()),
+            session_calls: Mutex::new(HashMap::new()),
+            pending_turns: Mutex::new(HashMap::new()),
             token,
             stores,
+            worker_alive,
             tx,
         }
     }
@@ -227,23 +320,26 @@ impl CaptureState {
         Ok(open_in(&self.stores, root)?.store)
     }
 
-    /// Does this process hold the Workspace's writer lock?
+    /// This process's claim on the Workspace's writer lock.
     ///
-    /// Answers `false` for a Workspace nothing has opened yet, which is correct:
-    /// nothing is recording it, and nothing is claiming to.
-    fn holds_writer_lock(&self, root: &Path) -> bool {
-        self.stores
-            .lock()
-            .expect("store registry")
-            .get(root)
-            .is_some_and(|handle| handle.is_writer)
+    /// `None` when nothing here has opened the store yet — no claim either way,
+    /// and crucially **not** evidence of another window. `Some(false)` means an
+    /// acquisition genuinely lost to another process; `Some(true)` means this
+    /// process holds it.
+    fn writer_claim(&self, root: &Path) -> Option<bool> {
+        lock_ok(&self.stores).get(root).map(|handle| handle.is_writer)
+    }
+
+    /// Is the capture worker thread still running?
+    fn is_worker_alive(&self) -> bool {
+        self.worker_alive.load(Ordering::Relaxed)
     }
 
     /// Install the credential source the drain uses.
     ///
     /// Called once from `setup`, after the auth core exists.
     pub fn install_token_provider(&self, provider: Box<dyn Fn() -> Option<String> + Send>) {
-        *self.token.lock().expect("token provider") = Some(provider);
+        *lock_ok(&self.token) = Some(provider);
     }
 
     /// Record the user's prompt and bind the session, from the send path.
@@ -266,18 +362,32 @@ impl CaptureState {
             return;
         }
 
+        // Seed the turn counter from the store when this is the first sighting
+        // of the session this process. Without this, a conversation resumed
+        // after a restart starts again at turn 1, `begin_turn` collides with
+        // the completed turn 1 already recorded, and the whole resumed tail is
+        // mis-attributed. The read is two indexed lookups, done *before* taking
+        // the registry lock so no I/O happens under it.
+        let source = source_for(plugin_id);
+        let needs_seed = !lock_ok(&self.sessions).contains_key(session_id);
+        let seed = if needs_seed {
+            seed_turn_seq(Path::new(cwd), source, session_id)
+        } else {
+            0
+        };
+
         let binding = {
-            let mut sessions = self.sessions.lock().expect("capture registry");
+            let mut sessions = lock_ok(&self.sessions);
             let entry = sessions
                 .entry(session_id.to_string())
                 .or_insert_with(|| SessionBinding {
                     workspace_root: PathBuf::from(cwd),
-                    source: source_for(plugin_id),
+                    source,
                     native_session_id: session_id.to_string(),
                     agent: Some(plugin_id.to_string()),
                     model: model.map(str::to_string),
                     cwd: cwd.to_string(),
-                    turn_seq: 0,
+                    turn_seq: seed,
                 });
             entry.turn_seq += 1;
             if model.is_some() {
@@ -308,7 +418,8 @@ impl CaptureState {
     /// The same call serves the one-time backfill (on enable) and the ongoing
     /// watch (on the worker's interval), because they are the same reconciling
     /// scan — a file that has not grown is skipped by a size check, which is
-    /// what makes running it repeatedly affordable.
+    /// what makes running it repeatedly affordable. Whether the import may run
+    /// at all (the Cloud bulk-disclosure gate) is checked in `import_for`.
     pub fn note_import(&self, workspace_root: &std::path::Path) {
         self.submit(Job::ImportTranscripts {
             workspace_root: workspace_root.to_path_buf(),
@@ -336,51 +447,164 @@ impl CaptureState {
     }
 
     fn binding(&self, session_id: &str) -> Option<SessionBinding> {
-        self.sessions
-            .lock()
-            .expect("capture registry")
-            .get(session_id)
-            .cloned()
+        lock_ok(&self.sessions).get(session_id).cloned()
     }
+
+    // ── Streamed-message accumulation ───────────────────────────────────────
+
+    /// A new agent message appeared. Start (or reset) its accumulation entry;
+    /// the body recorded at turn end, not this first-chunk snapshot.
+    fn begin_message(
+        &self,
+        session_id: &str,
+        binding: &SessionBinding,
+        id: String,
+        role: Role,
+        mode: Mode,
+        body: String,
+    ) {
+        let mut turns = lock_ok(&self.pending_turns);
+        let turn = turns
+            .entry(session_id.to_string())
+            .or_insert_with(|| PendingTurn { binding: binding.clone(), messages: Vec::new() });
+        match turn.messages.iter_mut().find(|m| m.id == id) {
+            Some(existing) => {
+                // A re-emit for a known id replaces rather than appends — the
+                // runtime sends the full snapshot in that case.
+                existing.role = role;
+                existing.mode = mode;
+                existing.body = body;
+            }
+            None => turn.messages.push(PendingMessage { id, role, mode, body }),
+        }
+    }
+
+    /// Append a streamed chunk to the message it belongs to.
+    ///
+    /// Text and thinking chunks are appended alike: the runtime creates separate
+    /// messages for thinking and text, so a chunk's message id already selects
+    /// the right body.
+    fn append_chunk(&self, session_id: &str, message_id: &str, delta: &str) {
+        let mut turns = lock_ok(&self.pending_turns);
+        if let Some(turn) = turns.get_mut(session_id) {
+            if let Some(message) = turn.messages.iter_mut().find(|m| m.id == message_id) {
+                message.body.push_str(delta);
+            }
+        }
+    }
+
+    /// The turn ended — submit every accumulated message (now complete), then
+    /// close the turn. Clearing the accumulation here is also what bounds its
+    /// memory.
+    fn flush_turn(&self, session_id: &str, fallback: &SessionBinding) {
+        let turn = lock_ok(&self.pending_turns).remove(session_id);
+        match turn {
+            Some(turn) => {
+                self.submit_pending_messages(&turn);
+                self.submit(Job::FinishTurn { binding: turn.binding });
+            }
+            // A turn with no agent messages (tool-only, or an instant failure)
+            // still has to close.
+            None => self.submit(Job::FinishTurn { binding: fallback.clone() }),
+        }
+    }
+
+    /// The agent died. Record whatever had streamed — a partial transcript is
+    /// better than none — but do *not* close the turn: an agent that died
+    /// mid-turn should be reconciled as aborted, not read as finished.
+    fn flush_session_end(&self, session_id: &str, binding: &SessionBinding) {
+        if let Some(turn) = lock_ok(&self.pending_turns).remove(session_id) {
+            self.submit_pending_messages(&turn);
+        }
+        // Evict the write caches for every call this session made. The
+        // `session_calls` guard is released before `pending_writes` is taken —
+        // an if-let scrutinee would keep it alive across the body, and
+        // `sample_writes` acquires the two locks in the opposite order.
+        let calls = lock_ok(&self.session_calls).remove(session_id);
+        if let Some(calls) = calls {
+            let mut pending = lock_ok(&self.pending_writes);
+            for call_id in calls {
+                pending.remove(&call_id);
+            }
+        }
+        // And the worker's cached store id for the session.
+        self.submit(Job::EndSession {
+            native_session_id: binding.native_session_id.clone(),
+        });
+    }
+
+    fn submit_pending_messages(&self, turn: &PendingTurn) {
+        for message in &turn.messages {
+            if message.body.trim().is_empty() {
+                continue;
+            }
+            self.submit(Job::Turn {
+                binding: turn.binding.clone(),
+                native_message_id: message.id.clone(),
+                role: message.role,
+                mode: message.mode,
+                body: message.body.clone(),
+            });
+        }
+    }
+
+    // ── Write sampling ──────────────────────────────────────────────────────
 
     /// Note which files a call is about to touch, and whether each existed.
     ///
-    /// Sampled once per call — the first sighting arrives before the agent
-    /// writes, and every later sighting reuses that answer. Re-sampling on the
-    /// completion update would always report `true`, which would make the link
-    /// rule credit the agent for files a human wrote.
+    /// The sampling *event* is cached per call id — even when the extracted
+    /// path set is empty — because many agents attach locations only on the
+    /// completion update, and re-sampling `existed_before` after the write
+    /// would always answer `true` for a file the agent just created. A path
+    /// first seen on a later (post-write) sighting is recorded with
+    /// `existed_before = false`: the strict arm may miss a link, but the
+    /// permissive arm must never credit the agent falsely.
+    ///
+    /// Returns the writes and whether a terminal sighting has already recorded
+    /// them (so repeated terminal upserts cannot duplicate rows).
     fn sample_writes(
         &self,
+        session_id: &str,
         call_id: &str,
         workspace_root: &std::path::Path,
         locations: &[serde_json::Value],
         arguments: &serde_json::Value,
-    ) -> Vec<PendingWrite> {
-        let mut pending = self.pending_writes.lock().expect("pending writes");
-        if let Some(existing) = pending.get(call_id) {
-            return existing.clone();
+        terminal: bool,
+    ) -> (Vec<PendingWrite>, bool) {
+        let mut pending = lock_ok(&self.pending_writes);
+
+        let first_sighting = !pending.contains_key(call_id);
+        if first_sighting {
+            lock_ok(&self.session_calls)
+                .entry(session_id.to_string())
+                .or_default()
+                .push(call_id.to_string());
+            pending.insert(call_id.to_string(), WriteSample { writes: Vec::new(), recorded: false });
+        }
+        let sample = pending.get_mut(call_id).expect("just ensured");
+
+        for raw in extract_paths(locations, arguments) {
+            let path = resolve_path(&raw, workspace_root);
+            if sample.writes.iter().any(|w| w.path.path == path.path) {
+                continue;
+            }
+            // Knowable only when this sighting precedes the write: the first
+            // sighting of a call that is not yet terminal. Anything later —
+            // including a call whose *first* sighting is already terminal — is
+            // post-write, and unknown is recorded as the strict arm.
+            let existed_before = if first_sighting && !terminal {
+                workspace_root.join(&path.path).exists()
+            } else {
+                false
+            };
+            sample.writes.push(PendingWrite { path, existed_before });
         }
 
-        let writes: Vec<PendingWrite> = extract_paths(locations, arguments)
-            .into_iter()
-            .map(|raw| {
-                let path = resolve_path(&raw, workspace_root);
-                let existed_before = workspace_root.join(&path.path).exists();
-                PendingWrite { path, existed_before }
-            })
-            .collect();
-
-        if !writes.is_empty() {
-            pending.insert(call_id.to_string(), writes.clone());
+        let already_recorded = sample.recorded;
+        if terminal && !already_recorded {
+            sample.recorded = true;
         }
-        writes
-    }
-
-    fn forget_writes(&self, call_id: &str) {
-        self.pending_writes
-            .lock()
-            .expect("pending writes")
-            .remove(call_id);
+        (sample.writes.clone(), already_recorded)
     }
 
     fn submit(&self, job: Job) {
@@ -398,69 +622,134 @@ impl Default for CaptureState {
     }
 }
 
+/// The highest turn number already recorded for a session, or 0.
+///
+/// Read through a reader connection so the send path never contends for the
+/// writer; run only on the first sighting of a session in this process.
+fn seed_turn_seq(root: &Path, source: Source, native_session_id: &str) -> i64 {
+    if !enabled_on_disk(root) {
+        return 0;
+    }
+    let Ok(store) = Store::open_reader(atlas_checkpoint::atlas_dir(root)) else {
+        return 0;
+    };
+    let workspace_id = root.to_string_lossy().to_string();
+    let Ok(Some(session_id)) = store.session_id_for(&workspace_id, source, native_session_id)
+    else {
+        return 0;
+    };
+    store.max_turn_seq(&session_id).unwrap_or(0)
+}
+
 // ── Command surface ─────────────────────────────────────────────────────────
 //
-// These are synchronous store reads and writes, not delta-stream work, so they
-// run on the caller's thread rather than through the capture worker. They are
-// fast (one SQLite row, a handful of `git` reads) and the popover needs an
-// answer to render at all.
+// Every command is async with its work inside `spawn_blocking`: Tauri v2 runs
+// non-async commands on the main thread, and several of these do 30-second
+// network calls or bulk store reads — a beachball per click otherwise. Names
+// and arguments are unchanged; `invoke` is transparent to async.
 
 /// What Atlas can work out about a directory before anything is bound.
 ///
 /// Drives the popover's "Detected" block: origin, root commit, whether this is
 /// a repository at all.
 #[tauri::command]
-pub fn capture_detect(project_path: String) -> Result<atlas_checkpoint::WorkspaceDetection, String> {
-    Ok(atlas_checkpoint::detect(std::path::Path::new(&project_path)))
+pub async fn capture_detect(
+    project_path: String,
+) -> Result<atlas_checkpoint::WorkspaceDetection, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        Ok(atlas_checkpoint::detect(std::path::Path::new(&project_path)))
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// How this Workspace is bound, or `null` if capture was never enabled.
 #[tauri::command]
-pub fn capture_binding(project_path: String) -> Result<Option<atlas_checkpoint::Binding>, String> {
-    let Some(store) = open_reader(&project_path)? else {
-        return Ok(None);
-    };
-    store.binding().map_err(|e| e.to_string())
+pub async fn capture_binding(
+    project_path: String,
+) -> Result<Option<atlas_checkpoint::Binding>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let Some(store) = open_reader(&project_path)? else {
+            return Ok(None);
+        };
+        store.binding().map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
-/// Turn capture on for this Workspace.
+/// Turn capture on for this Workspace — Local mode only.
 ///
 /// Local mode makes no network call and needs no account, which is the whole
 /// point: Atlas has to be useful before anyone signs up for anything.
+///
+/// Cloud is deliberately rejected here. A Cloud Workspace must be settled on
+/// the server first (Slug, Organisation, workspace id) or it is half-bound:
+/// rows queue as `pending` forever with nowhere to go. `capture_register_cloud`
+/// is the only Cloud-create path.
 #[tauri::command]
-pub fn capture_enable(
+pub async fn capture_enable(
     project_path: String,
     mode: String,
     app: AppHandle,
 ) -> Result<atlas_checkpoint::Binding, String> {
-    let mode = WorkspaceMode::parse(&mode)
-        .ok_or_else(|| format!("unknown workspace mode: {mode}"))?;
-    let root = std::path::Path::new(&project_path);
-    // The process-wide writer, not a second store on the same directory: that
-    // is what used to lose the writer lock to Atlas's own capture worker and
-    // report a nonexistent second window.
-    let handle = app.state::<CaptureState>().writer(root)?;
-    let store = handle.lock().expect("session store");
+    tauri::async_runtime::spawn_blocking(move || {
+        let mode =
+            WorkspaceMode::parse(&mode).ok_or_else(|| format!("unknown workspace mode: {mode}"))?;
+        if mode == WorkspaceMode::Cloud {
+            return Err(
+                "Cloud requires registration — use capture_register_cloud".to_string()
+            );
+        }
+        let root = std::path::Path::new(&project_path);
+        let state = app.state::<CaptureState>();
+        // The process-wide writer, not a second store on the same directory:
+        // that is what used to lose the writer lock to Atlas's own capture
+        // worker and report a nonexistent second window.
+        let handle = state.writer(root)?;
+        let store = lock_ok(&handle);
 
-    let binding = atlas_checkpoint::bind(&store, &project_path, root, mode)
-        .map_err(|e| e.to_string())?;
+        // Re-enabling must not demote: a registered Cloud Workspace whose user
+        // clicks Enable again keeps its mode (and its org, slug and remote id —
+        // `upsert_binding` never touches those columns). Local→Cloud only goes
+        // through register/promote; Cloud→Local would need an explicit
+        // demotion flow that does not exist yet.
+        let effective_mode = match store.binding().map_err(|e| e.to_string())? {
+            Some(existing) if existing.mode == WorkspaceMode::Cloud => WorkspaceMode::Cloud,
+            _ => mode,
+        };
 
-    // Establish the commit cursor immediately, so the first commit after
-    // enabling is linked rather than waiting for a walk that has no baseline.
-    let _ = atlas_checkpoint::walk_new_commits(&store, &project_path, root, mode);
+        atlas_checkpoint::bind(&store, &project_path, root, effective_mode)
+            .map_err(|e| e.to_string())?;
 
-    // Backfill this project's existing transcripts, so the timeline is
-    // populated now rather than months from now. Handed to the worker rather
-    // than done here, because a multi-hundred-megabyte corpus must never block
-    // the click that started it.
-    //
-    // Local imports without ceremony — nothing leaves the machine. A Cloud
-    // Workspace is a bulk disclosure and waits for `capture_import_confirm`,
-    // after the developer has seen the real numbers.
-    if mode == WorkspaceMode::Local {
-        app.state::<CaptureState>().note_import(root);
-    }
-    Ok(binding)
+        // Local imports without ceremony — nothing leaves the machine — so the
+        // approval that gates the background scan is granted here. A Cloud
+        // Workspace is a bulk disclosure and waits for `capture_import_confirm`.
+        if effective_mode == WorkspaceMode::Local {
+            store.set_import_approved(true).map_err(|e| e.to_string())?;
+        }
+
+        let binding = store
+            .binding()
+            .map_err(|e| e.to_string())?
+            .ok_or("binding vanished")?;
+        drop(store);
+
+        // Establish the commit cursor now-ish, so the first commit after
+        // enabling is linked rather than waiting for a walk with no baseline.
+        // Enqueued rather than run inline: the walk can touch 200 commits, and
+        // holding the store mutex through it stalls the worker and the click.
+        state.note_git_change(root);
+
+        // Backfill this project's existing transcripts, so the timeline is
+        // populated now rather than months from now.
+        if effective_mode == WorkspaceMode::Local {
+            state.note_import(root);
+        }
+        Ok(binding)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// What importing this Workspace's transcripts would disclose.
@@ -469,28 +758,46 @@ pub fn capture_enable(
 /// much data. A developer cannot otherwise know what they are about to publish,
 /// and this is one of only two bulk-disclosure moments in the whole feature.
 #[tauri::command]
-pub fn capture_import_preview(
+pub async fn capture_import_preview(
     project_path: String,
 ) -> Result<atlas_checkpoint::ImportPreview, String> {
-    let store = open_reader(&project_path)?;
-    let mode = store
-        .as_ref()
-        .and_then(|s| s.binding().ok().flatten())
-        .map(|b| b.mode)
-        .unwrap_or(WorkspaceMode::Local);
-    let root = std::path::Path::new(&project_path);
-    let Some(source) = transcript_source_for(root) else {
-        return Ok(atlas_checkpoint::ImportPreview::default());
-    };
-    Ok(atlas_checkpoint::import_preview(&source, mode))
+    tauri::async_runtime::spawn_blocking(move || {
+        let store = open_reader(&project_path)?;
+        let mode = store
+            .as_ref()
+            .and_then(|s| s.binding().ok().flatten())
+            .map(|b| b.mode)
+            .unwrap_or(WorkspaceMode::Local);
+        let root = std::path::Path::new(&project_path);
+        let Some(source) = transcript_source_for(root) else {
+            return Ok(atlas_checkpoint::ImportPreview::default());
+        };
+        Ok(atlas_checkpoint::import_preview(&source, mode))
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
-/// Start the import, after the developer has confirmed it.
+/// The developer confirmed the bulk import — record the approval, then start.
+///
+/// The persisted flag is the actual gate: `import_for` refuses a Cloud
+/// Workspace without it, so cancelling the dialog (flag never set) means the
+/// 30-second background scan imports nothing, forever, until confirmed.
 #[tauri::command]
-pub fn capture_import_confirm(project_path: String, app: AppHandle) -> Result<(), String> {
-    app.state::<CaptureState>()
-        .note_import(std::path::Path::new(&project_path));
-    Ok(())
+pub async fn capture_import_confirm(project_path: String, app: AppHandle) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let root = std::path::Path::new(&project_path);
+        let state = app.state::<CaptureState>();
+        let handle = state.writer(root)?;
+        {
+            let store = lock_ok(&handle);
+            store.set_import_approved(true).map_err(|e| e.to_string())?;
+        }
+        state.note_import(root);
+        Ok(())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// Re-read the identity signals for an already-bound Workspace.
@@ -499,26 +806,45 @@ pub fn capture_import_confirm(project_path: String, app: AppHandle) -> Result<()
 /// Checkpoints without a restart, which it can only do once the fingerprint it
 /// had no way to know is filled in.
 #[tauri::command]
-pub fn capture_refresh(
+pub async fn capture_refresh(
     project_path: String,
     app: AppHandle,
 ) -> Result<Option<atlas_checkpoint::Binding>, String> {
-    let root = std::path::Path::new(&project_path);
-    let handle = app.state::<CaptureState>().writer(root)?;
-    let store = handle.lock().expect("session store");
-    let binding = atlas_checkpoint::refresh_detection(&store, root).map_err(|e| e.to_string())?;
-    if let Some(binding) = &binding {
-        let _ = atlas_checkpoint::walk_new_commits(&store, &project_path, root, binding.mode);
+    tauri::async_runtime::spawn_blocking(move || refresh_inner(&project_path, &app))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn refresh_inner(
+    project_path: &str,
+    app: &AppHandle,
+) -> Result<Option<atlas_checkpoint::Binding>, String> {
+    let root = std::path::Path::new(project_path);
+    let state = app.state::<CaptureState>();
+    let handle = state.writer(root)?;
+    let binding = {
+        let store = lock_ok(&handle);
+        atlas_checkpoint::refresh_detection(&store, root).map_err(|e| e.to_string())?
+    };
+    if binding.is_some() {
+        state.note_git_change(root);
     }
     Ok(binding)
 }
 
-/// Stop capturing. Nothing already recorded is deleted.
+/// Stop capturing. Nothing already recorded is deleted, and rows already
+/// queued keep draining — pausing is about *new* records.
 #[tauri::command]
-pub fn capture_disable(project_path: String, app: AppHandle) -> Result<(), String> {
-    let handle = app.state::<CaptureState>().writer(std::path::Path::new(&project_path))?;
-    let store = handle.lock().expect("session store");
-    atlas_checkpoint::disable(&store).map_err(|e| e.to_string())
+pub async fn capture_disable(project_path: String, app: AppHandle) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let handle = app
+            .state::<CaptureState>()
+            .writer(std::path::Path::new(&project_path))?;
+        let store = lock_ok(&handle);
+        atlas_checkpoint::disable(&store).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// Initialise a repository in a non-git Workspace, then re-detect.
@@ -526,20 +852,73 @@ pub fn capture_disable(project_path: String, app: AppHandle) -> Result<(), Strin
 /// Framed in the UI as unlocking commit linkage rather than as a requirement,
 /// because that is what it is: Sessions are captured either way.
 #[tauri::command]
-pub fn capture_git_init(
+pub async fn capture_git_init(
     project_path: String,
     app: AppHandle,
 ) -> Result<Option<atlas_checkpoint::Binding>, String> {
-    let status = std::process::Command::new("git")
-        .arg("-C")
-        .arg(&project_path)
-        .arg("init")
-        .output()
-        .map_err(|e| format!("git init: {e}"))?;
-    if !status.status.success() {
-        return Err(String::from_utf8_lossy(&status.stderr).trim().to_string());
-    }
-    capture_refresh(project_path, app)
+    tauri::async_runtime::spawn_blocking(move || {
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&project_path)
+            .arg("init")
+            .output()
+            .map_err(|e| format!("git init: {e}"))?;
+        if !status.status.success() {
+            return Err(String::from_utf8_lossy(&status.stderr).trim().to_string());
+        }
+        refresh_inner(&project_path, &app)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// A bound Workspace just became active — make sure its store is open (which
+/// also runs the folder-rename re-key) and give its import and drain a kick.
+///
+/// This is what closes the restart hole for non-git Workspaces: the 30-second
+/// tick only covers stores this process has opened, a git Workspace gets opened
+/// by the watcher's open-time walk, and a non-git one previously waited for the
+/// first prompt. The frontend calls this on workspace activation.
+#[tauri::command]
+pub async fn capture_activate(project_path: String, app: AppHandle) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let root = std::path::Path::new(&project_path);
+        if !enabled_on_disk(root) {
+            return Ok(());
+        }
+        let state = app.state::<CaptureState>();
+        // Opening the writer registers the store with the worker's tick and
+        // performs the rename re-key. A failure (another process holds it) is
+        // fine — that process is doing the capturing.
+        let _ = state.writer(root);
+        state.note_import(root);
+        state.note_drain(root);
+        Ok(())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Give every failed row another chance and drain immediately.
+///
+/// The recovery action behind the health signal's "N records could not be
+/// sent" — the `failed → pending` transition is a deliberate human action,
+/// never automatic.
+#[tauri::command]
+pub async fn capture_retry_failed(project_path: String, app: AppHandle) -> Result<i64, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let root = std::path::Path::new(&project_path);
+        let state = app.state::<CaptureState>();
+        let handle = state.writer(root)?;
+        let retried = {
+            let store = lock_ok(&handle);
+            store.retry_failed_rows(&project_path).map_err(|e| e.to_string())?
+        };
+        state.note_drain(root);
+        Ok(retried)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// The capture-health state for a Workspace.
@@ -549,44 +928,83 @@ pub fn capture_git_init(
 /// indistinguishable from the event stream, which is exactly how the clear-all
 /// bug stayed invisible.
 #[tauri::command]
-pub fn capture_health(
+pub async fn capture_health(
     project_path: String,
     workspace_id: Option<String>,
-    watchers: tauri::State<'_, super::git_watcher::GitWatcherState>,
-    capture: tauri::State<'_, CaptureState>,
+    app: AppHandle,
 ) -> Result<atlas_checkpoint::CaptureHealth, String> {
-    let root = std::path::Path::new(&project_path);
-    // A reader, so a status poll never waits behind an import — and therefore
-    // one that cannot answer whether this process holds the writer lock. The
-    // registry is asked instead; a reader's own `is_writer` is always false and
-    // would report a second window on every single Workspace.
-    let Some(store) = open_reader(&project_path)? else {
-        // Nothing has ever been captured here. That is the `Off` state, and
-        // computing it needs no store.
-        return Ok(atlas_checkpoint::CaptureHealth {
-            state: atlas_checkpoint::HealthState::Off,
-            summary: "Session capture is off".into(),
-            issues: Vec::new(),
-            flagged_sessions: 0,
-            failed_rows: 0,
-            pending_rows: 0,
-        });
-    };
+    tauri::async_runtime::spawn_blocking(move || {
+        let root = std::path::Path::new(&project_path);
+        // A reader, so a status poll never waits behind an import — and
+        // therefore one that cannot answer whether this process holds the
+        // writer lock. The registry is asked instead.
+        let store = match open_reader_raw(&project_path) {
+            Ok(Some(store)) => store,
+            Ok(None) => {
+                // Nothing has ever been captured here. That is the `Off` state,
+                // and computing it needs no store.
+                return Ok(off_health("Session capture is off"));
+            }
+            // The one failure the status indicator must not answer with its own
+            // error: a store written by a newer build is a Stopped state with a
+            // reason, not a broken indicator.
+            Err(atlas_checkpoint::Error::SchemaTooNew { .. }) => {
+                return Ok(atlas_checkpoint::CaptureHealth {
+                    state: atlas_checkpoint::HealthState::Stopped,
+                    summary: "This Workspace's session store was written by a newer Atlas".into(),
+                    issues: vec![atlas_checkpoint::health::HealthIssue {
+                        state: atlas_checkpoint::HealthState::Stopped,
+                        reason: "This Workspace's session store was written by a newer version \
+                                 of Atlas, so this build cannot record to it."
+                            .into(),
+                        next_step: "Update Atlas to keep capturing here.".into(),
+                    }],
+                    flagged_sessions: 0,
+                    failed_rows: 0,
+                    pending_rows: 0,
+                });
+            }
+            Err(e) => return Err(e.to_string()),
+        };
 
-    let expects_watcher = atlas_checkpoint::git::is_repository(root);
-    let watcher_attached = expects_watcher
-        && watchers.is_watching(workspace_id.as_deref().unwrap_or(&project_path));
+        let watchers = app.state::<super::git_watcher::GitWatcherState>();
+        let capture = app.state::<CaptureState>();
+        let expects_watcher = atlas_checkpoint::git::is_repository(root);
+        // Checked under both keys the registry might hold: the workspace UUID
+        // (what the frontend registers watchers under) and the repository root.
+        // The root check means an omitted optional `workspace_id` cannot
+        // manufacture a permanent false "Stopped".
+        let watcher_attached = expects_watcher
+            && (workspace_id
+                .as_deref()
+                .is_some_and(|id| watchers.is_watching(id))
+                || watchers.is_watching_root(root));
 
-    atlas_checkpoint::evaluate_health(
-        &store,
-        &project_path,
-        atlas_checkpoint::HostSignals {
-            watcher_attached,
-            expects_watcher,
-            is_writer: capture.holds_writer_lock(root),
-        },
-    )
-    .map_err(|e| e.to_string())
+        atlas_checkpoint::evaluate_health(
+            &store,
+            &project_path,
+            atlas_checkpoint::HostSignals {
+                watcher_attached,
+                expects_watcher,
+                holds_writer: capture.writer_claim(root),
+                worker_alive: capture.is_worker_alive(),
+            },
+        )
+        .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+fn off_health(summary: &str) -> atlas_checkpoint::CaptureHealth {
+    atlas_checkpoint::CaptureHealth {
+        state: atlas_checkpoint::HealthState::Off,
+        summary: summary.into(),
+        issues: Vec::new(),
+        flagged_sessions: 0,
+        failed_rows: 0,
+        pending_rows: 0,
+    }
 }
 
 /// Every Session captured in this Workspace, newest first.
@@ -596,15 +1014,19 @@ pub fn capture_health(
 /// `is_writer`: a second Atlas window cannot record, but it can still read back
 /// what the first one did.
 #[tauri::command]
-pub fn artifacts_sessions(
+pub async fn artifacts_sessions(
     project_path: String,
     workspace_id: Option<String>,
 ) -> Result<Vec<atlas_checkpoint::SessionSummary>, String> {
-    let Some(store) = open_reader(&project_path)? else {
-        return Ok(Vec::new());
-    };
-    let workspace_id = workspace_id.unwrap_or_else(|| project_path.clone());
-    atlas_checkpoint::session_summaries(&store, &workspace_id).map_err(|e| e.to_string())
+    tauri::async_runtime::spawn_blocking(move || {
+        let Some(store) = open_reader(&project_path)? else {
+            return Ok(Vec::new());
+        };
+        let workspace_id = workspace_id.unwrap_or_else(|| project_path.clone());
+        atlas_checkpoint::session_summaries(&store, &workspace_id).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// One Session as an ordered timeline.
@@ -614,29 +1036,36 @@ pub fn artifacts_sessions(
 /// truth for a commit message rather than a copy in the store that goes stale
 /// after a reword.
 #[tauri::command]
-pub fn artifacts_session(
+pub async fn artifacts_session(
     project_path: String,
     session_id: String,
 ) -> Result<Option<atlas_checkpoint::SessionDetail>, String> {
-    let root = std::path::Path::new(&project_path).to_path_buf();
-    let Some(store) = open_reader(&project_path)? else {
-        return Ok(None);
-    };
+    tauri::async_runtime::spawn_blocking(move || {
+        let root = std::path::Path::new(&project_path).to_path_buf();
+        let Some(store) = open_reader(&project_path)? else {
+            return Ok(None);
+        };
 
-    // A Session usually carries a handful of Checkpoints, but one `git show` per
-    // Checkpoint is still a process spawn each. Resolving them once up front
-    // keeps a long Session from paying that cost repeatedly.
-    let mut subjects: HashMap<String, String> = HashMap::new();
-    if atlas_checkpoint::git::is_repository(&root) {
-        for checkpoint in store.checkpoints_for_session(&session_id).map_err(|e| e.to_string())? {
-            if let Ok(info) = atlas_checkpoint::git::commit_info(&root, &checkpoint.commit_sha) {
-                subjects.insert(checkpoint.commit_sha, info.subject);
+        // A Session usually carries a handful of Checkpoints, but one `git show`
+        // per Checkpoint is still a process spawn each. Resolving them once up
+        // front keeps a long Session from paying that cost repeatedly.
+        let mut subjects: HashMap<String, String> = HashMap::new();
+        if atlas_checkpoint::git::is_repository(&root) {
+            for checkpoint in
+                store.checkpoints_for_session(&session_id).map_err(|e| e.to_string())?
+            {
+                if let Ok(info) = atlas_checkpoint::git::commit_info(&root, &checkpoint.commit_sha)
+                {
+                    subjects.insert(checkpoint.commit_sha, info.subject);
+                }
             }
         }
-    }
 
-    atlas_checkpoint::session_detail(&store, &session_id, |sha| subjects.get(sha).cloned())
-        .map_err(|e| e.to_string())
+        atlas_checkpoint::session_detail(&store, &session_id, |sha| subjects.get(sha).cloned())
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// Is this Slug free within the Organisation?
@@ -644,22 +1073,26 @@ pub fn artifacts_session(
 /// Debounced by the caller so the answer arrives while the developer is still
 /// typing, rather than as a rejection after they commit to a name.
 #[tauri::command]
-pub fn capture_slug_available(
+pub async fn capture_slug_available(
     project_path: String,
     org_id: String,
     slug: String,
     app: AppHandle,
 ) -> Result<String, String> {
-    let token = token_provider(&app);
-    let config = sync_config(&project_path, &org_id, &token);
-    Ok(match atlas_checkpoint::sync::check_slug(&config, &slug) {
-        atlas_checkpoint::SlugAvailability::Available => "available",
-        atlas_checkpoint::SlugAvailability::Taken => "taken",
-        // Distinct from "taken": telling a developer their name is gone when
-        // the network merely blinked is a lie they will act on.
-        atlas_checkpoint::SlugAvailability::Unknown => "unknown",
-    }
-    .to_string())
+    tauri::async_runtime::spawn_blocking(move || {
+        let token = token_provider(&app);
+        let config = sync_config(&project_path, &org_id, &token);
+        Ok(match atlas_checkpoint::sync::check_slug(&config, &slug) {
+            atlas_checkpoint::SlugAvailability::Available => "available",
+            atlas_checkpoint::SlugAvailability::Taken => "taken",
+            // Distinct from "taken": telling a developer their name is gone when
+            // the network merely blinked is a lie they will act on.
+            atlas_checkpoint::SlugAvailability::Unknown => "unknown",
+        }
+        .to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// Register this Workspace with an Organisation and switch it to Cloud.
@@ -669,36 +1102,54 @@ pub fn capture_slug_available(
 /// Slug leaves a half-bound Workspace behind. A failure here leaves the
 /// Workspace capturing locally, which is a retryable state rather than a broken
 /// one.
+///
+/// The network round-trip runs *outside* the store mutex: registration can take
+/// the full 30-second timeout, and holding the writer lock through it would
+/// stall the capture worker and every other capture command.
 #[tauri::command]
-pub fn capture_register_cloud(
+pub async fn capture_register_cloud(
     project_path: String,
     org_id: String,
     slug: String,
     app: AppHandle,
 ) -> Result<atlas_checkpoint::Binding, String> {
-    let handle = app.state::<CaptureState>().writer(std::path::Path::new(&project_path))?;
-    let store = handle.lock().expect("session store");
-    let binding = store
-        .binding()
-        .map_err(|e| e.to_string())?
-        .ok_or("enable capture for this Workspace first")?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<CaptureState>();
+        let root = std::path::Path::new(&project_path);
 
-    let token = token_provider(&app);
-    let config = sync_config(&project_path, &org_id, &token);
+        // Short lock: read the advisory identity signals, then release.
+        let (root_commit_sha, git_url) = {
+            let handle = state.writer(root)?;
+            let store = lock_ok(&handle);
+            let binding = store
+                .binding()
+                .map_err(|e| e.to_string())?
+                .ok_or("enable capture for this Workspace first")?;
+            (binding.root_commit_sha, binding.git_url)
+        };
 
-    // Advisory only — the server must accept a registration with neither.
-    atlas_checkpoint::register_workspace(
-        &config,
-        &slug,
-        binding.root_commit_sha.as_deref(),
-        binding.git_url.as_deref(),
-    )
-    .map_err(|e| e.to_string())?;
+        let token = token_provider(&app);
+        let config = sync_config(&project_path, &org_id, &token);
 
-    store
-        .set_cloud_binding(&org_id, &slug)
+        // Advisory only — the server must accept a registration with neither.
+        // The returned id is the Workspace's wire identity from here on.
+        let remote_workspace_id = atlas_checkpoint::register_workspace(
+            &config,
+            &slug,
+            root_commit_sha.as_deref(),
+            git_url.as_deref(),
+        )
         .map_err(|e| e.to_string())?;
-    store.binding().map_err(|e| e.to_string())?.ok_or_else(|| "binding vanished".into())
+
+        let handle = state.writer(root)?;
+        let store = lock_ok(&handle);
+        store
+            .set_cloud_binding(&org_id, &slug, Some(&remote_workspace_id))
+            .map_err(|e| e.to_string())?;
+        store.binding().map_err(|e| e.to_string())?.ok_or_else(|| "binding vanished".into())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// The Organisation's Workspaces, with the one this repository most likely
@@ -708,51 +1159,55 @@ pub fn capture_register_cloud(
 /// the same GitHub template shares a root commit, so a match is not proof, and a
 /// confident wrong answer pollutes a *shared* timeline with foreign Sessions.
 #[tauri::command]
-pub fn capture_connect_options(
+pub async fn capture_connect_options(
     project_path: String,
     org_id: String,
     app: AppHandle,
 ) -> Result<ConnectOptions, String> {
-    let token = token_provider(&app);
-    let config = sync_config(&project_path, &org_id, &token);
-    let workspaces = atlas_checkpoint::list_workspaces(&config).map_err(|e| e.to_string())?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let token = token_provider(&app);
+        let config = sync_config(&project_path, &org_id, &token);
+        let workspaces = atlas_checkpoint::list_workspaces(&config).map_err(|e| e.to_string())?;
 
-    let detection = atlas_checkpoint::detect(std::path::Path::new(&project_path));
-    let chosen = atlas_checkpoint::preselect(
-        &workspaces,
-        detection.root_commit_sha.as_deref(),
-        detection.git_url.as_deref(),
-    );
+        let detection = atlas_checkpoint::detect(std::path::Path::new(&project_path));
+        let chosen = atlas_checkpoint::preselect(
+            &workspaces,
+            detection.root_commit_sha.as_deref(),
+            detection.git_url.as_deref(),
+        );
 
-    Ok(match chosen {
-        atlas_checkpoint::Preselection::One { workspace, .. } => ConnectOptions {
-            workspaces,
-            preselected: Some(workspace.id),
-            // A shallow clone's fingerprint is a graft boundary rather than the
-            // true root, so even a match is worth flagging.
-            warning: detection
-                .is_shallow
-                .then(|| "This is a shallow clone, so its fingerprint is not authoritative.".into()),
-        },
-        atlas_checkpoint::Preselection::Ambiguous { candidates } => ConnectOptions {
-            workspaces,
-            preselected: None,
-            warning: Some(format!(
-                "{} Workspaces share this repository\u{2019}s root commit — repositories created \
-                 from the same template do. Pick the right one.",
-                candidates.len()
-            )),
-        },
-        atlas_checkpoint::Preselection::None => ConnectOptions {
-            workspaces,
-            preselected: None,
-            warning: Some(
-                "This directory does not match any Workspace. Connecting anyway is fine — a \
-                 shallow clone, a squashed history or a fresh repository all look like this."
-                    .into(),
-            ),
-        },
+        Ok(match chosen {
+            atlas_checkpoint::Preselection::One { workspace, .. } => ConnectOptions {
+                workspaces,
+                preselected: Some(workspace.id),
+                // A shallow clone's fingerprint is a graft boundary rather than
+                // the true root, so even a match is worth flagging.
+                warning: detection.is_shallow.then(|| {
+                    "This is a shallow clone, so its fingerprint is not authoritative.".into()
+                }),
+            },
+            atlas_checkpoint::Preselection::Ambiguous { candidates } => ConnectOptions {
+                workspaces,
+                preselected: None,
+                warning: Some(format!(
+                    "{} Workspaces share this repository\u{2019}s root commit — repositories \
+                     created from the same template do. Pick the right one.",
+                    candidates.len()
+                )),
+            },
+            atlas_checkpoint::Preselection::None => ConnectOptions {
+                workspaces,
+                preselected: None,
+                warning: Some(
+                    "This directory does not match any Workspace. Connecting anyway is fine — a \
+                     shallow clone, a squashed history or a fresh repository all look like this."
+                        .into(),
+                ),
+            },
+        })
     })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// What Connect offers the developer.
@@ -769,25 +1224,38 @@ pub struct ConnectOptions {
 /// Connect this repository to an existing Workspace.
 ///
 /// From here on it behaves exactly like a Workspace created as Cloud — same
-/// capture, same drain, no separate code path.
+/// capture, same drain, no separate code path. `workspace_id` is the picked
+/// `RemoteWorkspace.id`; trust comes from the picker list being server-fetched
+/// (`capture_connect_options`) moments earlier, so no extra verification
+/// round-trip is made here — a stale pick simply fails at drain time, which is
+/// a retryable state.
 #[tauri::command]
-pub fn capture_connect(
+pub async fn capture_connect(
     project_path: String,
     org_id: String,
     slug: String,
+    workspace_id: String,
     app: AppHandle,
 ) -> Result<atlas_checkpoint::Binding, String> {
-    let handle = app.state::<CaptureState>().writer(std::path::Path::new(&project_path))?;
-    let store = handle.lock().expect("session store");
-    store
-        .set_cloud_binding(&org_id, &slug)
-        .map_err(|e| e.to_string())?;
-    app.state::<CaptureState>()
-        .note_drain(std::path::Path::new(&project_path));
-    store
-        .binding()
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| "enable capture for this Workspace first".into())
+    tauri::async_runtime::spawn_blocking(move || {
+        let root = std::path::Path::new(&project_path);
+        let state = app.state::<CaptureState>();
+        let handle = state.writer(root)?;
+        let binding = {
+            let store = lock_ok(&handle);
+            store
+                .set_cloud_binding(&org_id, &slug, Some(&workspace_id))
+                .map_err(|e| e.to_string())?;
+            store
+                .binding()
+                .map_err(|e| e.to_string())?
+                .ok_or("enable capture for this Workspace first")?
+        };
+        state.note_drain(root);
+        Ok(binding)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// What promoting this Workspace to Cloud would disclose.
@@ -797,26 +1265,29 @@ pub fn capture_connect(
 /// bulk-disclosure moments in the feature, and the developer genuinely cannot
 /// otherwise know what they are about to publish.
 #[tauri::command]
-pub fn capture_promotion_preview(project_path: String) -> Result<PromotionPreview, String> {
-    let store = open_reader(&project_path)?
-        .ok_or("enable capture for this Workspace first")?;
-    let sessions = store
-        .sessions_for_workspace(&project_path)
-        .map_err(|e| e.to_string())?;
+pub async fn capture_promotion_preview(project_path: String) -> Result<PromotionPreview, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let store = open_reader(&project_path)?.ok_or("enable capture for this Workspace first")?;
+        let sessions = store
+            .sessions_for_workspace(&project_path)
+            .map_err(|e| e.to_string())?;
 
-    let secrets_redacted: u64 = sessions
-        .iter()
-        .filter_map(|s| s.redaction_counts.as_object())
-        .flat_map(|counts| counts.values())
-        .filter_map(serde_json::Value::as_u64)
-        .sum();
+        let secrets_redacted: u64 = sessions
+            .iter()
+            .filter_map(|s| s.redaction_counts.as_object())
+            .flat_map(|counts| counts.values())
+            .filter_map(serde_json::Value::as_u64)
+            .sum();
 
-    Ok(PromotionPreview {
-        session_count: sessions.len(),
-        earliest: sessions.iter().map(|s| s.started_at).min().map(|t| t.to_rfc3339()),
-        latest: sessions.iter().map(|s| s.started_at).max().map(|t| t.to_rfc3339()),
-        secrets_redacted,
+        Ok(PromotionPreview {
+            session_count: sessions.len(),
+            earliest: sessions.iter().map(|s| s.started_at).min().map(|t| t.to_rfc3339()),
+            latest: sessions.iter().map(|s| s.started_at).max().map(|t| t.to_rfc3339()),
+            secrets_redacted,
+        })
     })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// What a promotion is about to publish.
@@ -835,25 +1306,60 @@ pub struct PromotionPreview {
 /// deliberately **no separate backfill path**: the accumulated history joins the
 /// same queue as everything else, so there is one drain to keep correct rather
 /// than two, and closing Atlas mid-drain resumes for free.
+///
+/// Ordering: register on the server first (outside the store lock — a 30-second
+/// round-trip must not stall capture), then flip the binding *and* every local
+/// row in one store transaction (`promote_to_cloud`), so a crash can never
+/// leave a Cloud Workspace whose history is stranded as `local`. The drain
+/// additionally self-heals stray `local` rows on a Cloud Workspace, so the
+/// invariant is convergent rather than order-dependent.
 #[tauri::command]
-pub fn capture_promote(
+pub async fn capture_promote(
     project_path: String,
     org_id: String,
     slug: String,
     app: AppHandle,
 ) -> Result<i64, String> {
-    // Registration first, so cancelling or failing leaves the Workspace exactly
-    // as it was: still Local, still captured, nothing sent.
-    capture_register_cloud(project_path.clone(), org_id, slug, app.clone())?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<CaptureState>();
+        let root = std::path::Path::new(&project_path);
 
-    let handle = app.state::<CaptureState>().writer(std::path::Path::new(&project_path))?;
-    let store = handle.lock().expect("session store");
-    let moved = store
-        .promote_local_rows(&project_path)
+        let (root_commit_sha, git_url) = {
+            let handle = state.writer(root)?;
+            let store = lock_ok(&handle);
+            let binding = store
+                .binding()
+                .map_err(|e| e.to_string())?
+                .ok_or("enable capture for this Workspace first")?;
+            (binding.root_commit_sha, binding.git_url)
+        };
+
+        // Registration first, and outside the lock — cancelling or failing
+        // leaves the Workspace exactly as it was: still Local, still captured,
+        // nothing sent.
+        let token = token_provider(&app);
+        let config = sync_config(&project_path, &org_id, &token);
+        let remote_workspace_id = atlas_checkpoint::register_workspace(
+            &config,
+            &slug,
+            root_commit_sha.as_deref(),
+            git_url.as_deref(),
+        )
         .map_err(|e| e.to_string())?;
 
-    app.state::<CaptureState>().note_drain(std::path::Path::new(&project_path));
-    Ok(moved)
+        let moved = {
+            let handle = state.writer(root)?;
+            let store = lock_ok(&handle);
+            store
+                .promote_to_cloud(&project_path, &org_id, &slug, Some(&remote_workspace_id))
+                .map_err(|e| e.to_string())?
+        };
+
+        state.note_drain(root);
+        Ok(moved)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// A closure the drain can call to mint or refresh an access token.
@@ -864,8 +1370,9 @@ pub fn capture_promote(
 fn token_provider(app: &AppHandle) -> impl Fn() -> Option<String> {
     let core = app.state::<crate::commands::auth::AuthState>().core();
     move || {
-        // Blocking on the async mint is fine here: every caller is either a
-        // Tauri command thread or the capture worker, never the UI thread.
+        // Blocking on the async mint is fine here: every caller runs on a
+        // `spawn_blocking` thread or the capture worker, never a runtime core
+        // thread and never the UI thread.
         tauri::async_runtime::block_on(core.mint_access_token()).ok()
     }
 }
@@ -879,15 +1386,16 @@ fn sync_config<'a>(
         base_url: atlas_checkpoint::sync::ingest_base(),
         org_id: org_id.to_string(),
         workspace_id: project_path.to_string(),
+        // Only `drain()` stamps artifacts with the wire identity, and the drain
+        // builds its own config (in `drain_for`) from the binding's registered
+        // id. The callers of this helper — slug check, registration, workspace
+        // listing — never produce artifacts, so the placeholder is never sent.
+        wire_workspace_id: project_path.to_string(),
         token,
         timeout: std::time::Duration::from_secs(30),
     }
 }
 
-/// Open a Workspace's store for a one-shot command.
-///
-/// A second window holding the writer lock still gets a readable store, so the
-/// popover renders; only the write paths refuse.
 /// A read-only view of a Workspace's store, or `None` if it has none.
 ///
 /// Its own connection, and deliberately **not** the writer: reading must never
@@ -898,12 +1406,16 @@ fn sync_config<'a>(
 /// and then merely looking at the Artifacts tab would plant an `.atlas/`
 /// directory in a Workspace nobody enabled.
 fn open_reader(project_path: &str) -> Result<Option<Store>, String> {
+    open_reader_raw(project_path).map_err(|e| e.to_string())
+}
+
+/// [`open_reader`] with the typed error kept, for the one caller
+/// (`capture_health`) that must distinguish `SchemaTooNew` from a real failure.
+fn open_reader_raw(project_path: &str) -> Result<Option<Store>, atlas_checkpoint::Error> {
     if !enabled_on_disk(Path::new(project_path)) {
         return Ok(None);
     }
-    Store::open_reader(atlas_checkpoint::atlas_dir(project_path))
-        .map(Some)
-        .map_err(|e| e.to_string())
+    Store::open_reader(atlas_checkpoint::atlas_dir(project_path)).map(Some)
 }
 
 /// Which capture path a session came from.
@@ -933,8 +1445,15 @@ fn enabled_on_disk(root: &Path) -> bool {
 /// Shared by the worker and by every write command, which is the whole point —
 /// see [`StoreRegistry`]. A Workspace whose store cannot be opened at all is
 /// reported and not retried on this call; the next one tries again.
+///
+/// This is also where a folder rename is healed: `.atlas/` travels with the
+/// directory, but every row is keyed on the absolute path it was written under.
+/// If the binding's stored `workspace_id` no longer matches the path the store
+/// was just opened at, everything is re-keyed in one transaction — otherwise
+/// the timeline, the health counts and the promotion preview all silently read
+/// as empty after a rename.
 fn open_in(stores: &StoreRegistry, root: &Path) -> Result<StoreHandle, String> {
-    let mut registry = stores.lock().expect("store registry");
+    let mut registry = lock_ok(stores);
     if let Some(handle) = registry.get(root) {
         return Ok(handle.clone());
     }
@@ -959,6 +1478,26 @@ fn open_in(stores: &StoreRegistry, root: &Path) -> Result<StoreHandle, String> {
         );
     }
 
+    if is_writer {
+        if let Ok(Some(binding)) = store.binding() {
+            let current = root.to_string_lossy().to_string();
+            if binding.workspace_id != current {
+                match store.rekey_workspace(&binding.workspace_id, &current, &current) {
+                    Ok(()) => tracing::info!(
+                        target: "atlas::capture",
+                        from = %binding.workspace_id,
+                        to = %current,
+                        "workspace folder was renamed; history re-keyed"
+                    ),
+                    Err(e) => tracing::warn!(
+                        target: "atlas::capture",
+                        "workspace re-key after rename failed: {e}"
+                    ),
+                }
+            }
+        }
+    }
+
     let handle = StoreHandle { store: Arc::new(Mutex::new(store)), is_writer };
     registry.insert(root.to_path_buf(), handle.clone());
     Ok(handle)
@@ -970,9 +1509,27 @@ fn open_in(stores: &StoreRegistry, root: &Path) -> Result<StoreHandle, String> {
 /// worker takes a store's mutex for the duration of one job and releases it, so
 /// a write command issued while the worker is idle does not have to wait for the
 /// worker to notice — and, more importantly, does not open a competing store.
-fn worker(rx: mpsc::Receiver<Job>, drain_token: TokenProvider, stores: StoreRegistry) {
+fn worker(
+    rx: mpsc::Receiver<Job>,
+    drain_token: TokenProvider,
+    stores: StoreRegistry,
+    alive: Arc<AtomicBool>,
+) {
+    /// Flips the liveness flag on the way out, however the thread exits — so a
+    /// dead worker is a `Stopped` health state instead of a silent gap.
+    struct AliveGuard(Arc<AtomicBool>);
+    impl Drop for AliveGuard {
+        fn drop(&mut self) {
+            self.0.store(false, Ordering::Relaxed);
+        }
+    }
+    let _guard = AliveGuard(alive);
+
     // Session ids are assigned by the store on first write and reused after.
     let mut session_ids: HashMap<String, String> = HashMap::new();
+    // Offline backoff per Workspace root — worker-owned, because the worker is
+    // the only place drains run.
+    let backoff: BackoffMap = Arc::new(Mutex::new(HashMap::new()));
 
     loop {
         // A timeout rather than a blocking receive, so the ongoing transcript
@@ -983,9 +1540,7 @@ fn worker(rx: mpsc::Receiver<Job>, drain_token: TokenProvider, stores: StoreRegi
         let job = match rx.recv_timeout(IMPORT_SCAN_INTERVAL) {
             Ok(job) => job,
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                let open: Vec<(PathBuf, StoreHandle)> = stores
-                    .lock()
-                    .expect("store registry")
+                let open: Vec<(PathBuf, StoreHandle)> = lock_ok(&stores)
                     .iter()
                     .filter(|(_, handle)| handle.is_writer)
                     .map(|(root, handle)| (root.clone(), handle.clone()))
@@ -994,11 +1549,21 @@ fn worker(rx: mpsc::Receiver<Job>, drain_token: TokenProvider, stores: StoreRegi
                 // import can run for minutes, and holding the map would stall
                 // every other Workspace behind one of them.
                 for (root, handle) in open {
-                    let mut store = handle.store.lock().expect("session store");
-                    import_for(&mut store, &root);
-                    // Reconnecting requires no action from the developer: the
-                    // same tick that scans for transcripts retries the outbox.
-                    drain_for(&mut store, &root, &drain_token);
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let mut store = lock_ok(&handle.store);
+                        import_for(&mut store, &root);
+                        // Reconnecting requires no action from the developer:
+                        // the same tick that scans for transcripts retries the
+                        // outbox (gated by the per-root backoff).
+                        drain_for(&mut store, &root, &drain_token, &backoff, false);
+                    }));
+                    if result.is_err() {
+                        tracing::error!(
+                            target: "atlas::capture",
+                            workspace = %root.display(),
+                            "capture tick panicked; continuing"
+                        );
+                    }
                 }
                 continue;
             }
@@ -1006,51 +1571,105 @@ fn worker(rx: mpsc::Receiver<Job>, drain_token: TokenProvider, stores: StoreRegi
             Err(mpsc::RecvTimeoutError::Disconnected) => return,
         };
 
-        // A commit walk is not tied to a Session, so it carries its own root
-        // rather than a binding.
-        let (session_binding, root) = match &job {
-            Job::WalkCommits { workspace_root, .. }
-            | Job::ImportTranscripts { workspace_root }
-            | Job::Drain { workspace_root } => (None, workspace_root.clone()),
-            Job::Prompt { binding, .. }
-            | Job::Turn { binding, .. }
-            | Job::ToolCall { binding, .. }
-            | Job::FinishTurn { binding }
-            | Job::Usage { binding, .. } => {
-                (Some(binding.clone()), binding.workspace_root.clone())
+        // One panicking job must not kill the recorder for the rest of the
+        // process. The job is lost (and logged); the mutexes it may have
+        // poisoned are recovered by `lock_ok` everywhere.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            process_job(job, &mut session_ids, &drain_token, &stores, &backoff);
+        }));
+        if result.is_err() {
+            tracing::error!(target: "atlas::capture", "capture job panicked; job dropped");
+        }
+    }
+}
+
+/// Handle one queued job.
+fn process_job(
+    job: Job,
+    session_ids: &mut HashMap<String, String>,
+    drain_token: &TokenProvider,
+    stores: &StoreRegistry,
+    backoff: &BackoffMap,
+) {
+    // Needs no store at all.
+    if let Job::EndSession { native_session_id } = &job {
+        session_ids.remove(native_session_id);
+        return;
+    }
+
+    // A commit walk is not tied to a Session, so it carries its own root
+    // rather than a binding.
+    let (session_binding, root) = match &job {
+        Job::WalkCommits { workspace_root, .. }
+        | Job::ImportTranscripts { workspace_root }
+        | Job::Drain { workspace_root } => (None, workspace_root.clone()),
+        Job::Prompt { binding, .. }
+        | Job::Turn { binding, .. }
+        | Job::ToolCall { binding, .. }
+        | Job::FinishTurn { binding }
+        | Job::Usage { binding, .. } => (Some(binding.clone()), binding.workspace_root.clone()),
+        Job::EndSession { .. } => unreachable!("handled above"),
+    };
+
+    // Capture is opt-in, and the check has to happen *before* the store is
+    // opened. `Store::open` creates `.atlas/` — so opening first and reading
+    // the binding second put an empty database in every directory the
+    // developer had ever run an agent in, which is precisely the surprise
+    // the binding check below was written to avoid. Only `capture_enable`
+    // creates the store; until it has, there is nothing here to record to.
+    if !enabled_on_disk(&root) {
+        return;
+    }
+
+    let Ok(handle) = open_in(stores, &root) else { return };
+    if !handle.is_writer {
+        return;
+    }
+    let mut guard = lock_ok(&handle.store);
+    let store = &mut *guard;
+
+    let Ok(Some(workspace)) = store.binding() else {
+        return;
+    };
+    // Paused stops *new* records only. What was already recorded keeps
+    // reconciling and draining — the developer was told pausing deletes
+    // nothing, and silently stopping their queued work from reaching the team
+    // would make that a half-truth.
+    let capturing = workspace.is_capturing();
+    let mode = workspace.mode;
+
+    // The commit walk needs the store but no Session, so it is handled
+    // before the Session-scoped jobs below.
+    if let Job::WalkCommits { workspace_id, .. } = &job {
+        // Reconcile **before** walking: the walk assumes every Checkpoint's
+        // commit reference is current, and running it against just-rewritten
+        // history links against stale shas the reconcile pass was about to
+        // re-point. A rewrite moves refs exactly like a commit does, so both
+        // run on the same trigger.
+        match atlas_checkpoint::reconcile_rewrites(store, workspace_id, &root) {
+            Ok(outcome) if outcome.is_mass_orphan() => tracing::warn!(
+                target: "atlas::capture",
+                orphaned = outcome.orphaned,
+                "history-wide rewrite orphaned Checkpoints in bulk"
+            ),
+            Ok(outcome) if outcome.relinked + outcome.orphaned + outcome.recovered > 0 => {
+                tracing::info!(
+                    target: "atlas::capture",
+                    relinked = outcome.relinked,
+                    orphaned = outcome.orphaned,
+                    recovered = outcome.recovered,
+                    "reconciled Checkpoints after a history rewrite"
+                )
             }
-        };
-
-        // Capture is opt-in, and the check has to happen *before* the store is
-        // opened. `Store::open` creates `.atlas/` — so opening first and reading
-        // the binding second put an empty database in every directory the
-        // developer had ever run an agent in, which is precisely the surprise
-        // the binding check below was written to avoid. Only `capture_enable`
-        // creates the store; until it has, there is nothing here to record to.
-        if !enabled_on_disk(&root) {
-            continue;
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(target: "atlas::capture", "reconciliation failed: {e}")
+            }
         }
 
-        let Ok(handle) = open_in(&stores, &root) else { continue };
-        if !handle.is_writer {
-            continue;
-        }
-        let mut guard = handle.store.lock().expect("session store");
-        let store = &mut *guard;
-
-        // Bound but paused must also stop new records, and that answer does
-        // live in the store.
-        let Ok(Some(workspace)) = store.binding() else {
-            continue;
-        };
-        if !workspace.is_capturing() {
-            continue;
-        }
-        let mode = workspace.mode;
-
-        // The commit walk needs the store but no Session, so it is handled
-        // before the Session-scoped jobs below.
-        if let Job::WalkCommits { workspace_id, .. } = &job {
+        // New Checkpoints are new capture; a paused Workspace only reconciles
+        // what it already recorded.
+        if capturing {
             match atlas_checkpoint::walk_new_commits(store, workspace_id, &root, mode) {
                 Ok(outcome) if outcome.checkpoints_created > 0 => tracing::info!(
                     target: "atlas::capture",
@@ -1066,141 +1685,128 @@ fn worker(rx: mpsc::Receiver<Job>, drain_token: TokenProvider, stores: StoreRegi
                 Ok(_) => {}
                 Err(e) => tracing::warn!(target: "atlas::capture", "commit walk failed: {e}"),
             }
-
-            // Same trigger, because a rewrite moves refs exactly like a commit
-            // does. Cheap when nothing was rewritten: it does no work at all
-            // once every Checkpoint's commit is still reachable.
-            match atlas_checkpoint::reconcile_rewrites(store, workspace_id, &root) {
-                Ok(outcome) if outcome.is_mass_orphan() => tracing::warn!(
-                    target: "atlas::capture",
-                    orphaned = outcome.orphaned,
-                    "history-wide rewrite orphaned Checkpoints in bulk"
-                ),
-                Ok(outcome) if outcome.relinked + outcome.orphaned + outcome.recovered > 0 => {
-                    tracing::info!(
-                        target: "atlas::capture",
-                        relinked = outcome.relinked,
-                        orphaned = outcome.orphaned,
-                        recovered = outcome.recovered,
-                        "reconciled Checkpoints after a history rewrite"
-                    )
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    tracing::warn!(target: "atlas::capture", "reconciliation failed: {e}")
-                }
-            }
-            continue;
         }
+        return;
+    }
 
-        if let Job::ImportTranscripts { .. } = &job {
-            import_for(store, &root);
-            continue;
-        }
+    if let Job::ImportTranscripts { .. } = &job {
+        // `import_for` checks both the pause state and the Cloud
+        // bulk-disclosure approval itself.
+        import_for(store, &root);
+        return;
+    }
 
-        if let Job::Drain { .. } = &job {
-            drain_for(store, &root, &drain_token);
-            continue;
-        }
+    if let Job::Drain { .. } = &job {
+        // Explicit drains (promotion, connect, retry) bypass the backoff — a
+        // human just asked for this one.
+        drain_for(store, &root, drain_token, backoff, true);
+        return;
+    }
 
-        let Some(binding) = session_binding else { continue };
-        let key = SessionKey {
-            // The Workspace binding proper arrives with the enable popover; until
-            // then a Workspace is its project directory, which is the same
-            // identity `.atlas/` already uses.
-            workspace_id: root.to_string_lossy().to_string(),
-            source: binding.source,
-            native_session_id: binding.native_session_id.clone(),
-        };
+    // Everything below records something new.
+    if !capturing {
+        return;
+    }
 
-        let mut capture = Capture::new(store, mode);
-        let outcome = match job {
-            // Already handled above; none of these needs a Session.
-            Job::WalkCommits { .. } | Job::ImportTranscripts { .. } | Job::Drain { .. } => Ok(()),
-            Job::Prompt { prompt, .. } => capture
-                .record_prompt(
-                    &key,
-                    &prompt,
-                    binding.turn_seq,
-                    binding.agent.as_deref(),
-                    binding.model.as_deref(),
-                    Some(&binding.cwd),
-                )
-                .map(|id| {
-                    session_ids.insert(binding.native_session_id.clone(), id);
-                }),
-            Job::Turn {
-                native_message_id,
-                role,
-                mode,
-                body,
-                ..
-            } => match session_ids.get(&binding.native_session_id) {
-                Some(session_id) => capture
-                    .record_turn(
-                        session_id,
-                        TurnContent {
-                            turn_seq: binding.turn_seq,
-                            native_message_id: Some(native_message_id),
-                            role,
-                            mode,
-                            body,
-                        },
-                    )
-                    .map(|_| ()),
-                // A delta before the session's first send has no Session row to
-                // attach to. Normal, not an error.
-                None => Ok(()),
-            },
-            Job::ToolCall {
-                native_call_id,
-                tool_name,
-                title,
-                kind,
-                status,
-                locations,
-                arguments,
-                result,
-                writes,
-                terminal,
-                patch,
-                ..
-            } => match session_ids.get(&binding.native_session_id) {
-                Some(session_id) => record_tool_call(
-                    &mut capture,
+    let Some(binding) = session_binding else { return };
+    let key = SessionKey {
+        // The Workspace binding proper arrives with the enable popover; until
+        // then a Workspace is its project directory, which is the same
+        // identity `.atlas/` already uses.
+        workspace_id: root.to_string_lossy().to_string(),
+        source: binding.source,
+        native_session_id: binding.native_session_id.clone(),
+    };
+
+    let mut capture = Capture::new(store, mode);
+    let outcome = match job {
+        // Already handled above; none of these needs a Session.
+        Job::WalkCommits { .. }
+        | Job::ImportTranscripts { .. }
+        | Job::Drain { .. }
+        | Job::EndSession { .. } => Ok(()),
+        Job::Prompt { prompt, .. } => capture
+            .record_prompt(
+                &key,
+                &prompt,
+                binding.turn_seq,
+                binding.agent.as_deref(),
+                binding.model.as_deref(),
+                Some(&binding.cwd),
+            )
+            .map(|id| {
+                session_ids.insert(binding.native_session_id.clone(), id);
+            }),
+        Job::Turn {
+            native_message_id,
+            role,
+            mode,
+            body,
+            ..
+        } => match session_ids.get(&binding.native_session_id) {
+            Some(session_id) => capture
+                .record_turn(
                     session_id,
-                    &binding,
-                    ToolCallJob {
-                        native_call_id,
-                        tool_name,
-                        title,
-                        kind,
-                        status,
-                        locations,
-                        arguments,
-                        result,
-                        writes,
-                        terminal,
-                        patch,
+                    TurnContent {
+                        turn_seq: binding.turn_seq,
+                        native_message_id: Some(native_message_id),
+                        role,
+                        mode,
+                        body,
+                        created_at: None,
                     },
-                ),
-                None => Ok(()),
-            },
-            Job::FinishTurn { .. } => match session_ids.get(&binding.native_session_id) {
-                Some(session_id) => capture.finish_turn(session_id, binding.turn_seq),
-                None => Ok(()),
-            },
-            Job::Usage { totals, .. } => match session_ids.get(&binding.native_session_id) {
-                Some(session_id) => capture.record_usage(session_id, &totals),
-                None => Ok(()),
-            },
-        };
+                )
+                .map(|_| ()),
+            // A delta before the session's first send has no Session row to
+            // attach to. Normal, not an error.
+            None => Ok(()),
+        },
+        Job::ToolCall {
+            native_call_id,
+            tool_name,
+            title,
+            kind,
+            status,
+            locations,
+            arguments,
+            result,
+            writes,
+            patch,
+            ..
+        } => match session_ids.get(&binding.native_session_id) {
+            Some(session_id) => record_tool_call(
+                &mut capture,
+                session_id,
+                &binding,
+                ToolCallJob {
+                    native_call_id,
+                    tool_name,
+                    title,
+                    kind,
+                    status,
+                    locations,
+                    arguments,
+                    result,
+                    writes,
+                    patch,
+                },
+            ),
+            None => Ok(()),
+        },
+        Job::FinishTurn { .. } => match session_ids.get(&binding.native_session_id) {
+            Some(session_id) => capture.finish_turn(session_id, binding.turn_seq),
+            None => Ok(()),
+        },
+        Job::Usage { totals, .. } => match session_ids.get(&binding.native_session_id) {
+            Some(session_id) => capture.record_usage(session_id, &totals),
+            None => Ok(()),
+        },
+    };
 
-        if let Err(e) = outcome {
-            // Already flagged on the Session row by the crate where it matters;
-            // this is the operator-facing half.
-            tracing::warn!(target: "atlas::capture", "capture failed: {e}");
-        }
+    if let Err(e) = outcome {
+        // Already flagged on the Session row by the crate where it matters;
+        // this is the operator-facing half.
+        tracing::warn!(target: "atlas::capture", "capture failed: {e}");
     }
 }
 
@@ -1211,6 +1817,10 @@ fn worker(rx: mpsc::Receiver<Job>, drain_token: TokenProvider, stores: StoreRegi
 /// size comparison before it is opened.
 const IMPORT_SCAN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// The drain retry floor and ceiling: 30 seconds doubling to 15 minutes.
+const DRAIN_BACKOFF_FLOOR: Duration = Duration::from_secs(30);
+const DRAIN_BACKOFF_CEILING: Duration = Duration::from_secs(15 * 60);
+
 /// Import a Workspace's transcripts, best-effort.
 ///
 /// Never fails the caller: a missing transcript directory (the developer has
@@ -1218,6 +1828,14 @@ const IMPORT_SCAN_INTERVAL: std::time::Duration = std::time::Duration::from_secs
 fn import_for(store: &mut Store, root: &std::path::Path) {
     let Ok(Some(binding)) = store.binding() else { return };
     if !binding.is_capturing() {
+        return;
+    }
+    // The Cloud bulk-disclosure gate. Local always may — nothing leaves the
+    // machine. A Cloud Workspace imports **nothing** until the developer has
+    // seen the real numbers and confirmed (`capture_import_confirm`);
+    // cancelling the dialog leaves the flag unset, and this scan honours that
+    // forever rather than sneaking the backlog in 30 seconds later.
+    if !binding.may_import() {
         return;
     }
     let Some(source) = transcript_source_for(root) else { return };
@@ -1238,15 +1856,67 @@ fn import_for(store: &mut Store, root: &std::path::Path) {
 
 /// Send everything pending for a Workspace, best-effort.
 ///
-/// Offline is the ordinary case here, not an error: rows simply stay pending and
-/// nothing is surfaced to the developer.
-fn drain_for(store: &mut Store, root: &std::path::Path, token: &TokenProvider) {
+/// Offline is the ordinary case here, not an error: rows simply stay pending —
+/// with exponential backoff on the retry so a dead network is not hammered
+/// every 30 seconds. `forced` bypasses the backoff for explicit human actions.
+fn drain_for(
+    store: &mut Store,
+    root: &std::path::Path,
+    token: &TokenProvider,
+    backoff: &BackoffMap,
+    forced: bool,
+) {
     let Ok(Some(binding)) = store.binding() else { return };
     if binding.mode != WorkspaceMode::Cloud {
         // Local mode is the same database with draining switched off.
         return;
     }
     let Some(org_id) = binding.org_id.clone() else { return };
+
+    // Terminal until re-registration: the server said this identity may not
+    // push, and retrying a revoked membership every 30 seconds forever is
+    // noise. `set_cloud_binding` clears the gate on a fresh registration.
+    if binding.drain_state == DrainGate::NotAuthorized {
+        return;
+    }
+
+    // The wire identity is the server-assigned workspace id (slug as a
+    // fallback for bindings registered before the id was persisted) — never
+    // the local filesystem path, which no teammate shares and which would leak
+    // the developer's directory layout to the whole Organisation. A Cloud
+    // binding without either predates registration (or was half-bound by an
+    // older build) and must not drain at all.
+    //
+    // NOTE: `SyncConfig` currently carries one `workspace_id`, used by the
+    // sync layer both to select rows (which must stay keyed on the local path)
+    // and to stamp `ArtifactBase.workspaceId`. Until the sync layer splits
+    // those, this gate guarantees a wire identity *exists* before anything is
+    // sent; carrying it on the payload is the sync layer's half.
+    if binding.remote_workspace_id.is_none() && binding.slug.is_none() {
+        warn_once_unregistered(root);
+        return;
+    }
+
+    if !forced {
+        if let Some(entry) = lock_ok(backoff).get(root) {
+            if Instant::now() < entry.next_attempt {
+                return;
+            }
+        }
+    }
+
+    // Self-heal a promotion interrupted on an older build: a Cloud Workspace
+    // should have no `local` rows, and flipping strays is always correct.
+    // A no-op when clean.
+    let workspace_key = root.to_string_lossy().to_string();
+    match store.heal_stranded_local_rows(&workspace_key) {
+        Ok(healed) if healed > 0 => tracing::info!(
+            target: "atlas::capture",
+            healed,
+            "re-queued rows stranded by an interrupted promotion"
+        ),
+        _ => {}
+    }
 
     let provider = token.clone();
     let mint_token = move || {
@@ -1257,32 +1927,98 @@ fn drain_for(store: &mut Store, root: &std::path::Path, token: &TokenProvider) {
             .flatten()
     };
 
+    // The wire identity: the server-assigned workspace id, or the slug for
+    // bindings registered before the id was persisted. The gate above already
+    // guaranteed one of them exists.
+    let wire_workspace_id = binding
+        .remote_workspace_id
+        .clone()
+        .or_else(|| binding.slug.clone())
+        .expect("gated on a wire identity existing");
+
     let config = atlas_checkpoint::SyncConfig {
         base_url: atlas_checkpoint::sync::ingest_base(),
         org_id,
-        workspace_id: root.to_string_lossy().to_string(),
+        // Local row keying: `pending_artifacts` selects by the path rows were
+        // written under. The wire identity is what lands on every artifact.
+        workspace_id: workspace_key,
+        wire_workspace_id,
         token: &mint_token,
         timeout: std::time::Duration::from_secs(30),
     };
 
     match atlas_checkpoint::drain(store, &config) {
         Ok(outcome) if outcome.status == atlas_checkpoint::DrainStatus::NotAuthorized => {
-            // A terminal state, not a retry loop. Surfaced through the
-            // capture-health signal; local capture is unaffected.
+            // A terminal state, not a retry loop: persisted so every later tick
+            // skips the drain, and surfaced through the capture-health signal.
+            // Local capture is unaffected.
+            if let Err(e) = store.set_drain_state(DrainGate::NotAuthorized) {
+                tracing::warn!(target: "atlas::capture", "recording drain gate failed: {e}");
+            }
+            lock_ok(backoff).remove(root);
             tracing::warn!(
                 target: "atlas::capture",
                 "no longer authorized for this workspace; drain stopped"
             );
         }
-        Ok(outcome) if outcome.sent > 0 || outcome.failed > 0 => tracing::info!(
+        Ok(outcome)
+            if matches!(
+                outcome.status,
+                atlas_checkpoint::DrainStatus::Offline
+                    | atlas_checkpoint::DrainStatus::RateLimited
+            ) =>
+        {
+            // A server-sent `Retry-After` outranks the guessed exponential
+            // delay — the server knows when it wants to hear from us again.
+            bump_backoff(backoff, root, outcome.retry_after);
+        }
+        Ok(outcome) => {
+            lock_ok(backoff).remove(root);
+            if outcome.sent > 0 || outcome.failed > 0 {
+                tracing::info!(
+                    target: "atlas::capture",
+                    sent = outcome.sent,
+                    failed = outcome.failed,
+                    pending = outcome.still_pending,
+                    "drained the outbox"
+                );
+            }
+        }
+        Err(e) => {
+            bump_backoff(backoff, root, None);
+            tracing::warn!(target: "atlas::capture", "drain failed: {e}");
+        }
+    }
+}
+
+/// Double the retry delay for a root, clamped to the ceiling; a server-sent
+/// `Retry-After` hint raises (never lowers past itself) the wait.
+fn bump_backoff(backoff: &BackoffMap, root: &std::path::Path, retry_after: Option<Duration>) {
+    let mut map = lock_ok(backoff);
+    let doubled = map
+        .get(root)
+        .map(|entry| (entry.delay * 2).min(DRAIN_BACKOFF_CEILING))
+        .unwrap_or(DRAIN_BACKOFF_FLOOR);
+    let delay = retry_after.map_or(doubled, |hint| hint.max(doubled));
+    map.insert(
+        root.to_path_buf(),
+        DrainBackoff { next_attempt: Instant::now() + delay, delay },
+    );
+}
+
+/// Log the "Cloud binding with no wire identity" condition once per root, not
+/// every 30 seconds forever.
+fn warn_once_unregistered(root: &std::path::Path) {
+    use std::collections::HashSet;
+    use std::sync::OnceLock;
+    static WARNED: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+    let warned = WARNED.get_or_init(|| Mutex::new(HashSet::new()));
+    if lock_ok(warned).insert(root.to_path_buf()) {
+        tracing::warn!(
             target: "atlas::capture",
-            sent = outcome.sent,
-            failed = outcome.failed,
-            pending = outcome.still_pending,
-            "drained the outbox"
-        ),
-        Ok(_) => {}
-        Err(e) => tracing::warn!(target: "atlas::capture", "drain failed: {e}"),
+            workspace = %root.display(),
+            "cloud workspace has no server identity (no remote id, no slug); drain skipped"
+        );
     }
 }
 
@@ -1307,18 +2043,13 @@ struct ToolCallJob {
     locations: serde_json::Value,
     arguments: Option<String>,
     result: Option<String>,
-    writes: Vec<PendingWrite>,
-    terminal: bool,
+    writes: Vec<CompletedWrite>,
     patch: Option<String>,
 }
 
-/// Write the tool call, then — once it has finished — hash what it left on disk.
-///
-/// The hash is taken here rather than at turn end, because by turn end the
-/// developer may already have edited the file, and recording their content as
-/// the agent's is exactly the false attribution the link rule exists to prevent.
-/// Reading the file is real I/O, which is why it happens on the worker thread
-/// and not on the emit thread that sampled `existed_before`.
+/// Write the tool call, and — for the first terminal sighting — the writes it
+/// performed, hashed on the emit thread when the file was still what the agent
+/// left.
 fn record_tool_call(
     capture: &mut Capture<'_>,
     session_id: &str,
@@ -1340,41 +2071,30 @@ fn record_tool_call(
         },
     )?;
 
-    if !job.terminal {
-        return Ok(());
-    }
-
     for write in &job.writes {
-        let absolute = binding.workspace_root.join(&write.path.path);
-        // A file the call was going to write that is no longer there was
-        // deleted. There is no content hash for a deletion — the marker is the
-        // evidence the link rule uses instead.
-        let (sha256_after, deleted) = match std::fs::read(&absolute) {
-            Ok(bytes) => (Some(atlas_checkpoint::hash_written_content(&bytes)), false),
-            Err(_) => (None, true),
-        };
-
         capture.record_file_write(
             session_id,
             &call_id,
             binding.turn_seq,
             FileWrite {
                 path: &write.path,
-                sha256_after,
+                sha256_after: write.sha256_after.clone(),
                 existed_before: write.existed_before,
-                deleted,
+                deleted: write.deleted,
             },
         )?;
+    }
 
-        if let Some(patch) = &job.patch {
-            capture.record_edit_patch(
-                session_id,
-                &call_id,
-                binding.turn_seq,
-                &write.path.path,
-                patch,
-            )?;
-        }
+    // The patch belongs to the call, not to each path it touched — an edit
+    // call reporting three locations applied one patch, not three.
+    if let (Some(patch), Some(first)) = (&job.patch, job.writes.first()) {
+        capture.record_edit_patch(
+            session_id,
+            &call_id,
+            binding.turn_seq,
+            &first.path.path,
+            patch,
+        )?;
     }
     Ok(())
 }
@@ -1424,9 +2144,10 @@ fn edit_patch(arguments: &serde_json::Value) -> Option<String> {
 
 /// Feeds finalized turns into capture.
 ///
-/// Deliberately only reacts to *finalized* content. Streaming text and thinking
-/// chunks are a live UI concern and never become a stored artifact — coalescing
-/// to whole turns is what keeps capture off the streaming hot path.
+/// Streaming text and thinking chunks are *accumulated* here (cheap string
+/// appends on the emit thread) and become stored artifacts only when the turn
+/// finishes — `MessageAppended` alone carries just the first streamed chunk,
+/// and recording at that moment stored every streamed response truncated.
 pub struct CaptureMiddleware {
     pub app: AppHandle,
 }
@@ -1452,20 +2173,26 @@ impl OutboundMiddleware<SessionDeltaEnvelope> for CaptureMiddleware {
                     atlas_agents::MessageMode::Tool => (Mode::Tool, message.content.clone()),
                     atlas_agents::MessageMode::Text => (Mode::Text, message.content.clone()),
                 };
-                if body.trim().is_empty() {
-                    return;
-                }
-                state.submit(Job::Turn {
-                    binding,
-                    native_message_id: message.id.clone(),
-                    role: match message.role {
+                // Started even when the first chunk is empty: the body arrives
+                // as later chunks, and entries that stay empty are skipped at
+                // flush time.
+                state.begin_message(
+                    &envelope.session_id,
+                    &binding,
+                    message.id.clone(),
+                    match message.role {
                         MessageRole::Assistant => Role::Assistant,
                         MessageRole::System => Role::System,
                         MessageRole::User => Role::User,
                     },
                     mode,
                     body,
-                });
+                );
+            }
+
+            SessionDelta::TextChunk { message_id, delta }
+            | SessionDelta::ThinkingChunk { message_id, delta } => {
+                state.append_chunk(&envelope.session_id, message_id, delta);
             }
 
             SessionDelta::ToolCallUpserted { tool_call, .. } => {
@@ -1475,8 +2202,7 @@ impl OutboundMiddleware<SessionDeltaEnvelope> for CaptureMiddleware {
                     ToolCallStatus::Completed => ToolStatus::Completed,
                     ToolCallStatus::Failed => ToolStatus::Failed,
                 };
-                let terminal =
-                    matches!(status, ToolStatus::Completed | ToolStatus::Failed);
+                let terminal = matches!(status, ToolStatus::Completed | ToolStatus::Failed);
 
                 // Derived, never the wire value: the runtime's `tool_name` is a
                 // display title for ACP agents, and grouping by it would produce
@@ -1488,13 +2214,48 @@ impl OutboundMiddleware<SessionDeltaEnvelope> for CaptureMiddleware {
                     &tool_call.arguments,
                 );
 
-                let writes = if tool_name.writes_files() {
+                // Sample (and merge) the write set on every sighting, whether
+                // or not paths were extractable yet — the sampling *event* is
+                // what must be cached, or a late-locations agent gets its
+                // `existed_before` re-sampled after the write.
+                let (writes, already_recorded) = if tool_name.writes_files() {
                     state.sample_writes(
+                        &envelope.session_id,
                         &tool_call.id,
                         &binding.workspace_root,
                         &tool_call.locations,
                         &tool_call.arguments,
+                        terminal,
                     )
+                } else {
+                    (Vec::new(), true)
+                };
+
+                // Hash on the emit thread at the terminal sighting, while the
+                // file is still what the agent left. Deferring the read to the
+                // worker means a multi-minute import in the queue lets the
+                // developer's later edits get hashed as the agent's — the exact
+                // false attribution the link rule exists to prevent. Only the
+                // first terminal sighting records; repeats carry nothing.
+                let completed: Vec<CompletedWrite> = if terminal && !already_recorded {
+                    writes
+                        .iter()
+                        .map(|write| {
+                            let absolute = binding.workspace_root.join(&write.path.path);
+                            let (sha256_after, deleted) = match std::fs::read(&absolute) {
+                                Ok(bytes) => {
+                                    (Some(atlas_checkpoint::hash_written_content(&bytes)), false)
+                                }
+                                Err(_) => (None, true),
+                            };
+                            CompletedWrite {
+                                path: write.path.clone(),
+                                existed_before: write.existed_before,
+                                sha256_after,
+                                deleted,
+                            }
+                        })
+                        .collect()
                 } else {
                     Vec::new()
                 };
@@ -1509,14 +2270,9 @@ impl OutboundMiddleware<SessionDeltaEnvelope> for CaptureMiddleware {
                     locations: serde_json::Value::Array(tool_call.locations.clone()),
                     arguments: serialize_arguments(&tool_call.arguments),
                     result: tool_call.result.clone(),
-                    writes,
-                    terminal,
+                    writes: completed,
                     patch: edit_patch(&tool_call.arguments),
                 });
-
-                if terminal {
-                    state.forget_writes(&tool_call.id);
-                }
             }
 
             SessionDelta::UsageUpdated { usage } => {
@@ -1549,7 +2305,16 @@ impl OutboundMiddleware<SessionDeltaEnvelope> for CaptureMiddleware {
             }
 
             SessionDelta::TurnFinished { .. } | SessionDelta::TurnFailed { .. } => {
-                state.submit(Job::FinishTurn { binding });
+                // The streamed bodies are complete now — record them, then
+                // close the turn.
+                state.flush_turn(&envelope.session_id, &binding);
+            }
+
+            SessionDelta::AgentDisconnected { .. } => {
+                // Record what streamed (a partial transcript beats none), but
+                // leave the turn open so it reconciles as aborted; evict every
+                // per-session cache so a long-lived process stays bounded.
+                state.flush_session_end(&envelope.session_id, &binding);
             }
 
             _ => {}

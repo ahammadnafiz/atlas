@@ -53,6 +53,18 @@ fn walk(
             }
         }
         Value::String(text) => {
+            // A link field is never entropy-scanned — a long path segment or a
+            // signed-URL parameter is not a secret, and shredding it breaks the
+            // link — but a credential *inside* one is still a leak, so the
+            // URI/DSN password layers run on it in a link-preserving form.
+            if is_link_field(&key.to_ascii_lowercase()) {
+                let out = crate::redact_link(text);
+                if out.changed() {
+                    *text = out.text;
+                    counts.merge(&out.counts);
+                }
+                return;
+            }
             let (redacted, leaf_counts) = leaf(text);
             if &redacted != text {
                 *text = redacted;
@@ -86,8 +98,15 @@ fn is_structural_field(key: &str) -> bool {
     }
     matches!(
         lower.as_str(),
-        "filepath" | "file_path" | "cwd" | "root" | "directory" | "dir" | "path" | "uri" | "url"
+        "filepath" | "file_path" | "cwd" | "root" | "directory" | "dir" | "path"
     )
+}
+
+/// `url`/`uri` values are links: skipped by the entropy layer but still scanned
+/// for embedded credentials — `{"url": "postgres://app:hunter2@db/x"}` carries
+/// a live password, and skipping it wholesale is how that reaches disk.
+fn is_link_field(key: &str) -> bool {
+    matches!(key, "url" | "uri")
 }
 
 fn is_binary_payload(map: &serde_json::Map<String, Value>) -> bool {
@@ -116,9 +135,13 @@ fn is_credential_object(map: &serde_json::Map<String, Value>) -> bool {
 
 fn is_credential_key(key: &str, credential_context: bool) -> bool {
     let normalized = normalize_key(key);
-    if credential_context
-        && matches!(normalized.as_str(), "password" | "passwd" | "pwd" | "secret")
-    {
+    // `password` names a credential wherever it appears; there is no innocent
+    // reading of a string-valued `password` field. `pwd` (the shell's working
+    // directory) and `secret` (could be anything) stay context-gated.
+    if matches!(normalized.as_str(), "password" | "passwd" | "passphrase") {
+        return true;
+    }
+    if credential_context && matches!(normalized.as_str(), "pwd" | "secret") {
         return true;
     }
     // Outside a credential-shaped object, require the key to name itself
@@ -195,6 +218,54 @@ mod tests {
         let input = r#"{"client_secret":"<your-secret>"}"#;
         let out = redact_json(input);
         assert!(out.text.contains("<your-secret>"));
+        assert_eq!(out.counts.total(), 0);
+    }
+
+    #[test]
+    fn a_bare_password_key_is_redacted_even_without_connection_context() {
+        let input = r#"{"password":"hunter2"}"#;
+        let out = redact_json(input);
+        assert!(!out.text.contains("hunter2"), "{}", out.text);
+        assert_eq!(out.counts.total(), 1);
+    }
+
+    #[test]
+    fn a_url_field_keeps_its_link_but_loses_its_password() {
+        let input = r#"{"url":"postgres://app:hunter2@db/x"}"#;
+        let out = redact_json(input);
+        assert_eq!(out.text, r#"{"url":"postgres://app:[REDACTED]@db/x"}"#);
+        assert_eq!(out.counts.total(), 1);
+    }
+
+    #[test]
+    fn a_password_query_param_in_a_uri_field_is_redacted_in_place() {
+        let input = r#"{"uri":"mysql://db.internal/app?user=svc&password=hunter2"}"#;
+        let out = redact_json(input);
+        assert!(!out.text.contains("hunter2"), "{}", out.text);
+        assert!(
+            out.text.contains("mysql://db.internal/app?user=svc&password="),
+            "link destroyed: {}",
+            out.text
+        );
+    }
+
+    #[test]
+    fn a_plain_url_field_is_untouched_even_when_long_and_path_ish() {
+        for input in [
+            r#"{"url":"https://example.com/very/long/path"}"#,
+            r#"{"url":"https://cdn.example.com/build/artifacts/2026-07-27/bundle.min.js?version=1720000000"}"#,
+            r#"{"uri":"file:///Users/nafiz/Development/atlas/src/lib.rs"}"#,
+        ] {
+            let out = redact_json(input);
+            assert_eq!(out.counts.total(), 0, "over-redacted: {}", out.text);
+        }
+    }
+
+    #[test]
+    fn a_documented_placeholder_password_in_a_url_field_is_left_alone() {
+        let input = r#"{"url":"postgres://user:<password>@localhost/db"}"#;
+        let out = redact_json(input);
+        assert!(out.text.contains("<password>"));
         assert_eq!(out.counts.total(), 0);
     }
 

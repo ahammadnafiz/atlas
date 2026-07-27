@@ -179,6 +179,11 @@ pub struct IngestRequest {
 /// markable as failed while everything behind it keeps draining. Today's server
 /// returns a single 403 for a whole batch if any org check fails, which is why
 /// the drain also carries a bisect fallback — see [`crate::sync`].
+///
+/// An empty `results` body means the whole batch was accepted — the 202
+/// contract. A **non-empty** body that omits a row is *not* acceptance: the
+/// drain treats the omitted row as unacknowledged and leaves it pending,
+/// because a server that silently dropped a row must not have it marked sent.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IngestResponse {

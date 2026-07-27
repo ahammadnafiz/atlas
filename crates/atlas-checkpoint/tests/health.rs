@@ -14,12 +14,22 @@ const WORKSPACE: &str = "ws-atlas";
 
 /// A Workspace whose git watcher is attached and healthy.
 fn watching() -> HostSignals {
-    HostSignals { watcher_attached: true, expects_watcher: true, is_writer: true }
+    HostSignals {
+        watcher_attached: true,
+        expects_watcher: true,
+        holds_writer: Some(true),
+        worker_alive: true,
+    }
 }
 
 /// A Workspace that needs no watcher — not a git repository.
 fn no_watcher_needed() -> HostSignals {
-    HostSignals { watcher_attached: false, expects_watcher: false, is_writer: true }
+    HostSignals {
+        watcher_attached: false,
+        expects_watcher: false,
+        holds_writer: Some(true),
+        worker_alive: true,
+    }
 }
 
 fn store_in(root: &Path) -> Store {
@@ -167,6 +177,7 @@ fn a_storage_failure_flags_the_session_and_surfaces_as_degraded() {
                 role: atlas_checkpoint::Role::Assistant,
                 mode: atlas_checkpoint::Mode::Text,
                 body: "x".repeat(SPILL_THRESHOLD_BYTES + 1),
+                created_at: None,
             },
         );
     }
@@ -222,7 +233,12 @@ fn a_dead_watcher_moves_the_workspace_to_stopped() {
     init_repo(dir.path());
     let store = bound(dir.path());
 
-    let stopped = HostSignals { watcher_attached: false, expects_watcher: true, is_writer: true };
+    let stopped = HostSignals {
+        watcher_attached: false,
+        expects_watcher: true,
+        holds_writer: Some(true),
+        worker_alive: true,
+    };
     let health = health(&store, stopped);
 
     assert_eq!(health.state, HealthState::Stopped);
@@ -273,9 +289,15 @@ fn a_second_window_reports_stopped_rather_than_silently_not_recording() {
 
     // Writer-ness is a host signal, not something read off the store: the health
     // read runs against a reader connection that never asked for the lock.
+    // `Some(false)` — a *lost* acquisition, not merely an unopened store.
     let health = health(
         &second,
-        HostSignals { watcher_attached: false, expects_watcher: false, is_writer: false },
+        HostSignals {
+            watcher_attached: false,
+            expects_watcher: false,
+            holds_writer: Some(false),
+            worker_alive: true,
+        },
     );
     assert_eq!(health.state, HealthState::Stopped);
     assert!(
@@ -283,6 +305,134 @@ fn a_second_window_reports_stopped_rather_than_silently_not_recording() {
         "{:?}",
         health.issues
     );
+}
+
+#[test]
+fn a_workspace_never_opened_this_process_is_not_another_window() {
+    // Before the first capture event lands, the host's store registry has no
+    // entry for the Workspace — no claim on the writer lock either way. The old
+    // boolean signal read that as "lost the lock" and reported a phantom second
+    // window on every health poll after app start.
+    let dir = tempfile::tempdir().unwrap();
+    let store = bound(dir.path());
+
+    let health = health(
+        &store,
+        HostSignals {
+            watcher_attached: false,
+            expects_watcher: false,
+            holds_writer: None,
+            worker_alive: true,
+        },
+    );
+    assert_eq!(health.state, HealthState::Ok, "{:?}", health.issues);
+    assert!(
+        !health.issues.iter().any(|i| i.reason.contains("Another Atlas window")),
+        "{:?}",
+        health.issues
+    );
+}
+
+#[test]
+fn a_dead_capture_worker_reports_stopped() {
+    // A dead worker is total silent capture loss — every write funnels through
+    // it — and previously health kept reporting whatever the store last said.
+    let dir = tempfile::tempdir().unwrap();
+    let store = bound(dir.path());
+
+    let health = health(
+        &store,
+        HostSignals {
+            watcher_attached: false,
+            expects_watcher: false,
+            holds_writer: Some(true),
+            worker_alive: false,
+        },
+    );
+    assert_eq!(health.state, HealthState::Stopped);
+    assert!(
+        health.issues.iter().any(|i| i.reason.contains("capture worker")),
+        "{:?}",
+        health.issues
+    );
+}
+
+#[test]
+fn a_revoked_drain_authorization_surfaces_without_stopping_capture() {
+    // Degraded, not Stopped: capture keeps recording locally — only the drain
+    // is gated — and the reason still says work is not reaching the team.
+    let dir = tempfile::tempdir().unwrap();
+    let store = store_in(dir.path());
+    bind(&store, WORKSPACE, dir.path(), WorkspaceMode::Cloud).unwrap();
+    store
+        .set_drain_state(atlas_checkpoint::model::DrainGate::NotAuthorized)
+        .unwrap();
+
+    let health = health(&store, no_watcher_needed());
+    assert_eq!(health.state, HealthState::Degraded);
+    assert!(
+        health.issues.iter().any(|i| i.reason.contains("authorized")),
+        "{:?}",
+        health.issues
+    );
+    assert!(health.issues.iter().all(|i| !i.next_step.is_empty()));
+}
+
+#[test]
+fn a_mass_orphan_reconcile_note_surfaces_as_degraded_with_the_count() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = bound(dir.path());
+    store
+        .set_reconcile_note(WORKSPACE, r#"{"relinked":0,"orphaned":12,"recovered":0}"#)
+        .unwrap();
+
+    let health = health(&store, no_watcher_needed());
+    assert_eq!(health.state, HealthState::Degraded);
+    assert!(
+        health.issues.iter().any(|i| i.reason.contains("12 Checkpoint")),
+        "{:?}",
+        health.issues
+    );
+}
+
+#[test]
+fn a_quiet_reconcile_note_is_not_an_issue() {
+    // An ordinary squash orphaning one Checkpoint is correct behaviour, not an
+    // incident; only bulk detachment or a wedged pass is worth an alarm.
+    let dir = tempfile::tempdir().unwrap();
+    let store = bound(dir.path());
+    store
+        .set_reconcile_note(WORKSPACE, r#"{"relinked":2,"orphaned":1,"failed":0}"#)
+        .unwrap();
+
+    assert_eq!(health(&store, no_watcher_needed()).state, HealthState::Ok);
+}
+
+#[test]
+fn a_partly_failed_reconcile_pass_surfaces_as_degraded() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = bound(dir.path());
+    store
+        .set_reconcile_note(WORKSPACE, r#"{"relinked":0,"orphaned":0,"failed":3}"#)
+        .unwrap();
+
+    let health = health(&store, no_watcher_needed());
+    assert_eq!(health.state, HealthState::Degraded);
+    assert!(
+        health.issues.iter().any(|i| i.reason.contains("reconciliation")),
+        "{:?}",
+        health.issues
+    );
+}
+
+#[test]
+fn an_unreadable_reconcile_note_never_breaks_the_signal() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = bound(dir.path());
+    store.set_reconcile_note(WORKSPACE, "not json at all").unwrap();
+
+    // Tolerant parse: the health signal must never itself become the failure.
+    assert_eq!(health(&store, no_watcher_needed()).state, HealthState::Ok);
 }
 
 #[test]
@@ -343,7 +493,12 @@ impl HealthSignalsBoth<'_> {
         evaluate_health(
             self.0,
             WORKSPACE,
-            HostSignals { watcher_attached: false, expects_watcher: true, is_writer: true },
+            HostSignals {
+                watcher_attached: false,
+                expects_watcher: true,
+                holds_writer: Some(true),
+                worker_alive: true,
+            },
         )
         .expect("health evaluates")
     }

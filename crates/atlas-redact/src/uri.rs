@@ -45,6 +45,27 @@ pub(crate) fn detect(input: &str) -> Vec<Region> {
     regions
 }
 
+/// Flag only the userinfo password of each credentialed URI, leaving the rest
+/// of the link intact.
+///
+/// The whole-URI replacement above is right for prose, where a half-redacted
+/// connection string invites reuse — but in a JSON `url` field the link *is*
+/// the datum, and destroying it destroys the record. There the password is the
+/// only part that must go.
+pub(crate) fn detect_userinfo_passwords(input: &str) -> Vec<Region> {
+    let mut regions = Vec::new();
+    for captures in credentialed_uri().captures_iter(input) {
+        let Some(password) = captures.get(1) else {
+            continue;
+        };
+        if !is_real_secret_value(password.as_str()) {
+            continue;
+        }
+        regions.push(Region::new(password.start(), password.end(), Category::CredentialedUri));
+    }
+    regions
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

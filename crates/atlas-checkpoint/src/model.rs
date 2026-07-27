@@ -419,6 +419,17 @@ pub struct Binding {
     pub git_url: Option<String>,
     /// Capture stops when this is false; nothing already recorded is deleted.
     pub enabled: bool,
+    /// Has the user explicitly approved the bulk transcript import? Always set
+    /// for Local (nothing leaves the machine); for Cloud it is set only by the
+    /// disclosure confirmation, and the background scan must refuse until then.
+    pub import_approved: bool,
+    /// `ok`, or `not_authorized` once the server said this identity may not
+    /// push. Terminal until re-registration — remembered so the drain does not
+    /// retry a revoked membership every thirty seconds forever.
+    pub drain_state: DrainGate,
+    /// The server-assigned Workspace id from registration. The wire identity of
+    /// every synced artifact; `None` until the Workspace is registered.
+    pub remote_workspace_id: Option<String>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -426,6 +437,44 @@ impl Binding {
     /// Is this Workspace recording right now?
     pub fn is_capturing(&self) -> bool {
         self.enabled
+    }
+
+    /// May the background scan import transcripts for this Workspace?
+    ///
+    /// Local always may — nothing leaves the machine. Cloud requires the
+    /// explicit bulk-disclosure confirmation first.
+    pub fn may_import(&self) -> bool {
+        match self.mode {
+            WorkspaceMode::Local => true,
+            WorkspaceMode::Cloud => self.import_approved,
+        }
+    }
+}
+
+/// Whether the drain is allowed to run at all for this Workspace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DrainGate {
+    Ok,
+    /// The server rejected this identity. Terminal until re-registration; the
+    /// capture-health signal renders it as "no longer authorized".
+    NotAuthorized,
+}
+
+impl DrainGate {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::NotAuthorized => "not_authorized",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "ok" => Some(Self::Ok),
+            "not_authorized" => Some(Self::NotAuthorized),
+            _ => None,
+        }
     }
 }
 

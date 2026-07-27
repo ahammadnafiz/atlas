@@ -12,9 +12,14 @@
 //!
 //! This is the layer most exposed to false positives, so it is bounded three
 //! ways: the key must be a whole identifier token (not a substring of a longer
-//! word), a bare `:` separator is only honoured for identifier-shaped keys so
-//! ordinary prose like "the secret: it was a race" is untouched, and the value
-//! must survive the placeholder gate.
+//! word), a bare `:` separator is only honoured for identifier-shaped keys or a
+//! quoted value so ordinary prose like "the secret: it was a race" is
+//! untouched, and the value must survive the placeholder gate.
+//!
+//! Quoted keys — `"password": "hunter2"`, the JSON spelling — are matched too.
+//! JSON *documents* go through the structure-preserving walker, but a JSON
+//! fragment quoted inside a prose body never parses as a document, and this
+//! layer is the only thing standing between such a fragment and disk.
 
 use std::sync::OnceLock;
 
@@ -60,6 +65,24 @@ fn assignment() -> &'static Regex {
     RE.get_or_init(|| {
         Regex::new(
             r#"(?:^|[^A-Za-z0-9_])([A-Za-z0-9_.-]{1,64})[ \t]*(=|:)[ \t]*("[^"]*"|'[^']*'|[^\s,;&]+)"#,
+        )
+        .expect("static pattern")
+    })
+}
+
+/// The JSON spelling of an assignment: `"password": "hunter2"`. The pattern
+/// above cannot see it — the closing quote sits between the key and the colon —
+/// and a JSON fragment pasted into prose never reaches the JSON-aware walker,
+/// so without this form a `{"password": "hunter2"}` snippet inside a chat
+/// message would pass through the flat redactor untouched.
+///
+/// A quoted key needs no identifier-shape gate: the quotes themselves are the
+/// evidence that this is config or data, not a word in a sentence.
+fn quoted_key_assignment() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r#"(?:"([A-Za-z0-9_.-]{1,64})"|'([A-Za-z0-9_.-]{1,64})')[ \t]*:[ \t]*("[^"]*"|'[^']*'|[^\s,;&}\]]+)"#,
         )
         .expect("static pattern")
     })
@@ -132,18 +155,55 @@ pub(crate) fn detect(input: &str) -> Vec<Region> {
         if !is_credential_key(key.as_str()) {
             continue;
         }
-        if separator.as_str() == ":" && !is_identifier_shaped(key.as_str()) {
+        // A bare `:` after a lone credential word is usually prose — unless the
+        // value is quoted, which is the YAML spelling (`password: "hunter2"`);
+        // prose does not quote what follows its colon.
+        if separator.as_str() == ":"
+            && !is_identifier_shaped(key.as_str())
+            && !is_quoted(value.as_str())
+        {
             continue;
         }
 
-        let (start, end) = strip_quotes(input, value.start(), value.end());
-        let raw = &input[start..end];
-        if raw.len() < MIN_VALUE_LEN || !is_real_secret_value(raw) {
+        regions.extend(value_region(input, value));
+    }
+    for captures in quoted_key_assignment().captures_iter(input) {
+        let (Some(key), Some(value)) =
+            (captures.get(1).or_else(|| captures.get(2)), captures.get(3))
+        else {
+            continue;
+        };
+        if !is_credential_key(key.as_str()) {
             continue;
         }
-        regions.push(Region::new(start, end, Category::CredentialValue));
+        regions.extend(value_region(input, value));
     }
     regions
+}
+
+/// Vet a matched value and turn it into a region, or decline: too short, purely
+/// numeric, or a placeholder.
+fn value_region(input: &str, value: regex::Match) -> Option<Region> {
+    let (start, end) = strip_quotes(input, value.start(), value.end());
+    let raw = &input[start..end];
+    if raw.len() < MIN_VALUE_LEN || is_numeric(raw) || !is_real_secret_value(raw) {
+        return None;
+    }
+    Some(Region::new(start, end, Category::CredentialValue))
+}
+
+/// A purely numeric value is a port, a count, a limit — `max_tokens=4096`,
+/// `"expires_in": 3600` — never a credential, whatever its key is called.
+fn is_numeric(value: &str) -> bool {
+    value.chars().any(|c| c.is_ascii_digit())
+        && value.chars().all(|c| c.is_ascii_digit() || c == '.')
+}
+
+/// Is the raw matched value wrapped in quotes?
+fn is_quoted(value: &str) -> bool {
+    value.len() >= 2
+        && ((value.starts_with('"') && value.ends_with('"'))
+            || (value.starts_with('\'') && value.ends_with('\'')))
 }
 
 /// A key that reads as a variable rather than a word in a sentence: it is
@@ -234,5 +294,54 @@ mod tests {
     #[test]
     fn very_short_values_are_left_alone() {
         assert!(spans("token=1").is_empty());
+    }
+
+    #[test]
+    fn a_json_quoted_key_is_caught_by_the_flat_layer() {
+        for (input, expected) in [
+            (r#"{"password": "hunter2"}"#, "hunter2"),
+            (r#"{'password': 'hunter2'}"#, "hunter2"),
+            (r#""client_secret":"hunter2xyz""#, "hunter2xyz"),
+            (r#"the tool sent {"api_key": "abcdefgh1234"} and failed"#, "abcdefgh1234"),
+        ] {
+            assert_eq!(spans(input), vec![expected], "missed: {input}");
+        }
+    }
+
+    #[test]
+    fn a_yaml_credential_key_with_a_quoted_value_is_caught() {
+        assert_eq!(spans(r#"password: "hunter2""#), vec!["hunter2"]);
+        assert_eq!(spans("secret: 'correct-horse-battery'"), vec!["correct-horse-battery"]);
+    }
+
+    #[test]
+    fn quoted_non_credential_keys_are_left_alone() {
+        for input in [
+            r#"{"message_id": "xJ3kQ9vB2mZ7pL5rT8wN4cF6yH1sD0gA"}"#,
+            r#"{"role": "assistant", "content": "done"}"#,
+            r#"{"password_policy": "strict-rotation"}"#,
+            r#"{"token_count": "many"}"#,
+        ] {
+            assert!(spans(input).is_empty(), "over-redacted: {input}");
+        }
+    }
+
+    #[test]
+    fn quoted_credential_keys_with_placeholder_values_are_left_alone() {
+        assert!(spans(r#"{"password": "[REDACTED]"}"#).is_empty());
+        assert!(spans(r#"{"api_key": "<your-api-key>"}"#).is_empty());
+        assert!(spans(r#"{"client_secret": "changeme"}"#).is_empty());
+    }
+
+    #[test]
+    fn purely_numeric_values_are_not_credentials() {
+        for input in [
+            r#"{"max_tokens": 4096}"#,
+            "max_tokens=4096",
+            r#""tokens": 51234"#,
+            "request_tokens: 8192.5",
+        ] {
+            assert!(spans(input).is_empty(), "over-redacted: {input}");
+        }
     }
 }

@@ -85,6 +85,10 @@ pub struct TurnContent {
     pub mode: Mode,
     /// Raw content. Scrubbed here, on the way in.
     pub body: String,
+    /// When the turn actually happened. `None` means "now" — live capture. The
+    /// importer passes the transcript's own timestamp so imported history keeps
+    /// its real dates.
+    pub created_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Records agent activity into a Workspace's store.
@@ -127,18 +131,27 @@ impl<'a> Capture<'a> {
 
         // Title first: it must exist the moment the first turn completes, and
         // deriving it costs nothing.
-        if let Some(derived) = title::from_prompt(prompt) {
+        if let Some(derived) = self.derive_title(&session_id, prompt) {
             self.store.set_title_if_absent(&session_id, &derived)?;
         }
 
+        // Atlas's own send has no agent-issued message id, so one is
+        // synthesised deterministically from the turn and the content. Without
+        // it a re-submitted send — a frontend retry, a re-processed delta —
+        // would insert the same user message twice.
+        let native_message_id = format!(
+            "prompt-{turn_seq}-{}",
+            blobs::key_for(prompt.as_bytes())
+        );
         self.record_content(
             &session_id,
             TurnContent {
                 turn_seq,
-                native_message_id: None,
+                native_message_id: Some(native_message_id),
                 role: Role::User,
                 mode: Mode::Text,
                 body: prompt.to_string(),
+                created_at: None,
             },
         )?;
 
@@ -149,10 +162,10 @@ impl<'a> Capture<'a> {
     ///
     /// The importer needs this because it must record *every* line — the first
     /// prompt included — through [`Capture::record_turn`] with the agent's own
-    /// message id attached. [`Capture::record_prompt`] stores the prompt with no
-    /// such id, which is right for live capture (Atlas's own send has no agent
-    /// id to use) and wrong for a transcript that may be re-read as it grows:
-    /// without the id, the second read duplicates the first turn.
+    /// message id attached. [`Capture::record_prompt`] synthesises its own id
+    /// (there is no agent-issued one on the send path), which is right for live
+    /// capture and wrong for a transcript: the transcript line carries the
+    /// agent's real id, and that is the one that must win.
     pub fn ensure_session(
         &mut self,
         key: &SessionKey,
@@ -175,12 +188,33 @@ impl<'a> Capture<'a> {
     ///
     /// Redacted like every other stored string — the title is the most visible
     /// one in the product, and an imported prompt is exactly as likely to
-    /// contain a pasted key as a live one.
+    /// contain a pasted key as a live one. Redaction runs inside the same panic
+    /// guard as every body scrub: if it fails, the Session simply gets no title
+    /// (and is flagged) rather than the failure unwinding through the caller —
+    /// a hostile transcript line must not be able to kill the capture worker.
     pub fn set_title_from_prompt(&mut self, session_id: &str, prompt: &str) -> Result<()> {
-        if let Some(title) = title::from_prompt(prompt) {
+        if let Some(title) = self.derive_title(session_id, prompt) {
             self.store.set_title_if_absent(session_id, &title)?;
         }
         Ok(())
+    }
+
+    /// Scrub a prompt under the panic guard and derive a title from the result.
+    ///
+    /// Fails closed to *no title*: a redaction failure flags the Session and
+    /// yields `None` instead of propagating, because a title is decoration —
+    /// the caller's turn must still record (and will itself fail closed on the
+    /// body through the same guard).
+    fn derive_title(&mut self, session_id: &str, prompt: &str) -> Option<String> {
+        match scrub(prompt) {
+            Ok(redacted) => title::from_redacted(&redacted.text),
+            Err(err) => {
+                let _ = self
+                    .store
+                    .flag_needs_attention(session_id, &err.to_string());
+                None
+            }
+        }
     }
 
     /// Record one finalized turn.
@@ -202,7 +236,11 @@ impl<'a> Capture<'a> {
     ///
     /// `arguments` and `result` are scrubbed here on the same on-write basis as
     /// message bodies — a command that prints a token puts it in `result`, which
-    /// makes these the highest-risk content in a Session.
+    /// makes these the highest-risk content in a Session. Both go through the
+    /// JSON-aware redactor: arguments are serialised JSON by construction and
+    /// results frequently are, and the flat pass both misses a quoted
+    /// low-entropy credential (`{"password": "hunter2"}`) and shreds the
+    /// identifiers the walk exists to protect (`{"message_id": …}`).
     ///
     /// A non-UTF-8 result is stored verbatim with a binary marker and skipped by
     /// string redaction. Lossily decoding it to scan would corrupt the payload on
@@ -214,13 +252,12 @@ impl<'a> Capture<'a> {
             None => None,
         };
 
+        // One redaction pass, not two: the UTF-8 check is the whole
+        // text-vs-binary decision, and the scrub below is the only scrub.
         let result_text = match call.result {
-            Some(bytes) => match atlas_redact::redact_bytes(bytes) {
-                Some(_) => Some(self.scrub_or_flag(
-                    session_id,
-                    std::str::from_utf8(bytes).expect("redact_bytes already validated"),
-                )?),
-                None => None,
+            Some(bytes) => match std::str::from_utf8(bytes) {
+                Ok(text) => Some(self.scrub_or_flag(session_id, text)?),
+                Err(_) => None,
             },
             None => None,
         };
@@ -306,8 +343,11 @@ impl<'a> Capture<'a> {
 
     /// Scrub, flagging the Session and failing closed if scrubbing did not
     /// complete. Shared by every path that writes agent content.
+    ///
+    /// Shape-aware: JSON payloads go through the walking redactor, prose
+    /// through the flat one — see [`scrub_auto`].
     fn scrub_or_flag(&mut self, session_id: &str, raw: &str) -> Result<String> {
-        match scrub(raw) {
+        match scrub_auto(raw) {
             Ok(scrubbed) => {
                 let _ = self.store.add_redaction_counts(session_id, &scrubbed.counts);
                 Ok(scrubbed.text)
@@ -321,7 +361,10 @@ impl<'a> Capture<'a> {
     }
 
     fn record_content(&mut self, session_id: &str, content: TurnContent) -> Result<Option<String>> {
-        let scrubbed = match scrub(&content.body) {
+        // Shape-aware for the rare body that *is* a JSON document (an agent
+        // replying with pure JSON): the walk keeps its ids and paths intact
+        // where the flat pass would shred them. Prose takes the flat pass.
+        let scrubbed = match scrub_auto(&content.body) {
             Ok(scrubbed) => scrubbed,
             Err(err) => {
                 // Fail closed. The content is not written, and the Session says
@@ -341,6 +384,7 @@ impl<'a> Capture<'a> {
             mode: content.mode,
             body: &scrubbed.text,
             sync_state: self.mode.initial_sync_state(),
+            created_at: content.created_at,
         });
 
         match written {
@@ -374,6 +418,20 @@ fn scrub(body: &str) -> Result<atlas_redact::Redacted> {
         .map_err(|_| Error::RedactionFailed("redactor panicked on this content".into()))
 }
 
+/// Shape-aware scrub under the same panic guard as [`scrub`].
+///
+/// JSON-shaped content is routed through the walking redactor
+/// (`atlas_redact::redact_auto`), which catches quoted low-entropy credentials
+/// the flat layers structurally cannot see and preserves the ids, paths and
+/// field names the flat entropy layer would destroy. Anything that is not JSON
+/// falls through to the flat pass inside `redact_auto` itself. The guard is
+/// identical because the failure mode is identical: a redactor panic must
+/// become [`Error::RedactionFailed`], never an unwind through the caller.
+fn scrub_auto(body: &str) -> Result<atlas_redact::Redacted> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| atlas_redact::redact_auto(body)))
+        .map_err(|_| Error::RedactionFailed("redactor panicked on this content".into()))
+}
+
 /// Whether a body is large enough to be spilled beside the database rather than
 /// stored on the row. Re-exported so callers can reason about a payload before
 /// handing it over.
@@ -397,5 +455,26 @@ mod tests {
         let out = scrub("just a normal sentence").expect("scrub");
         assert_eq!(out.text, "just a normal sentence");
         assert_eq!(out.counts.total(), 0);
+    }
+
+    #[test]
+    fn the_shape_aware_scrub_keeps_json_identifiers_and_drops_quoted_credentials() {
+        // The two failure modes of the flat pass on JSON, in one payload: a
+        // low-entropy credential under a quoted key (missed entirely) and a
+        // high-entropy identifier (destroyed by the entropy layer).
+        let payload = r#"{"host":"db.internal","user":"app","password":"hunter2","message_id":"xJ3kQ9vB2mZ7pL5rT8wN4cF6yH1sD0gA"}"#;
+        let out = scrub_auto(payload).expect("scrub");
+        assert!(!out.text.contains("hunter2"), "{}", out.text);
+        assert!(
+            out.text.contains("xJ3kQ9vB2mZ7pL5rT8wN4cF6yH1sD0gA"),
+            "{}",
+            out.text
+        );
+    }
+
+    #[test]
+    fn the_shape_aware_scrub_treats_prose_as_prose() {
+        let out = scrub_auto("API_KEY=supersecretvalue123").expect("scrub");
+        assert!(out.text.contains("[REDACTED]"));
     }
 }

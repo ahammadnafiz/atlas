@@ -144,6 +144,26 @@ fn trim_trailing_punctuation(input: &str, start: usize, mut end: usize) -> usize
     end
 }
 
+/// Flag only the values of `password=`/`pwd=` assignments, leaving whatever
+/// carries them intact.
+///
+/// Used for JSON `url` fields, where the whole-unit replacement above would
+/// destroy the link: `mysql://db/app?user=svc&password=hunter2` keeps its host
+/// and path and loses only the password.
+pub(crate) fn detect_password_values(input: &str) -> Vec<Region> {
+    let mut regions = Vec::new();
+    for captures in password_assignment().captures_iter(input) {
+        let Some(value) = captures.get(1) else {
+            continue;
+        };
+        if !is_real_secret_value(value.as_str()) {
+            continue;
+        }
+        regions.push(Region::new(value.start(), value.end(), Category::ConnectionString));
+    }
+    regions
+}
+
 fn has_real_password(candidate: &str) -> bool {
     password_assignment().captures_iter(candidate).any(|captures| {
         captures

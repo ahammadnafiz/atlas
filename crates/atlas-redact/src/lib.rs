@@ -188,6 +188,48 @@ pub fn redact(input: &str) -> Redacted {
     Redacted { text, counts }
 }
 
+/// Redact only the credential material inside a link value, keeping the link.
+///
+/// Used by [`redact_json`] for `url`/`uri` fields. Replacing a whole URL
+/// destroys the reference the transcript exists to keep, and the entropy layer
+/// misreads long path segments and signed-URL parameters as secrets — so
+/// neither runs here. What must still not survive is an actual credential:
+/// a userinfo password (`postgres://app:hunter2@db/x`), a `password=` query
+/// parameter, or a provider token embedded in the URL the way git remotes
+/// embed one (`https://ghp_…@github.com/org/repo`).
+pub(crate) fn redact_link(input: &str) -> Redacted {
+    let mut regions = uri::detect_userinfo_passwords(input);
+    regions.extend(dsn::detect_password_values(input));
+    regions.extend(provider::detect(input));
+
+    let (text, replaced) = region::apply(input, regions, PLACEHOLDER);
+    let mut counts = RedactionCounts::default();
+    for category in replaced {
+        counts.record(category);
+    }
+    Redacted { text, counts }
+}
+
+/// Redact a payload whose shape is unknown — the right call for tool arguments
+/// and tool results, which are JSON-shaped most of the time but not always.
+///
+/// If the trimmed input parses as a JSON object or array it is routed through
+/// [`redact_json`], so ids, paths and field names survive, and comes back
+/// serialised compactly. Anything else — prose, logs, a fragment that does not
+/// parse — goes through the flat [`redact`] pass. The counts are whichever
+/// path produced them; nothing is dropped in the dispatch.
+pub fn redact_auto(input: &str) -> Redacted {
+    let trimmed = input.trim();
+    if trimmed.starts_with('{') || trimmed.starts_with('[') {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
+            if value.is_object() || value.is_array() {
+                return redact_json(trimmed);
+            }
+        }
+    }
+    redact(input)
+}
+
 /// Redact bytes, or decline if they are not text.
 ///
 /// Returns `None` for input that is not valid UTF-8. A tool result can be a

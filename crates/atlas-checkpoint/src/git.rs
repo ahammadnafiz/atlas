@@ -68,6 +68,11 @@ pub struct CommitInfo {
     pub author_name: String,
     pub author_email: String,
     pub parents: Vec<String>,
+    /// Committer time, seconds since the epoch. The link walk refuses to link a
+    /// commit to a Session that started *after* the commit was created — which
+    /// is what makes the bounded recovery re-scan safe: historical commits that
+    /// predate every Session can neither link nor consume its touches.
+    pub commit_time: i64,
     pub subject: String,
 }
 
@@ -114,6 +119,31 @@ fn run(repo: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
+/// A git invocation whose *exit status* carries meaning.
+///
+/// [`run`] folds any non-zero exit into an error, which is right for commands
+/// where failure is failure. Reachability probes are different: `merge-base
+/// --is-ancestor` answers "no" with exit 1, and conflating that with "the probe
+/// could not run" is how a transient failure gets read as "unreachable" and
+/// orphans a perfectly good Checkpoint. Here only a spawn failure is an error.
+struct RunStatus {
+    success: bool,
+    stdout: String,
+}
+
+fn run_status(repo: &Path, args: &[&str]) -> Result<RunStatus> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .output()
+        .map_err(|e| GitError(format!("{args:?}: {e}")))?;
+    Ok(RunStatus {
+        success: output.status.success(),
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+    })
+}
+
 /// Is this directory a git repository?
 ///
 /// Git is optional: a Workspace that is not a repository captures Sessions
@@ -141,18 +171,41 @@ pub fn current_branch(repo: &Path) -> Option<String> {
     (!branch.is_empty()).then(|| branch.to_string())
 }
 
-/// Is this commit reachable from any ref?
+/// Is this commit reachable from HEAD or any ref — branches **and tags**?
 ///
 /// The question that decides whether a Checkpoint's commit still exists after a
-/// history rewrite.
-pub fn is_reachable(repo: &Path, sha: &str) -> bool {
-    // `--all` covers every ref; a commit only in the reflog is *not* reachable,
-    // which is the correct answer — a rebased-away commit is gone as far as the
-    // history is concerned.
-    run(repo, &["merge-base", "--is-ancestor", sha, "HEAD"]).is_ok()
-        || run(repo, &["branch", "--all", "--contains", sha])
-            .map(|out| !out.trim().is_empty())
-            .unwrap_or(false)
+/// history rewrite. Tags count: a commit kept alive only by a release tag is
+/// permanently reachable, and orphaning its Checkpoint would be false.
+///
+/// Returns `Err` when the probe itself could not be trusted — the caller must
+/// treat that as "unknown" and skip, never as "unreachable". A commit only in
+/// the reflog *is* unreachable, which is the correct answer: a rebased-away
+/// commit is gone as far as the history is concerned.
+pub fn is_reachable(repo: &Path, sha: &str) -> Result<bool> {
+    // HEAD ancestry first: the overwhelmingly common case, and one cheap check.
+    // Exit 0 = ancestor; exit 1 = not; anything else falls through to the
+    // ref scan, which distinguishes "gone" from "probe failed".
+    let head = run_status(repo, &["merge-base", "--is-ancestor", sha, "HEAD"])?;
+    if head.success {
+        return Ok(true);
+    }
+
+    // `for-each-ref --contains` covers every ref — branches, tags, remotes.
+    let refs = run_status(repo, &["for-each-ref", "--format=%(refname)", "--contains", sha])?;
+    if refs.success {
+        return Ok(!refs.stdout.trim().is_empty());
+    }
+
+    // The ref scan refused. Either the commit object no longer exists at all
+    // (definitively unreachable — nothing can contain a missing object) or the
+    // probe itself failed (lock contention, a mid-gc window). Only the first
+    // may orphan; the second must surface as an error and be retried later.
+    let exists = run_status(repo, &["cat-file", "-e", &format!("{sha}^{{commit}}")])?;
+    if exists.success {
+        Err(GitError(format!("reachability probe failed for {sha}")))
+    } else {
+        Ok(false)
+    }
 }
 
 /// Commits reachable from `to` but not from `from`, oldest first.
@@ -263,10 +316,42 @@ pub fn normalize_git_url(raw: &str) -> String {
 /// for them costs two `stat`s and turns "tolerate firing mid-rebase" from a hope
 /// into a guarantee.
 pub fn rewrite_in_progress(repo: &Path) -> bool {
+    const MARKERS: [&str; 4] = ["rebase-merge", "rebase-apply", "CHERRY_PICK_HEAD", "MERGE_HEAD"];
+
+    // Resolved through `rev-parse --git-path` rather than assuming `.git/<marker>`:
+    // in a linked worktree the markers live under the worktree's private gitdir
+    // (`.git/worktrees/<name>/rebase-merge`), and the naive join would silently
+    // never fire there — deferral would be a hope, not a guarantee, exactly
+    // where a mid-rebase orphaning is most likely.
+    if let Ok(out) = run(
+        repo,
+        &[
+            "rev-parse",
+            "--git-path", MARKERS[0],
+            "--git-path", MARKERS[1],
+            "--git-path", MARKERS[2],
+            "--git-path", MARKERS[3],
+        ],
+    ) {
+        return out
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .any(|line| {
+                let path = Path::new(line);
+                if path.is_absolute() {
+                    path.exists()
+                } else {
+                    // `git -C <repo>` prints paths relative to the repo root.
+                    repo.join(path).exists()
+                }
+            });
+    }
+
+    // rev-parse unavailable: the static layout still answers for the main
+    // worktree, which is better than answering "no rewrite" unconditionally.
     let git_dir = repo.join(".git");
-    ["rebase-merge", "rebase-apply", "CHERRY_PICK_HEAD", "MERGE_HEAD"]
-        .iter()
-        .any(|marker| git_dir.join(marker).exists())
+    MARKERS.iter().any(|marker| git_dir.join(marker).exists())
 }
 
 /// The most recent `limit` commits across **every** ref, newest first.
@@ -288,12 +373,13 @@ pub fn recent_commits_all_refs(repo: &Path, limit: usize) -> Result<Vec<String>>
 /// after an interactive rebase has to consider every rewritten commit against
 /// every affected Checkpoint, and doing that pairwise would be quadratic in
 /// subprocess spawns.
-pub fn patch_id_map(repo: &Path, limit: usize) -> std::collections::HashMap<String, Vec<String>> {
+///
+/// Fallible on purpose. A failed scan must not be readable as an *empty* map —
+/// "no candidates" is what reconciliation turns into "no match, orphan", and a
+/// transient git failure must never orphan anything.
+pub fn patch_id_map(repo: &Path, limit: usize) -> Result<std::collections::HashMap<String, Vec<String>>> {
     let mut map: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
-    let Ok(commits) = recent_commits_all_refs(repo, limit) else {
-        return map;
-    };
-    for commit in commits {
+    for commit in recent_commits_all_refs(repo, limit)? {
         // `None` for an empty diff, which is exactly right: the patch-id of an
         // empty diff is a constant, so letting empty commits into this map would
         // make every one of them a candidate match for every other.
@@ -301,7 +387,28 @@ pub fn patch_id_map(repo: &Path, limit: usize) -> std::collections::HashMap<Stri
             map.entry(id).or_default().push(commit);
         }
     }
-    map
+    Ok(map)
+}
+
+/// The commits a merge brought in from one side parent, oldest first, bounded.
+///
+/// `first_parent..side_parent`, merges excluded — the commits the first-parent
+/// walk deliberately skipped. Work committed on a side branch while Atlas was
+/// closed and then merged is linked through these, exactly once each: the
+/// `(Session, commit)` idempotency key and touch consumption make re-seeing
+/// them (a later merge of an already-walked branch) harmless.
+pub fn merge_side_commits(
+    repo: &Path,
+    first_parent: &str,
+    side_parent: &str,
+    limit: usize,
+) -> Result<Vec<String>> {
+    let range = format!("{first_parent}..{side_parent}");
+    let out = run(
+        repo,
+        &["rev-list", "--no-merges", "--reverse", "--max-count", &limit.to_string(), &range],
+    )?;
+    Ok(out.lines().map(str::trim).filter(|l| !l.is_empty()).map(str::to_string).collect())
 }
 
 /// The branches a commit is on.
@@ -322,7 +429,7 @@ pub fn branches_containing(repo: &Path, sha: &str) -> Vec<String> {
 pub fn commit_info(repo: &Path, sha: &str) -> Result<CommitInfo> {
     // Unit-separator delimited so an author name containing the delimiter is
     // not a parsing hazard.
-    let out = run(repo, &["show", "--no-patch", "--format=%H%x1f%an%x1f%ae%x1f%P%x1f%s", sha])?;
+    let out = run(repo, &["show", "--no-patch", "--format=%H%x1f%an%x1f%ae%x1f%P%x1f%ct%x1f%s", sha])?;
     let line = out.lines().next().unwrap_or_default();
     let mut fields = line.split('\x1f');
 
@@ -336,6 +443,11 @@ pub fn commit_info(repo: &Path, sha: &str) -> Result<CommitInfo> {
             .split_whitespace()
             .map(str::to_string)
             .collect(),
+        // Zero (the epoch) on a parse failure, which fails **closed**: the time
+        // bound then refuses to link this commit to any Session rather than
+        // linking it to all of them — a missing link is recoverable, a wrong
+        // one corrupts a shared timeline.
+        commit_time: fields.next().and_then(|f| f.trim().parse().ok()).unwrap_or(0),
         subject: fields.next().unwrap_or_default().to_string(),
     })
 }
@@ -401,6 +513,25 @@ pub fn blob_at(repo: &Path, sha: &str, path: &str) -> Option<Vec<u8>> {
         .arg("-C")
         .arg(repo)
         .args(["cat-file", "blob", &format!("{sha}:{path}")])
+        .output()
+        .ok()?;
+    output.status.success().then_some(output.stdout)
+}
+
+/// The content of a path as it would appear in the **worktree** — the committed
+/// blob with git's content filters (CRLF conversion, `text=auto`) applied on
+/// the way out.
+///
+/// The strict arm of the link rule compares the committed blob against a hash
+/// of the bytes the agent wrote into the worktree. On a repository that
+/// normalises line endings, those two are legitimately different byte strings
+/// for the same content: the agent wrote CRLF, the blob stores LF. Comparing
+/// against the checkout form closes that gap without weakening the rule.
+pub fn blob_at_filtered(repo: &Path, sha: &str, path: &str) -> Option<Vec<u8>> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["cat-file", "--filters", &format!("{sha}:{path}")])
         .output()
         .ok()?;
     output.status.success().then_some(output.stdout)
@@ -738,10 +869,107 @@ mod tests {
         repo.commit_all("initial");
         repo.write("a.rs", "one\ntwo\n");
         let before = repo.commit_all("add two");
-        assert!(is_reachable(repo.path(), &before));
+        assert!(is_reachable(repo.path(), &before).unwrap());
 
         repo.git(&["reset", "--hard", "HEAD~1"]);
-        assert!(!is_reachable(repo.path(), &before));
+        assert!(!is_reachable(repo.path(), &before).unwrap());
+    }
+
+    #[test]
+    fn a_commit_kept_alive_only_by_a_tag_is_still_reachable() {
+        // A tagged release whose branch was rewritten away is permanently
+        // reachable; calling it unreachable would orphan its Checkpoint over a
+        // commit that is very much still in history.
+        let repo = TestRepo::new();
+        repo.write("a.rs", "one\n");
+        repo.commit_all("initial");
+        repo.write("a.rs", "one\ntwo\n");
+        let tagged = repo.commit_all("add two");
+        repo.git(&["tag", "v1.0"]);
+        repo.git(&["reset", "--hard", "HEAD~1"]);
+
+        assert!(is_reachable(repo.path(), &tagged).unwrap());
+    }
+
+    #[test]
+    fn commit_info_carries_the_committer_time() {
+        let repo = TestRepo::new();
+        repo.write("a.rs", "one\n");
+        let sha = repo.commit_all("initial");
+        let info = commit_info(repo.path(), &sha).unwrap();
+        // A real recent timestamp, not the parse-failure epoch fallback.
+        assert!(info.commit_time > 1_500_000_000, "got {}", info.commit_time);
+    }
+
+    #[test]
+    fn merge_side_commits_returns_the_side_branchs_commits_oldest_first() {
+        let repo = TestRepo::new();
+        repo.write("base.rs", "base");
+        repo.commit_all("initial");
+
+        repo.git(&["checkout", "-b", "side"]);
+        repo.write("side1.rs", "one");
+        let side1 = repo.commit_all("side one");
+        repo.write("side2.rs", "two");
+        let side2 = repo.commit_all("side two");
+
+        repo.git(&["checkout", "main"]);
+        repo.write("main.rs", "main");
+        repo.commit_all("main work");
+        repo.git(&["merge", "--no-ff", "side", "-m", "merge side"]);
+        let merge = head_commit(repo.path()).unwrap();
+
+        let info = commit_info(repo.path(), &merge).unwrap();
+        let sides =
+            merge_side_commits(repo.path(), &info.parents[0], &info.parents[1], 200).unwrap();
+        assert_eq!(sides, vec![side1, side2]);
+    }
+
+    #[test]
+    fn a_rewrite_in_a_linked_worktree_is_detected_through_the_resolved_gitdir() {
+        // A linked worktree's rebase markers live under the private gitdir
+        // (`.git/worktrees/<name>/`), not under `.git/` — the naive join never
+        // sees them, and deferral would silently not happen mid-rebase.
+        let repo = TestRepo::new();
+        repo.write("a.rs", "one\n");
+        repo.commit_all("initial");
+
+        let wt_parent = tempfile::tempdir().unwrap();
+        let wt = wt_parent.path().join("linked");
+        repo.git(&["worktree", "add", wt.to_str().unwrap()]);
+        assert!(!rewrite_in_progress(&wt));
+
+        let marker = run(&wt, &["rev-parse", "--git-path", "rebase-merge"]).unwrap();
+        let marker = marker.trim();
+        let marker_path = if Path::new(marker).is_absolute() {
+            Path::new(marker).to_path_buf()
+        } else {
+            wt.join(marker)
+        };
+        std::fs::create_dir_all(&marker_path).unwrap();
+
+        assert!(rewrite_in_progress(&wt), "the worktree's own markers must count");
+        assert!(!rewrite_in_progress(repo.path()), "the main worktree is not rebasing");
+    }
+
+    #[test]
+    fn a_filtered_blob_read_applies_the_checkout_conversion() {
+        let repo = TestRepo::new();
+        repo.write(".gitattributes", "*.txt text eol=crlf\n");
+        repo.commit_all("attributes");
+        repo.write("notes.txt", "one\r\ntwo\r\n");
+        let sha = repo.commit_all("notes");
+
+        // The blob itself is normalised to LF at commit…
+        assert_eq!(
+            blob_at(repo.path(), &sha, "notes.txt").as_deref(),
+            Some(b"one\ntwo\n".as_slice())
+        );
+        // …and the filtered read returns the worktree (checkout) form.
+        assert_eq!(
+            blob_at_filtered(repo.path(), &sha, "notes.txt").as_deref(),
+            Some(b"one\r\ntwo\r\n".as_slice())
+        );
     }
 
     #[test]

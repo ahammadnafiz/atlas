@@ -32,6 +32,7 @@ fn assistant(turn_seq: i64, body: &str) -> TurnContent {
         role: Role::Assistant,
         mode: Mode::Text,
         body: body.to_string(),
+        created_at: None,
     }
 }
 

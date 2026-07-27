@@ -572,6 +572,205 @@ fn orphaned_is_a_queryable_state_that_retains_its_session_link() {
     assert!(store.session(&session).unwrap().is_some());
 }
 
+// ── The production sequence: walk, then reconcile ───────────────────────────
+//
+// The watcher job runs `walk_new_commits` first and `reconcile_rewrites`
+// second on every git event. The tests above drive reconcile in isolation;
+// these drive the sequence production actually uses, where the walk sees the
+// rewritten commits *before* reconciliation looks at the stale rows — the
+// ordering that used to wedge reconciliation on a UNIQUE collision (amend) and
+// re-attach orphans to the squashed commit (squash).
+
+/// One watcher event, as production orders it.
+fn git_event(fixture: &Fixture, store: &Store) -> atlas_checkpoint::ReconcileOutcome {
+    fixture.walk(store);
+    fixture.reconcile(store)
+}
+
+#[test]
+fn the_production_sequence_survives_an_amend() {
+    let fixture = Fixture::new();
+    fixture.write("src/lib.rs", "original\n");
+    fixture.commit_all("initial");
+    let mut store = fixture.store();
+    fixture.walk(&store);
+
+    let session = agent_commit(&fixture, &mut store, "s1", "src/lib.rs", "agent\n", "agent change");
+    fixture.git(&["commit", "--amend", "-m", "amended"]);
+    let new_sha = fixture.git(&["rev-parse", "HEAD"]).trim().to_string();
+
+    let outcome = git_event(&fixture, &store);
+    assert_eq!(outcome.relinked, 1);
+    assert_eq!(outcome.orphaned, 0);
+    assert_eq!(outcome.failed, 0);
+
+    // Exactly one Checkpoint, Linked, at the new sha — no duplicate row from
+    // the walk, no stale row wedged at the rewritten-away sha.
+    let after = only_checkpoint(&store, &session);
+    assert_eq!(after.commit_sha, new_sha);
+    assert_eq!(after.link_state, LinkState::Linked);
+
+    // And the next events are no-ops: the sequence is idempotent.
+    for _ in 0..3 {
+        let again = git_event(&fixture, &store);
+        assert_eq!((again.relinked, again.orphaned, again.recovered, again.failed), (0, 0, 0, 0));
+    }
+    assert_eq!(only_checkpoint(&store, &session).commit_sha, new_sha);
+}
+
+#[test]
+fn reconcile_before_walk_also_survives_an_amend() {
+    // The other ordering must hold too — the fix cannot depend on which half
+    // runs first.
+    let fixture = Fixture::new();
+    fixture.write("src/lib.rs", "original\n");
+    fixture.commit_all("initial");
+    let mut store = fixture.store();
+    fixture.walk(&store);
+
+    let session = agent_commit(&fixture, &mut store, "s1", "src/lib.rs", "agent\n", "agent change");
+    fixture.git(&["commit", "--amend", "-m", "amended"]);
+    let new_sha = fixture.git(&["rev-parse", "HEAD"]).trim().to_string();
+
+    assert_eq!(fixture.reconcile(&store).relinked, 1);
+    fixture.walk(&store);
+
+    let after = only_checkpoint(&store, &session);
+    assert_eq!(after.commit_sha, new_sha);
+    assert_eq!(after.link_state, LinkState::Linked);
+}
+
+#[test]
+fn the_production_sequence_survives_a_rebase() {
+    let fixture = Fixture::new();
+    fixture.write("base.rs", "base\n");
+    fixture.commit_all("initial");
+    let mut store = fixture.store();
+    fixture.walk(&store);
+
+    fixture.git(&["checkout", "-b", "feature"]);
+    let session = agent_commit(&fixture, &mut store, "s1", "src/lib.rs", "agent\n", "agent work");
+
+    fixture.git(&["checkout", "main"]);
+    fixture.write("other.rs", "other\n");
+    fixture.commit_all("unrelated work on main");
+    fixture.git(&["checkout", "feature"]);
+    fixture.git(&["rebase", "main"]);
+    let new_sha = fixture.git(&["rev-parse", "HEAD"]).trim().to_string();
+
+    let outcome = git_event(&fixture, &store);
+    assert_eq!(outcome.relinked, 1);
+    assert_eq!(outcome.failed, 0);
+
+    let after = only_checkpoint(&store, &session);
+    assert_eq!(after.commit_sha, new_sha);
+    assert_eq!(after.link_state, LinkState::Linked);
+
+    let again = git_event(&fixture, &store);
+    assert_eq!((again.relinked, again.orphaned, again.recovered, again.failed), (0, 0, 0, 0));
+    assert_eq!(only_checkpoint(&store, &session).commit_sha, new_sha);
+}
+
+#[test]
+fn the_production_sequence_orphans_a_squash_without_reattaching() {
+    // ATL-84: squashing marks the affected Checkpoints orphaned *rather than
+    // attaching them all to the squashed commit*. The walk sees the squashed
+    // commit first; touch consumption is what stops it from confidently
+    // re-linking every Session whose paths the squash carries.
+    let fixture = Fixture::new();
+    fixture.write("src/lib.rs", "original\n");
+    fixture.commit_all("initial");
+    let mut store = fixture.store();
+    fixture.walk(&store);
+
+    let first = agent_commit(&fixture, &mut store, "s1", "src/one.rs", "step one\n", "one");
+    let second = agent_commit(&fixture, &mut store, "s2", "src/two.rs", "step two\n", "two");
+
+    fixture.git(&["reset", "--soft", "HEAD~2"]);
+    fixture.git(&["commit", "-m", "squashed"]);
+    let squashed = fixture.git(&["rev-parse", "HEAD"]).trim().to_string();
+
+    let outcome = git_event(&fixture, &store);
+    assert_eq!(outcome.relinked, 0);
+    assert_eq!(outcome.orphaned, 2);
+    assert_eq!(outcome.failed, 0);
+
+    for session in [&first, &second] {
+        let checkpoint = only_checkpoint(&store, session);
+        assert_eq!(checkpoint.link_state, LinkState::Orphaned);
+        assert_eq!(&checkpoint.session_id, session);
+    }
+    assert!(
+        store.checkpoints_for_commit(&squashed).unwrap().is_empty(),
+        "nothing may confidently attach to the squashed commit"
+    );
+
+    // Repeated events change nothing.
+    let again = git_event(&fixture, &store);
+    assert_eq!((again.relinked, again.orphaned, again.recovered, again.failed), (0, 0, 0, 0));
+    assert!(store.checkpoints_for_commit(&squashed).unwrap().is_empty());
+}
+
+#[test]
+fn a_commit_kept_alive_only_by_a_tag_is_not_orphaned() {
+    // A tagged release whose branch moved on is permanently reachable — via
+    // the tag. Orphaning it would be false.
+    let fixture = Fixture::new();
+    fixture.write("src/lib.rs", "original\n");
+    fixture.commit_all("initial");
+    let mut store = fixture.store();
+    fixture.walk(&store);
+
+    let session = agent_commit(&fixture, &mut store, "s1", "src/lib.rs", "agent\n", "agent change");
+    fixture.git(&["tag", "v1.0"]);
+    fixture.git(&["reset", "--hard", "HEAD~1"]);
+
+    let outcome = git_event(&fixture, &store);
+    assert_eq!(outcome.orphaned, 0);
+    assert_eq!(only_checkpoint(&store, &session).link_state, LinkState::Linked);
+}
+
+#[test]
+fn a_mass_orphan_writes_a_reconcile_note_and_a_clean_pass_zeroes_it() {
+    // ATL-84: a history-wide rewrite surfaces one summary through the
+    // capture-health signal — persisted, not just logged.
+    let fixture = Fixture::new();
+    fixture.write("seed.rs", "seed\n");
+    fixture.commit_all("initial");
+    let mut store = fixture.store();
+    fixture.walk(&store);
+
+    for i in 0..6 {
+        agent_commit(
+            &fixture,
+            &mut store,
+            &format!("s{i}"),
+            "src/lib.rs",
+            &format!("agent step {i}\n"),
+            &format!("step {i}"),
+        );
+    }
+    fixture.git(&["reset", "--soft", "HEAD~6"]);
+    fixture.git(&["commit", "-m", "one commit to rule them all"]);
+
+    let outcome = git_event(&fixture, &store);
+    assert!(outcome.is_mass_orphan());
+
+    let note = store.reconcile_note(WORKSPACE).unwrap().expect("a persisted note");
+    let parsed: serde_json::Value = serde_json::from_str(&note).unwrap();
+    assert_eq!(parsed["orphaned"], 6);
+    assert_eq!(parsed["failed"], 0);
+    assert!(parsed["at"].is_string());
+
+    // The next, clean pass resets the note: the signal is current state, not
+    // history — an alarm that never clears is an alarm nobody reads.
+    let again = git_event(&fixture, &store);
+    assert_eq!(again.orphaned, 0);
+    let note = store.reconcile_note(WORKSPACE).unwrap().expect("still present, zeroed");
+    let parsed: serde_json::Value = serde_json::from_str(&note).unwrap();
+    assert_eq!(parsed["orphaned"], 0);
+}
+
 #[test]
 fn reconciliation_does_not_noticeably_slow_a_repository_with_a_long_history() {
     let fixture = Fixture::new();
