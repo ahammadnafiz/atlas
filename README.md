@@ -1,368 +1,188 @@
+<!-- #todo BANNER: replace with a wide product banner (1584x396 works well) -->
+![Atlas](landing/og-image.png)
+
+<div align="center">
+
+[![Discord](https://img.shields.io/badge/Discord-Join%20Server-5865F2.svg?style=for-the-badge&logo=discord&logoColor=white)](https://discord.gg/GmnFggaPfP)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg?style=for-the-badge)](LICENSE)
+[![Latest release](https://img.shields.io/github/v/release/pacifio/atlas?include_prereleases&label=Release&style=for-the-badge)](https://github.com/pacifio/atlas/releases)
+[![Contributors](https://img.shields.io/github/contributors/pacifio/atlas?style=for-the-badge)](https://github.com/pacifio/atlas/graphs/contributors)
+
+**[Download](https://github.com/pacifio/atlas/releases)** · **[Discord](https://discord.gg/GmnFggaPfP)** · **[Docs](https://cersei.tryatlas.cc/docs)** · **[Roadmap](#roadmap)**
+
+</div>
+
 # Atlas
 
-A native desktop second-brain for code and research — built on Tauri v2, React 19, and Rust.
+<!-- #todo one-liner not settled — three candidates on the table -->
 
-Atlas wraps a code editor, a multi-session AI chat (with first-class Claude Code agent integration), a Git client with a real commit graph, a paged file explorer, a PTY terminal, a research/knowledge layer, an infinite spatial canvas for notes, and a unified activity log into one application. Everything is local-first: project state lives in `.atlas/` next to the code, global state lives in `~/.atlas/`.
+Atlas is version control for coding agents. Run **Claude Code**, **Codex**, and Atlas's own native agent side by side on the same codebase, with shared memory between them and a searchable history of what each one changed.
 
-> Status: pre-1.0. Targets macOS for now; Linux/Windows are reachable from the same Tauri build but untested.
+<!-- #todo six bullets is one too many — "Semantic recall" overlaps "One memory, three agents" -->
 
----
+- **Run agents in parallel.** Multiple sessions across tabs, each streaming independently. Switching tabs never freezes or drops a run in flight.
+- **One memory, three agents.** A decision Claude Code made shows up in Codex's next prompt. Plans, file changes, failures, and architecture notes are shared automatically.
+- **Semantic recall on every turn.** Your message is embedded on-device and matched against the project index, so relevant history is pulled into context without you re-explaining it.
+- **Your notes are agent context.** Markdown in `.atlas/knowledge/`, plus the `CLAUDE.md` and `AGENTS.md` you already wrote, feed every agent in the project.
+- **`@` anything into a prompt.** Files, folders, symbols, branches, commits, notes, papers, and past sessions resolve locally before the prompt is sent.
+- **Local by default.** Code, notes, and sessions stay on your machine. Sign in and create an organisation when you want to sync across a team.
+
+**[Join the Discord](https://discord.gg/GmnFggaPfP)** · `#general` chat · `#dev` build questions · `#feature-requests` ideas · `#bugs` report breakage
+
+## Download
+
+Grab the latest `.dmg` from [tryatlas.cc](https://www.tryatlas.cc/) or the [releases page](https://github.com/pacifio/atlas/releases). macOS is the supported platform.
+
+<!-- #todo homebrew tap so this becomes `brew install atlas` -->
+
+Prefer to compile it yourself? See [Build from source](#build-from-source).
 
 ## Table of contents
 
+- [Download](#download)
 - [Why Atlas](#why-atlas)
+- [How it works](#how-it-works)
 - [Features](#features)
-- [Accounts and privacy](#accounts-and-privacy)
-- [Getting started](#getting-started)
-- [Architecture](#architecture)
-  - [High-level layout](#high-level-layout)
-  - [Frontend (React + Zustand)](#frontend-react--zustand)
-  - [Backend (Tauri + Rust)](#backend-tauri--rust)
-  - [Agent integration (ACP)](#agent-integration-acp)
-  - [State, persistence, and IPC](#state-persistence-and-ipc)
-- [Project structure](#project-structure)
+- [Build from source](#build-from-source)
 - [Contributing](#contributing)
-
----
+- [Roadmap](#roadmap)
+- [Local by default](#local-by-default)
+- [Links](#links)
 
 ## Why Atlas
 
-Most "AI IDEs" today are forks of VS Code with a chat pane bolted on. Atlas is the opposite: a small, opinionated shell that treats the AI agent and your own thinking as equal first-class citizens, alongside the editor and terminal. The goal is a tool that an individual researcher / engineer can keep open all day and trust with project context — not a hosted product, not a fork.
+<!-- #todo bullets to be refined in a later pass -->
 
-Concretely:
+- **Agents start from zero every session.** Atlas keeps a persistent, on-device memory of decisions, plans, and changes, and pushes the relevant parts into each new turn.
+- **Switching agents loses everything.** In Atlas, the first message of a new session carries a curated fact pack plus the tail of your last session — including one from a different agent.
+- **You can't review what you can't see.** Every session is stored and searchable, alongside a real commit graph and file-level diffs of what actually landed.
+- **Context lives in ten places.** The knowledge base, `CLAUDE.md`, `AGENTS.md`, Claude Code's own memory files, and Codex's history are folded into one index every agent reads from.
+- **Nothing is locked in.** Notes are markdown, canvases are JSON, sessions are JSONL, and the editor is a file on disk. Close Atlas and pick up in vim.
+- **Built for agents, not adapted for them.** Atlas is not a fork of an existing editor with a chat pane added. It is what an IDE looks like when agents are the primary user.
 
-- **The agent is plural.** Multiple Claude Code sessions run concurrently, each with its own thread history and stop button. Switching tabs never freezes a running stream.
-- **State is just files.** No SQLite, no proprietary format. Chat history is JSONL on disk (read directly by Claude Code's own resume flag), notes are markdown, canvases are JSON.
-- **Local-first.** Your projects, notes, chat history, and memory live on your machine and are never uploaded. Atlas does talk to the network — the model providers you point it at, the research and GitHub features you invoke, an update check, and anonymous usage data you can switch off — but none of that carries your content. See [Accounts and privacy](#accounts-and-privacy).
-- **The account is optional.** Atlas has an Atlas account you can connect to (see [Accounts and privacy](#accounts-and-privacy)), but nothing is gated behind it. Signed out, every feature works exactly as it does signed in.
+## How it works
 
----
+Atlas runs Claude Code and Codex as they are, and enriches what they see.
+
+Both run as external subprocesses over [ACP](https://github.com/zed-industries/agent-client-protocol). The Atlas agent runs in-process on [Cersei](https://cersei.tryatlas.cc/docs), our Rust agent framework. All three go through the same send path, so everything below applies whichever one you pick.
+
+Before your message reaches the agent, Atlas assembles context around it:
+
+| Injected | Where it comes from | When |
+|---|---|---|
+| **`@` mentions** | Resolved locally in Rust before the prompt is sent. Notes, skills, papers, and past sessions are inlined; files and folders resolve to a path | Every turn |
+| **Shared agent memory** | Active plan, decisions, file changes, failures, and architecture notes, written by any agent | Every turn |
+| **Semantic matches** | Your message is embedded on-device and matched against the project's memory index | Every turn |
+| **Session handoff** | A curated fact pack plus the tail of your last session in this project, including one from a different agent | First message |
+| **What you already wrote** | Knowledge notes, `CLAUDE.md`, `AGENTS.md`, Claude Code's memory files, and Codex's history, folded into one index | Continuously |
+
+- **One path, no per-agent special-casing.** Run your existing Claude Code or Codex subscription through Atlas and the session gets more context, with no change to how you work.
+- **Claude Code's memory is visible to Codex, and the reverse.** Neither agent can read the other's history on its own.
+- **Folders resolve to a pointer, not a paste.** `@`-ing a 5000-line file sends a path the agent reads on demand, so one mention doesn't occupy the context window for the rest of the session.
+- **Embedding runs on your machine.** Retrieval never leaves the device.
 
 ## Features
 
-| Area | What's there |
-|------|--------------|
-| **Chat / Agent** | Multi-session, multi-agent chat over [ACP (Agent Client Protocol)](https://github.com/zed-industries/agent-client-protocol). First-class support for Claude Code; the same transport plugs into any other ACP-speaking agent. Stop-button, message queue, permission-mode cycling (⇧⇥), tri-state send button (send / queue / stop), per-tab session sidebar, bash-call history panel, in-chat search (⌘F). Tool-permission / question prompts render as an inline card with numbered, keyboard-selectable options (1–9 / Enter / Esc) plus a free-text "tell the agent what to do instead". Assistant markdown is highlighted off the main thread in a Web Worker so long answers never block the composer. |
-| **Editor** | CodeMirror 6 with language support for JS/TS, Python, Rust, Go, Java, C++, JSON, YAML, Markdown, SQL, CSS, HTML, XML. Cmd+S writes to disk and emits an editor save event picked up by the log. |
-| **Terminal** | Block terminal: a zsh OSC-133 shell-integration PTY (Rust `portable-pty`) rendered as a React list of command blocks (command + output + exit code + duration), with an embedded xterm.js surface for alt-screen apps (vim/htop/less). Per-tab + tab-strip running indicators, inline masked password entry for `sudo`/`ssh` prompts, a live cwd + git-status badge, `clear` clears the block list, `sudo -s`/`-i`/`su` relaunch with shell integration preserved, and large outputs (e.g. `tree /`) are render-throttled so the UI stays responsive. |
-| **Browser** | Real in-app web browsing on a native WebKit child webview (full JS, cookies, logins) embedded in a tab, plus an "open as window" mode. Omnibox that treats input as a URL or a Google search, and a per-page **Reader** toggle that renders a clean, sanitized view of the current page. |
-| **Split view** | The center panel splits into up to **3 resizable columns**, each with its own tab strip — e.g. Agent chat │ Knowledge │ Browser side-by-side. A given module lives in one column (opening it again focuses the existing one). ⌘\ split right, ⌥;/⌥' move focus, ⌥W close split. **Zen mode** (⌥Z) snaps to a Knowledge │ Chat │ Browser 3-column layout with the side panels hidden, and restores the previous layout on the next ⌥Z. Layout persists per project. |
-| **Git** | Real commit graph (custom SVG lane-assignment), stage/unstage/commit, branch list with checkout / create / delete, file-level diff. |
-| **Explorer** | Paged file tree with lazy directory expansion. |
-| **GitHub** | Search public repos, clone into a managed directory, browse cloned READMEs, delete clones. |
-| **Research** | arXiv + Semantic Scholar search, PDF download, "save to knowledge base" pipeline. |
-| **Knowledge** | Markdown notes with subdirectories, an interactions log appended to per-project JSONL, surfaced as system-prompt context to the chat model. |
-| **Canvas (Spaces)** | Infinite ReactFlow board for spatial note-taking with edges between nodes. |
-| **Log** | Global ring-buffered activity log (500 events) with pinned-rows-survive-restart, TanStack Table view, source/project filtering, per-row JSON expand. |
-| **Project** | Open / close project, project picker, per-project state in `.atlas/`. |
-| **Monitor** | Token-usage tracker per provider/model. |
-| **Tasks** | Lightweight task list driven by agent plans. |
-| **Account** | Optional sign-in to an Atlas account via the OAuth 2.0 device grant — click the title-bar avatar, approve in your browser. Shows who is signed in, the Organisation this device acts for and your role in it, and an account menu that doubles as the entry point to Settings. Nothing is gated behind it. |
-| **Settings** | Provider / model / API key, theme tokens, keyboard shortcuts. |
+### Agents
 
----
+| Capability | Description |
+|---|---|
+| **Multi-agent sessions** | Claude Code, Codex, and Atlas's native agent, selectable per session and running in parallel across tabs. Sessions are independent of tabs, so switching never drops a run in flight |
+| **Shared agent memory** | On-device semantic index (local embeddings, HNSW search) that every agent reads from and writes to |
+| **`@` mentions** | Local resolution of files, folders, symbols, branches, commits, notes, skills, papers, and past sessions |
+| **Skills** | `SKILL.md` files scoped globally or per project, enabled per agent by symlinking into that agent's own skills directory |
+| **Packs** | Install a GitHub repo of skills, subagents, commands, hooks, rules, and scripts, discovered through the skills.sh index |
+| **Model chat** | Talk to a model directly in its own tab, with no agent loop around it |
+| **Organisations** | Sign in, create an organisation, and sync across devices and teammates |
 
-## Accounts and privacy
+### Agent history
 
-Atlas used to have no account and no server. It now has both, and this section says exactly what that does and does not mean.
+| Capability | Description |
+|---|---|
+| **Session capture** | Every session recorded to `.atlas/sessions.db`: prompts, messages, tool calls, the files each one touched, and the patches it applied |
+| **Checkpoints** | Each session linked to the commits it produced. Commits are observed rather than intercepted, so one made from a terminal, from another editor, or while Atlas was closed still finds its session |
+| **Survives history rewrites** | Links re-point through amend and rebase by patch-id reconciliation. When a squash makes the link genuinely ambiguous, it orphans instead of guessing |
+| **Transcript import** | Backfills your existing Claude Code history, so the record starts before you installed Atlas |
+| **Secrets scrubbed on write** | Redaction runs before anything is persisted, so the local store is never itself a disclosure risk |
+| **Capture health** | One signal per workspace, OK, Degraded, or Stopped, each with a reason and the next step |
+| **Mission control** | Dashboard for agent activity: usage over time, consumption breakdown, timelines, and a filterable log table |
 
-**Signing in is optional and purely additive.** Every feature in the table above works signed out, and none of them changes behaviour when you sign in. There is no paid tier, no gated feature, and no plan. If you never click the avatar, Atlas talks to no Atlas server at all.
+Works with no account and no network.
 
-**Signing in does not upload anything.** No code, chat history, notes, knowledge, memory, or file paths leave your machine as a result of connecting an account. What sign-in currently buys you is identity — your photo in the title bar, your name, Organisation and role in the account menu — and the foundation for sync work that has not shipped yet. When it does, it will be its own opt-in with its own consent, not a silent consequence of having signed in once.
+### The workspace
 
-**The credential stays in Rust.** The session token never crosses into the renderer, is never written to a log, and lives in a `0600` file in the app config directory. Signing out deletes it immediately and unconditionally, before the server is contacted at all — so it works with the network off.
+| Capability | Description |
+|---|---|
+| **Editor** | CodeMirror editing surface, with per-project editor state restored across restarts |
+| **Git** | Real commit graph with lane assignment, stage/unstage/commit, branch operations, and file-level diffs |
+| **Terminal** | Block terminal where each command carries its own output, exit code, and duration, plus a full interactive surface for `vim`, `htop`, and friends |
+| **Knowledge base** | Plain markdown notes in `.atlas/knowledge/`, versioned next to the code, with backlinks, a link graph, and export to HTML or a standalone server binary |
+| **Research** | Search arXiv and Semantic Scholar, pull papers in, read them in-app, and `@`-mention them into a prompt |
+| **Browser** | Native WebKit webview in a tab, with real logins, cookies, and a reader mode |
+| **Spaces** | Spatial board for notes and their connections, persisted as JSON in the project |
+| **Split view** | Up to three resizable columns, each with its own tabs |
+| **Activity log** | Every significant event in the project, filterable, with rows you can pin across restarts |
 
-**Telemetry is anonymous, and stays anonymous after you sign in.** Atlas sends coarse usage and crash metadata to PostHog under a random install id, behind **Settings → General → "Share anonymous usage data"**. It defaults on and can be turned off at any time. Signing in does **not** link that id to your account — there is no `identify` and no `alias` call in the app, and the sign-in and sign-out events carry no user id, email, or Organisation id. An install that has opted out sends nothing extra as a result of signing in.
+## Build from source
 
-Prompts, code, file paths, notes, terminal I/O, browser URLs, and API keys are never collected. The complete event catalogue and the full never-collected list are in **[TELEMETRY.md](TELEMETRY.md)**.
+Linux and Windows build from the same Tauri codebase but are untested.
 
-**The update check is separate.** Atlas asks for the latest version on launch, independently of the telemetry toggle, because an app that stops learning about security updates when you decline analytics is a worse deal than the one you thought you were making. It has its own switch: **Settings → Updates → "Automatic updates"**.
+To use the Claude Code agent, install the `claude` CLI and put it on your `PATH`. Atlas's native agent needs no external CLI.
 
----
-
-## Getting started
-
-### Prerequisites
-
-- **Node.js 20+** and a package manager (`pnpm`, `npm`, or `bun` — `bun` is the one wired into `tauri.conf.json` by default).
-- **Rust toolchain** (stable). Install via [rustup](https://rustup.rs/).
-- **Tauri prerequisites** for your OS. See the [Tauri prerequisites guide](https://tauri.app/start/prerequisites/). On macOS this is just Xcode Command Line Tools.
-- **(Optional) Claude Code CLI** if you want the agent. Install per Anthropic's instructions and make sure `claude` is on your `PATH`.
-
-### Install and run in dev
+Requires **[Bun](https://bun.sh/)**, **Rust** (stable, via [rustup](https://rustup.rs/)), and **Xcode Command Line Tools**.
 
 ```bash
 git clone https://github.com/pacifio/atlas
 cd atlas
-
-# Install JS dependencies — pick one
-pnpm install
-# or: npm install
-# or: bun install
-
-# Start the desktop app in dev mode (hot-reload frontend, recompiles Rust on change)
-npm run dev:app
+bun install
+bun run dev:app
 ```
 
-The first Rust compile takes a few minutes; subsequent runs are seconds.
+The first Rust compile takes a few minutes; after that it is seconds. Use `bun run dev` for frontend-only iteration, though anything calling `invoke()` needs `dev:app`.
 
-### Build a production .app
+Production builds:
 
 ```bash
-# macOS .app bundle
-npm run build:app
-
-# .app + .dmg installer
-npm run build:app:dmg
+bun run build:app       # .app bundle
+bun run build:app:dmg   # .app + .dmg installer
 ```
-
-The bundled app lands under `src-tauri/target/release/bundle/macos/Atlas.app`. The bundle augments the GUI process `PATH` at runtime (login-shell init) so `claude`, `git`, `bun`, etc. resolve the same way they do in your terminal — even though macOS otherwise strips `PATH` from GUI launches.
-
-### Available scripts
-
-| Script | What it does |
-|--------|--------------|
-| `npm run dev` | Vite dev server only (no Tauri shell). For quick frontend iteration. |
-| `npm run dev:app` | Full Tauri dev — Rust backend + Vite frontend + hot-reload. |
-| `npm run build` | Type-check + production Vite build to `dist/`. |
-| `npm run build:app` | `.app` bundle. |
-| `npm run build:app:dmg` | `.app` + `.dmg`. |
-| `npm run preview` | Preview the static Vite build in a browser. |
-| `npm run lint` | ESLint on `src/`. |
-| `npm run format` | Prettier on `src/`. |
-
----
-
-## Architecture
-
-### High-level layout
-
-```
-┌──────────────────────────────────────────────────────────────────┐
-│                         Atlas (Tauri shell)                      │
-│                                                                  │
-│  ┌────────────────────────────┐    ┌──────────────────────────┐  │
-│  │  React 19 frontend         │    │  Rust backend            │  │
-│  │  (WKWebView on macOS)      │◀──▶│  (tokio + tauri 2)       │  │
-│  │                            │ IPC│                          │  │
-│  │  • Zustand stores          │    │  • commands/ — IPC verbs │  │
-│  │  • CodeMirror, xterm,      │    │  • atlas-acp (JSON-RPC)  │  │
-│  │    Tiptap, Pixi, TanStack  │    │  • atlas-agents (sessions│  │
-│  │  • Tailwind v4             │    │  • atlas-terminal (PTY)  │  │
-│  │                            │    │  • spawn_blocking I/O    │  │
-│  └────────────────────────────┘    └──────────────────────────┘  │
-│                                                                  │
-│  Persistence:                                                    │
-│  • Per-project: <project>/.atlas/ (knowledge, canvas, log,       │
-│    editor state, interactions.jsonl)                             │
-│  • Global:      ~/.atlas/        (pinned log, GitHub clones)     │
-│  • Claude Code: ~/.claude/projects/<project-slug>/*.jsonl        │
-└──────────────────────────────────────────────────────────────────┘
-```
-
-### Frontend (React + Zustand)
-
-`src/` is organised by **feature**, not by file type. Each feature is a self-contained slice:
-
-```
-src/features/<feature>/
-  components/   — React components
-  stores/       — Zustand store(s) for this feature
-  lib/          — Pure helpers (parsers, formatters, IPC wrappers)
-```
-
-State management uses **Zustand + Immer** with a shared `createSelectors` helper (`src/lib/create-selectors.ts`) that auto-generates `useStore.use.x()` selectors. Stores never call other stores directly; cross-feature coordination happens by reading via `getState()` at action boundaries or by listening for `window.dispatchEvent(new CustomEvent("atlas:..."))` events.
-
-Key feature stores and their responsibilities:
-
-- `chat/stores/chat-store.ts` — per-tab UI state (queues, draft, scroll). The authoritative session state (messages, tool calls, status) lives in Rust under `atlas-agents`; the store only mirrors deltas streamed over the `atlas:agents` event channel. See [the agent integration section](#agent-integration-acp).
-- `project/stores/project-store.ts` — current project, recent projects, project metadata.
-- `editor/stores/editor-store.ts` — open files, dirty flags. **CodeMirror owns the document text** — the store only holds metadata so editor performance doesn't degrade with file size.
-- `git/stores/git-store.ts` — branch, status, commits, lane-assigned graph.
-- `terminal/stores/terminal-store.ts` — split layout. The terminal backend buffer is the source of truth for bytes, not the store.
-- `layout/stores/layout-store.ts` — tab system (`addTab`, `closeTab`, dedupe rules per tab type) and the center-panel **split columns** (`groupOrder` ≤ 3, per-column active tab, focused column); `activeTabId` is a maintained mirror of the focused column's active tab so existing readers don't need to know about splits.
-- `log/stores/log-store.ts` — ring-buffered event log (500 in memory) + on-disk pinned entries.
-- `knowledge/stores/knowledge-store.ts` — notes, directories, interaction log.
-- `canvas/stores/canvas-store.ts` — ReactFlow nodes + edges, persisted JSON.
-- `monitor/stores/usage-store.ts` — token-usage counters per provider/model.
-- `analysis/`, `browser/`, `github/`, `research/`, `settings/`, `tasks/` — their respective domains.
-
-The layout is three columns (`src/features/layout/components/app-layout.tsx`):
-
-```
-LeftPanel        CenterPanel                RightPanel
-─ Explorer       ─ Tab system               ─ Chat / Knowledge / Git
-─ Knowledge      ─ Editor, Terminal,          (whichever is active)
-─ Git / Search   ─ Canvas, Log, Analysis…
-─ GitHub         ─ each panel lazy-loaded
-```
-
-`CenterPanel.tsx` owns the tab type registry — see `src/lib/constants.ts` for `TAB_TYPES` and the lazy-import map. Adding a new panel type is: lazy-import in `CenterPanel`, add to `TAB_TYPES`, optionally add an entry to `NEW_TAB_OPTIONS` for the `+` menu. The center panel itself can be **split into up to three resizable columns** (`react-resizable-panels`), each a `TabColumn` with its own tab strip; each tab carries a `groupId` for which column it lives in. Persistent module types (editor, terminal, browser, knowledge-graph, pdf) stay mounted across tab switches *within their column* via `display: contents/none` so heavy state (CodeMirror, the PTY, the native webview, Pixi) isn't rebuilt.
-
-### Backend (Tauri + Rust)
-
-`src-tauri/src/` is the Tauri host process. The IPC surface is one module per domain under `src-tauri/src/commands/`:
-
-| Module | Responsibility |
-|--------|----------------|
-| `agents.rs` | ACP agent lifecycle — plugin discovery, spawn/kill, new/load session, send/cancel, model + mode switching, permission responses. Stream deltas reach the frontend via `atlas:agents` Tauri events. |
-| `claude.rs` | History readers — lists, reads, and deletes Claude Code session JSONL files in `~/.claude/projects/<slug>/`. Session spawn + streaming go through ACP (`agents.rs`), not this module. |
-| `claude_setup.rs` | Detects / installs the Claude Code CLI on the user's PATH. |
-| `terminal.rs` | PTY lifecycle (`terminal_create`, `_write`, `_resize`, `_close`) backed by the `atlas-terminal` workspace crate (`portable-pty`), which injects a zsh OSC-133 shell-integration `ZDOTDIR`. `terminal_zsh_dir` exposes that dir so the UI can relaunch a root shell (`sudo -s`) with integration intact. |
-| `browser.rs` | Native WebKit browsing — `browser_open_window` (separate browser window) and the embedded child-webview verbs (`browser_embed_create`/`_navigate`/`_back`/`_forward`/`_reload`/`_set_bounds`/`_set_visible`/`_destroy`), all sharing one persistent profile so logins survive. Nav state streams back over `atlas:browser-nav`. |
-| `fs.rs` | Directory listing, file read/write, create/rename/delete/copy/duplicate, reveal-in-Finder, open-in-terminal, gitignore appends. |
-| `git.rs` + `git_graph.rs` + `git_watcher.rs` | Status, log, diff, stage/unstage, commit, branch ops, real commit-graph lane assignment, fs-watcher for live refresh. |
-| `github.rs` | GitHub search via REST, repo clone via `git clone` into `<project>/.atlas/repos/`. |
-| `analysis.rs` | Whole-project file/line/language counts and symbol indexing. |
-| `search.rs` | Fast in-files text search. |
-| `fileindex.rs` | Cmd+P file-picker index. |
-| `mention_search.rs` | Unified `@`-mention search (files, folders, knowledge, symbols, repos, papers, …). |
-| `research.rs` + `papers.rs` | arXiv + Semantic Scholar API calls, PDF download, saved-papers index. |
-| `knowledge.rs` + `knowledge_meta.rs` + `knowledge_links.rs` + `knowledge_export.rs` | Knowledge notes CRUD, page metadata in `_meta.json`, backlinks/forward-links scanner + graph, exporters (md/html, workspace, self-contained server binary). |
-| `canvas.rs` | Read/write `.atlas/canvas.json`. |
-| `pomodoro.rs` | Read/write `.atlas/pomodoro.json` for the focus-timer feature. |
-| `log.rs` | Append-only pinned log at `~/.atlas/log/pinned.jsonl`. |
-| `app_state.rs`, `cli.rs`, `recent_files.rs`, `sessions_watch.rs`, `compose_prompt.rs`, `window.rs`, `menu.rs` | Bootstrap, `atlas <path>` CLI helper, recent files, session JSONL watcher, prompt composition for ACP sends, native window controls (zoom/title), and the native macOS menu (its ⌘W "Close Tab" item routes through the app so a focused browser webview can't tear down the window). |
-
-All long-running or blocking operations (`Command::output`, `Command::spawn` + line reads, file I/O on big trees) run inside `tokio::task::spawn_blocking` so the Tauri command runtime never blocks the UI's IPC channel.
-
-Workspace crates under `crates/` (all wired in from `src-tauri/Cargo.toml`):
-
-- **`atlas-acp`** — ACP (Agent Client Protocol) transport. Speaks JSON-RPC to any ACP-speaking agent binary (Claude Code today, others on the way), forwards permission prompts, tool calls, and content blocks.
-- **`atlas-agents`** — Per-session runtime: `AgentManager` owns the registry, one `SessionWorker` task per session owns the message log, queue, and stream subscribers. Emits `atlas:agents` deltas to the frontend.
-- **`atlas-terminal`** — Wraps `portable-pty` and bridges PTY bytes to Tauri events.
-- **`atlas-kb-server`** — Standalone self-contained static-server binary produced by the knowledge-base "Export server" action. Embeds the exported HTML/CSS via `include_dir!` and serves it on `localhost:4747`.
-
-### Agent integration (ACP)
-
-Atlas talks to agents over [ACP — the Agent Client Protocol](https://github.com/zed-industries/agent-client-protocol), the open JSON-RPC protocol that originated in Zed. Any binary that speaks ACP can plug in; the bundled default is the official `claude-code-acp` bridge in front of Anthropic's Claude Code CLI.
-
-The integration is split across two Rust crates and one IPC surface:
-
-**`atlas-acp`** — the transport. It spawns the agent binary, handles the JSON-RPC framing, forwards ACP method calls (`initialize`, `newSession`, `loadSession`, `prompt`, `cancel`, `setSessionMode`, `setSessionModel`, …), and surfaces permission prompts and tool-call updates back to the host.
-
-**`atlas-agents`** — the per-session runtime that sits between ACP and the UI:
-
-- `AgentManager` owns the global registry — which agent plugins are installed, which sessions are running, which one belongs to which UI tab.
-- A `SessionWorker` task is spawned per session. It owns the canonical message log, the user's queued prompts, the run status, and the broadcast channel that fans deltas out to subscribers.
-- All session state lives here, in Rust. The frontend store is a view-only mirror.
-
-**`commands/agents.rs`** — the Tauri IPC verbs the frontend calls: `agents_list_plugins`, `agents_new_session`, `agents_load_session`, `agents_send`, `agents_cancel`, `agents_set_mode`, `agents_set_model`, `agents_respond_permission`, etc. Deltas come back over a single Tauri event channel: **`atlas:agents`**, payload-typed by `kind` (`message_appended`, `content_block_delta`, `tool_call`, `permission_request`, `status`, `error`, `done`).
-
-Two design properties matter:
-
-**1. The `acpSessionId` is the single source of truth.**
-It is both the ACP-protocol session id used on the wire *and* the filename stem under `~/.claude/projects/<slug>/<acpSessionId>.jsonl`. The frontend never splits or rewrites it — UI tabs, history rows, and the on-disk log all key off the same string.
-
-**2. Streams are tab-independent.**
-Because `SessionWorker` owns the message log in Rust and broadcasts deltas, you can fire off three concurrent Claude Code prompts in three different tabs, switch freely between them and the history sidebar, and each one keeps streaming. Switching back to a tab just resubscribes to the worker's broadcast — no in-flight state is lost.
-
-**History.** The history sidebar reads session JSONL files directly from `~/.claude/projects/<slug>/`. Resuming a past conversation is a `loadSession` ACP call against the same id.
-
-**PATH resolution.** In production builds, `claude_setup.rs` resolves `claude` via a login-shell `which` because macOS GUI apps get a stripped `PATH`. Without this, the bundled `.app` can't find any user-installed CLI.
-
-### State, persistence, and IPC
-
-**Per-project state** lives in `<project-root>/.atlas/`:
-
-```
-.atlas/
-├── knowledge/         markdown notes + subdirectories
-├── interactions.jsonl one-line summary per significant event,
-│                       fed back to the chat as system-prompt context
-├── canvas.json        ReactFlow node/edge state
-└── editor.json        workspace layout — open tabs + split-column arrangement
-```
-
-**Global state** lives in `~/.atlas/`:
-
-```
-~/.atlas/
-├── log/pinned.jsonl   pinned activity-log rows (survive restart)
-└── clones/            repos cloned via the GitHub panel
-```
-
-**Claude Code state** lives in `~/.claude/projects/<slug>/` and is read directly by Atlas — Atlas does not mirror it.
-
-**IPC** is purely Tauri's `invoke()` for commands and `listen()` for streams. All payloads are JSON. The frontend never touches the filesystem directly.
-
----
-
-## Project structure
-
-```
-atlas/
-├── src/                          React 19 frontend
-│   ├── App.tsx, main.tsx         entry points
-│   ├── features/                 one folder per feature (see above)
-│   ├── components/               cross-feature widgets
-│   ├── ui/                       shadcn-style primitives (Kbd, etc.)
-│   ├── hooks/                    shared React hooks
-│   ├── lib/                      utilities (cn, createSelectors, constants)
-│   ├── styles/globals.css        Tailwind 4 + design tokens
-│   └── types/                    shared TS types (agent.ts, etc.)
-│
-├── src-tauri/                    Tauri host (Rust)
-│   ├── src/
-│   │   ├── main.rs               binary entry
-│   │   ├── lib.rs                tauri::Builder + invoke_handler
-│   │   └── commands/             one .rs per IPC domain
-│   ├── icons/                    bundle icons
-│   ├── tauri.conf.json           bundle config, CSP, window
-│   └── Cargo.toml
-│
-├── crates/                       Rust workspace crates
-│   ├── atlas-acp                 ACP (Agent Client Protocol) transport
-│   ├── atlas-agents              per-session runtime + AgentManager
-│   ├── atlas-terminal            PTY (portable-pty)
-│   └── atlas-kb-server           self-contained KB static-server binary
-│
-├── index.html
-├── package.json
-├── vite.config.ts
-├── tsconfig.json
-├── postcss.config.js
-├── LICENSE
-├── README.md
-└── TELEMETRY.md                     event catalogue + never-collected list
-```
-
----
 
 ## Contributing
 
-Contributions are very welcome — Atlas is a one-person project and there's plenty of room for others to make it better.
+See [CONTRIBUTING.md](CONTRIBUTING.md). Two things catch people out:
 
-### Ground rules
+- **Everyone forks.** Nobody has direct push access, including the core team. Fork, branch, open a PR.
+- **Feature work targets the current version branch**, not `main`. `main` only receives a finished version branch, and that merge is the release.
 
-1. **Open an issue first** for anything bigger than a small fix. It's easier to align on direction before you write the code.
-2. **Match the existing patterns.** Feature folder, Zustand store with `createSelectors`, Tailwind classes via `cn()`, IPC verbs in a single `commands/<domain>.rs` module. If you're adding something that doesn't fit, propose the structure in the issue.
-3. **Nothing leaves the machine that isn't in [TELEMETRY.md](TELEMETRY.md).** Atlas is local-first by design. The existing telemetry is anonymous, consent-gated, and metadata-only; adding an event means adding it to that catalogue in the same PR, and anything that would send content, paths, or account identity needs its own issue first.
-4. **No new heavy dependencies without discussion.** The current dep list is intentional.
+[ARCHITECTURE.md](ARCHITECTURE.md) covers how Atlas is built. [SECURITY.md](SECURITY.md) covers reporting vulnerabilities.
 
-### Local dev loop
+## Roadmap
 
-```bash
-npm run dev:app       # full app with hot reload
-npm run lint          # ESLint
-npm run format        # Prettier
-cd src-tauri && cargo check     # quick Rust type-check
-```
+<!-- #todo roadmap wording to be worked on later -->
 
-For UI work you can sometimes get away with `npm run dev` (Vite-only, no Tauri commands), but anything that hits `invoke()` needs `dev:app`.
+- Source control for agents
+- AI gateway via Atlas accounts
+- Timeline boards covering how team members are changing code
+- Organisational agents
+- Pick up work from any device
+- Issue tracking
+- Shared documentation
 
-### Pull request checklist
+## Local by default
 
-- [ ] `npx tsc --noEmit` passes
-- [ ] `cd src-tauri && cargo check` passes
-- [ ] You've actually run the app and used the feature in a window (not just compiled it)
-- [ ] No commented-out code, no leftover `console.log` debug lines
-- [ ] No new top-level dependencies unless discussed in the issue
+- **Your code, notes, and sessions stay on your machine.** Nothing is uploaded to run an agent.
+- **Secrets are scrubbed before anything is written to disk.** Not before upload, before persistence.
+- **Accounts are opt-in.** Sign in to create an organisation and sync across devices and teammates.
+- **Anonymous usage analytics are on by default.** Coarse metadata, never code or prompts. [What's collected, and how to turn it off](TELEMETRY.md).
 
-### Areas where help is especially welcome
+## Links
 
-- Linux / Windows testing of the production bundle (terminal font, PATH resolution, GUI quirks).
-- Additional ACP agent plugins beyond Claude Code (Gemini CLI, Codex, etc.) — `atlas-acp` already speaks the wire format; mostly a matter of plugin discovery + auth flow.
-- LSP support — would slot into the editor for diagnostics / go-to-definition.
-- MCP server integration for tool-call extensibility.
-- Theme system / additional color palettes.
+- **Website:** [tryatlas.cc](https://www.tryatlas.cc/)
+- **Cersei docs:** [cersei.tryatlas.cc/docs](https://cersei.tryatlas.cc/docs)
+- **Discord:** [discord.gg/GmnFggaPfP](https://discord.gg/GmnFggaPfP)
+- **Issues:** [github.com/pacifio/atlas/issues](https://github.com/pacifio/atlas/issues)
+- **Telemetry:** [what Atlas collects, and how to turn it off](TELEMETRY.md)
+
+## License
+
+MIT. See [LICENSE](LICENSE).

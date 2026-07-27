@@ -4,7 +4,7 @@ import type { ToolCallDisplay } from "@/types/agent";
  * Recognising bash/shell tool calls is subtle because the two ingest paths
  * label them differently:
  *   - Live ACP stream (`manager.rs`): `toolName` is the ACP *title*, which for
- *     Bash is the command itself (e.g. `npm install`), and `kind` is "execute".
+ *     Bash is the command itself (e.g. `bun install`), and `kind` is "execute".
  *   - Reloaded transcript (`transcript.rs`): `toolName` is the Claude Code tool
  *     name "Bash"; `kind` is mapped to "execute" on replay.
  * So the reliable signal is `kind === "execute"`, with a tool-name fallback for
