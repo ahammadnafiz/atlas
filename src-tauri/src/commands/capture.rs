@@ -502,6 +502,52 @@ pub fn capture_health(
     .map_err(|e| e.to_string())
 }
 
+/// Every Session captured in this Workspace, newest first.
+///
+/// The whole point of the recorder. Reading is safe from any window — the
+/// writer lock guards writes only — so this deliberately does not check
+/// `is_writer`: a second Atlas window cannot record, but it can still read back
+/// what the first one did.
+#[tauri::command]
+pub fn artifacts_sessions(
+    project_path: String,
+    workspace_id: Option<String>,
+) -> Result<Vec<atlas_checkpoint::SessionSummary>, String> {
+    let store = open_store(&project_path)?;
+    let workspace_id = workspace_id.unwrap_or_else(|| project_path.clone());
+    atlas_checkpoint::session_summaries(&store, &workspace_id).map_err(|e| e.to_string())
+}
+
+/// One Session as an ordered timeline.
+///
+/// Commit subjects are resolved from git here rather than in the crate: this is
+/// the layer that knows the Workspace root, and git remains the single source of
+/// truth for a commit message rather than a copy in the store that goes stale
+/// after a reword.
+#[tauri::command]
+pub fn artifacts_session(
+    project_path: String,
+    session_id: String,
+) -> Result<Option<atlas_checkpoint::SessionDetail>, String> {
+    let root = std::path::Path::new(&project_path).to_path_buf();
+    let store = open_store(&project_path)?;
+
+    // A Session usually carries a handful of Checkpoints, but one `git show` per
+    // Checkpoint is still a process spawn each. Resolving them once up front
+    // keeps a long Session from paying that cost repeatedly.
+    let mut subjects: HashMap<String, String> = HashMap::new();
+    if atlas_checkpoint::git::is_repository(&root) {
+        for checkpoint in store.checkpoints_for_session(&session_id).map_err(|e| e.to_string())? {
+            if let Ok(info) = atlas_checkpoint::git::commit_info(&root, &checkpoint.commit_sha) {
+                subjects.insert(checkpoint.commit_sha, info.subject);
+            }
+        }
+    }
+
+    atlas_checkpoint::session_detail(&store, &session_id, |sha| subjects.get(sha).cloned())
+        .map_err(|e| e.to_string())
+}
+
 /// Is this Slug free within the Organisation?
 ///
 /// Debounced by the caller so the answer arrives while the developer is still

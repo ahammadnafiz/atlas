@@ -30,17 +30,23 @@ use crate::store::Store;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HealthState {
+    /// Not recording *by choice* — never enabled, or deliberately paused.
+    ///
+    /// Ordered below `Ok` so it can never win the worst-first sort, though in
+    /// practice `evaluate` returns it early and it never competes.
+    Off,
     /// Recording, watcher attached, store writable.
     Ok,
     /// Still recording, but something needs attention.
     Degraded,
-    /// Not recording. The reason says why.
+    /// Meant to be recording and is not. The reason says why.
     Stopped,
 }
 
 impl HealthState {
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Off => "off",
             Self::Ok => "ok",
             Self::Degraded => "degraded",
             Self::Stopped => "stopped",
@@ -102,6 +108,20 @@ pub struct HostSignals {
 /// on turn completion, on watcher events and when the drain hits a terminal
 /// error — not on a timer.
 pub fn evaluate(store: &Store, workspace_id: &str, host: HostSignals) -> Result<CaptureHealth> {
+    // A Workspace nobody enabled — or one the developer deliberately paused — is
+    // *off*, not broken. Every check below assumes capture is meant to be
+    // running, so falling through would report a missing watcher and an unheld
+    // writer lock for something nobody asked to record: three alarms for a
+    // Workspace whose only real state is "not set up yet". That turns the first
+    // thing a new user sees into an incident.
+    match store.binding()? {
+        None => return off(store, workspace_id, "Session capture is off"),
+        Some(binding) if !binding.is_capturing() => {
+            return off(store, workspace_id, "Session capture is paused")
+        }
+        Some(_) => {}
+    }
+
     let mut issues = Vec::new();
 
     // ── Stopped: not recording at all ───────────────────────────────────────
@@ -113,21 +133,6 @@ pub fn evaluate(store: &Store, workspace_id: &str, host: HostSignals) -> Result<
             next_step: "Sessions are being captured by the other window. Close it to record here."
                 .into(),
         });
-    }
-
-    match store.binding()? {
-        None => issues.push(HealthIssue {
-            state: HealthState::Stopped,
-            reason: "Session capture is not enabled for this Workspace.".into(),
-            next_step: "Enable it from the Workspace switcher.".into(),
-        }),
-        Some(binding) if !binding.is_capturing() => issues.push(HealthIssue {
-            state: HealthState::Stopped,
-            reason: "Session capture is paused.".into(),
-            next_step: "Resume it from the Workspace switcher. Nothing recorded has been lost."
-                .into(),
-        }),
-        Some(_) => {}
     }
 
     if let Err(err) = store.check_writable() {
@@ -206,6 +211,22 @@ pub fn evaluate(store: &Store, workspace_id: &str, host: HostSignals) -> Result<
     })
 }
 
+/// Health for a Workspace that is not recording on purpose.
+///
+/// The counts are still reported: pausing does not discard what was already
+/// captured, and a developer who paused with work still unsent should be able to
+/// see that.
+fn off(store: &Store, workspace_id: &str, summary: &str) -> Result<CaptureHealth> {
+    Ok(CaptureHealth {
+        state: HealthState::Off,
+        summary: summary.into(),
+        issues: Vec::new(),
+        flagged_sessions: store.flagged_session_count(workspace_id)?,
+        failed_rows: store.row_count_in_state(workspace_id, SyncState::Failed)?,
+        pending_rows: store.row_count_in_state(workspace_id, SyncState::Pending)?,
+    })
+}
+
 fn summarize(state: HealthState, issues: &[HealthIssue], pending_rows: i64) -> String {
     match state {
         // The healthy line still carries the one number a developer wants
@@ -214,6 +235,8 @@ fn summarize(state: HealthState, issues: &[HealthIssue], pending_rows: i64) -> S
             format!("{pending_rows} pending")
         }
         HealthState::Ok => "Synced".into(),
+        // Set by `off`, which passes its own summary and never reaches here.
+        HealthState::Off => "Session capture is off".into(),
         // One issue reads better as itself than as a count of one.
         _ if issues.len() == 1 => issues[0].reason.clone(),
         _ => format!(
@@ -237,9 +260,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn state_ordering_puts_stopped_worst() {
+    fn state_ordering_puts_stopped_worst_and_off_below_healthy() {
         assert!(HealthState::Stopped > HealthState::Degraded);
         assert!(HealthState::Degraded > HealthState::Ok);
+        // Off must never win the worst-first sort — being switched off is not a
+        // fault, and ranking it above Ok would light the alarm on every
+        // Workspace nobody has enabled yet.
+        assert!(HealthState::Off < HealthState::Ok);
     }
 
     #[test]

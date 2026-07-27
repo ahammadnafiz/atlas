@@ -3,21 +3,25 @@ import { invoke } from "@tauri-apps/api/core";
 import { Check, CircleDot, GitBranch, Loader2, Lock } from "lucide-react";
 
 import { useAuthStore } from "@/features/auth/stores/auth-store";
+import { cn } from "@/lib/utils";
 
-import type { CaptureHealth } from "./capture-control";
+import type { Binding, CaptureHealth, Detection, WorkspaceMode } from "../types";
 
 /**
  * Turning session capture on for a Workspace.
  *
- * Opens from the Workspace switcher panel header — where Workspaces are already
- * managed, rather than in Settings where nobody would look for it.
+ * Opens from the Artifacts tab header, next to the Sessions it governs. It used
+ * to open from the sidebar, which was wrong on two counts: the portal rendered
+ * beneath the sidebar overlay so it never appeared, and setup was the *only*
+ * thing the sidebar row could reach — the recorded Sessions had no surface at
+ * all.
  *
  * The load-bearing decision here is that **Local is a real mode, not a waiting
  * room for Cloud**. Choosing it needs no account, makes no network call, and
  * produces the complete product: Sessions recorded, commits linked, the whole
- * timeline queryable from the local store. Cloud is presented alongside it and
- * disabled with a stated reason when it is not available, so the requirement is
- * obvious before the form is filled in rather than after.
+ * timeline readable. Cloud is presented alongside it and disabled with a stated
+ * reason when unavailable, so the requirement is obvious before the form is
+ * filled in rather than after.
  *
  * Everything detected below is **evidence, not a gate**. A repository with no
  * remote, a shallow clone, a squashed history, a directory that is not a
@@ -25,39 +29,16 @@ import type { CaptureHealth } from "./capture-control";
  * fine.
  */
 
-type WorkspaceMode = "local" | "cloud";
-
-interface Binding {
-  workspaceId: string;
-  root: string;
-  mode: WorkspaceMode;
-  slug: string | null;
-  orgId: string | null;
-  rootCommitSha: string | null;
-  fingerprintIsShallow: boolean;
-  gitUrl: string | null;
-  enabled: boolean;
-  createdAt: string;
-}
-
-interface Detection {
-  root: string;
-  isGitRepository: boolean;
-  hasCommits: boolean;
-  rootCommitSha: string | null;
-  isShallow: boolean;
-  gitUrl: string | null;
-  suggestedSlug: string;
-}
-
 interface Props {
   projectPath: string;
   /** Why capture is degraded or stopped, if it is. */
   health: CaptureHealth | null;
+  /** Told when the binding changes, so the surrounding tab can re-read. */
+  onChanged: () => void;
   onClose: () => void;
 }
 
-export function CapturePopover({ projectPath, health, onClose }: Props) {
+export function CapturePopover({ projectPath, health, onChanged, onClose }: Props) {
   const signedIn = useAuthStore.use.snapshot().status === "signed-in";
 
   const [binding, setBinding] = useState<Binding | null>(null);
@@ -89,6 +70,7 @@ export function CapturePopover({ projectPath, health, onClose }: Props) {
     try {
       await action();
       await load();
+      onChanged();
     } catch (e) {
       setError(String(e));
     } finally {
@@ -96,12 +78,12 @@ export function CapturePopover({ projectPath, health, onClose }: Props) {
     }
   };
 
-  // Cloud needs an account. Saying so up front is the point — the alternative
-  // is letting someone fill in a Slug and only then telling them.
+  // Cloud needs an account. Saying so up front is the point — the alternative is
+  // letting someone fill in a Slug and only then telling them.
   const cloudReason = signedIn ? null : "Sign in to share with an Organisation";
 
   return (
-    <div className="w-[320px] rounded-lg border border-[var(--border-default)] bg-[var(--bg-elevated)] p-3 text-[12px] shadow-lg">
+    <div className="w-[320px] rounded-lg border border-[var(--border-default)] bg-[var(--bg-overlay)] p-3 text-[12px] shadow-[var(--shadow-overlay)]">
       <header className="flex items-center justify-between pb-2">
         <span className="font-medium text-[var(--text-primary)]">Session capture</span>
         <StatusPill binding={binding} />
@@ -134,7 +116,7 @@ export function CapturePopover({ projectPath, health, onClose }: Props) {
       )}
 
       {error && (
-        <p className="mt-2 rounded bg-[var(--bg-danger-subtle)] px-2 py-1 text-[11px] text-[var(--text-danger)]">
+        <p className="mt-2 rounded bg-[var(--status-error-muted)] px-2 py-1 text-[11px] text-[var(--status-error)]">
           {error}
         </p>
       )}
@@ -149,33 +131,32 @@ export function CapturePopover({ projectPath, health, onClose }: Props) {
  * condition carries a next step, because "capture stopped" without a cause is
  * only marginally better than the silence it replaced.
  *
- * Nothing renders while healthy — a permanent green banner trains people to
- * stop reading the thing they are supposed to notice.
+ * Nothing renders while healthy or switched off — a permanent banner trains
+ * people to stop reading the thing they are supposed to notice.
  */
 function HealthDetail({ health }: { health: CaptureHealth | null }) {
-  if (!health || health.state === "ok" || health.issues.length === 0) return null;
+  if (!health || health.issues.length === 0) return null;
 
   const stopped = health.state === "stopped";
   return (
     <ul
-      className={`mb-2 space-y-1.5 rounded px-2 py-1.5 ${
-        stopped ? "bg-[var(--bg-danger-subtle)]" : "bg-[var(--bg-warning-subtle)]"
-      }`}
+      className={cn(
+        "mb-2 space-y-1.5 rounded px-2 py-1.5",
+        stopped ? "bg-[var(--status-error-muted)]" : "bg-[var(--status-warning-muted)]",
+      )}
     >
       {health.issues.map((issue) => (
         <li key={issue.reason} className="text-[11px]">
           <p
             className={
               issue.state === "stopped"
-                ? "text-[var(--text-danger)]"
-                : "text-[var(--text-warning)]"
+                ? "text-[var(--status-error)]"
+                : "text-[var(--status-warning)]"
             }
           >
             {issue.reason}
           </p>
-          {issue.nextStep && (
-            <p className="text-[var(--text-tertiary)]">{issue.nextStep}</p>
-          )}
+          {issue.nextStep && <p className="text-[var(--text-tertiary)]">{issue.nextStep}</p>}
         </li>
       ))}
     </ul>
@@ -191,7 +172,7 @@ function StatusPill({ binding }: { binding: Binding | null }) {
     <span className="flex items-center gap-1 text-[11px] text-[var(--text-secondary)]">
       <CircleDot
         size={11}
-        className={binding.enabled ? "text-[var(--text-success)]" : "text-[var(--text-tertiary)]"}
+        className={binding.enabled ? "text-[var(--status-info)]" : "text-[var(--text-tertiary)]"}
       />
       {binding.enabled ? "Capturing" : "Paused"} · {binding.mode === "cloud" ? "Cloud" : "Local"}
     </span>
@@ -235,14 +216,7 @@ function BoundState({
             Pause capture
           </button>
         ) : (
-          <button
-            type="button"
-            disabled={busy}
-            onClick={onEnable}
-            className="rounded bg-[var(--bg-accent)] px-2 py-1 text-[11px] text-[var(--text-on-accent)] disabled:opacity-50"
-          >
-            Resume capture
-          </button>
+          <PrimaryButton busy={busy} onClick={onEnable} label="Resume capture" />
         )}
       </div>
 
@@ -310,17 +284,39 @@ function UnboundState({
         >
           Cancel
         </button>
-        <button
-          type="button"
-          disabled={busy}
-          onClick={onEnable}
-          className="flex items-center gap-1 rounded bg-[var(--bg-accent)] px-2 py-1 text-[11px] text-[var(--text-on-accent)] disabled:opacity-50"
-        >
-          {busy && <Loader2 size={11} className="animate-spin" />}
-          Enable
-        </button>
+        <PrimaryButton busy={busy} onClick={onEnable} label="Enable" />
       </div>
     </div>
+  );
+}
+
+/**
+ * The one affirmative action in the popover.
+ *
+ * Atlas has no accent *background* token — `--accent-primary` is white, meant
+ * for text and rules. So the primary action inverts instead, which is the
+ * pattern the rest of the app uses and, unlike the invented `--bg-accent` this
+ * shipped with, actually resolves to a colour.
+ */
+function PrimaryButton({
+  busy,
+  onClick,
+  label,
+}: {
+  busy: boolean;
+  onClick: () => void;
+  label: string;
+}) {
+  return (
+    <button
+      type="button"
+      disabled={busy}
+      onClick={onClick}
+      className="flex items-center gap-1 rounded bg-[var(--accent-primary)] px-2 py-1 text-[11px] font-medium text-[var(--text-inverse)] hover:bg-[var(--accent-primary-hover)] disabled:opacity-50"
+    >
+      {busy && <Loader2 size={11} className="animate-spin" />}
+      {label}
+    </button>
   );
 }
 
@@ -345,21 +341,22 @@ function ModeOption({
       aria-disabled={disabled}
       disabled={disabled}
       onClick={onSelect}
-      className={`flex w-full items-start gap-2 rounded px-2 py-1.5 text-left ${
+      className={cn(
+        "flex w-full items-start gap-2 rounded px-2 py-1.5 text-left",
         disabled
           ? "cursor-not-allowed opacity-60"
           : selected
             ? "bg-[var(--bg-selected)]"
-            : "hover:bg-[var(--bg-hover)]"
-      }`}
+            : "hover:bg-[var(--bg-hover)]",
+      )}
     >
       <span className="mt-0.5 shrink-0">
         {disabled ? (
           <Lock size={11} className="text-[var(--text-tertiary)]" />
         ) : selected ? (
-          <Check size={11} className="text-[var(--text-accent)]" />
+          <Check size={11} className="text-[var(--text-primary)]" />
         ) : (
-          <span className="block h-[11px] w-[11px] rounded-full border border-[var(--border-default)]" />
+          <span className="block h-[11px] w-[11px] rounded-full border border-[var(--border-strong)]" />
         )}
       </span>
       <span className="min-w-0">
@@ -381,7 +378,7 @@ function Detected({ detection }: { detection: Detection | null }) {
   if (!detection) return null;
 
   return (
-    <dl className="space-y-0.5 rounded bg-[var(--bg-subtle)] px-2 py-1.5 text-[11px]">
+    <dl className="space-y-0.5 rounded bg-[var(--bg-raised)] px-2 py-1.5 text-[11px]">
       <Row label="Folder" value={detection.root.split("/").pop() ?? detection.root} />
       {detection.gitUrl && <Row label="Origin" value={detection.gitUrl} />}
       {detection.rootCommitSha && (
@@ -420,14 +417,14 @@ function GitInitOffer({ busy, onGitInit }: { busy: boolean; onGitInit: () => voi
       <GitBranch size={12} className="mt-0.5 shrink-0 text-[var(--text-tertiary)]" />
       <div className="min-w-0">
         <p className="text-[11px] text-[var(--text-secondary)]">
-          Sessions are recorded here already. Initialise git to also link them to the
-          commits they produce.
+          Sessions are recorded here already. Initialise git to also link them to the commits
+          they produce.
         </p>
         <button
           type="button"
           disabled={busy}
           onClick={onGitInit}
-          className="mt-1 text-[11px] text-[var(--text-accent)] hover:underline disabled:opacity-50"
+          className="mt-1 text-[11px] text-[var(--text-primary)] underline underline-offset-2 hover:no-underline disabled:opacity-50"
         >
           Initialise git
         </button>

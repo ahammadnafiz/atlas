@@ -1,133 +1,110 @@
 import { useEffect, useState } from "react";
-import * as Popover from "@radix-ui/react-popover";
 import { invoke } from "@tauri-apps/api/core";
-import { CircleDot, CircleSlash, TriangleAlert } from "lucide-react";
+import { Layers, TriangleAlert } from "lucide-react";
 
+import { useLayoutStore } from "@/features/layout/stores/layout-store";
 import { useProjectStore } from "@/features/project/stores/project-store";
+import { cn } from "@/lib/utils";
 
-import { CapturePopover } from "./capture-popover";
+import type { Binding, CaptureHealth } from "../types";
 
 /**
- * The always-visible half of session capture: one row in the Workspace switcher
- * panel header showing whether this Workspace is recording, and opening the
- * enable popover when clicked.
+ * The Artifacts entry point: one row in the Workspace switcher panel header,
+ * carrying the recording state and opening the Artifacts tab.
  *
- * Deliberately a *status* row rather than a button labelled "Set up capture".
- * The developer should be able to tell at a glance whether their work is being
- * recorded and in which mode — that is the whole reason the feature has any UI
- * at all, since daily use has none.
+ * The first version of this opened a settings popover instead, which was wrong
+ * twice over. It rendered a Radix portal at `z-50` underneath the sidebar
+ * overlay's `z-[60]`, so clicking it appeared to do nothing at all. And more
+ * fundamentally, it made *configuring* capture the only thing this row could do
+ * — while the recorded Sessions, the entire product, had no surface anywhere.
+ *
+ * So the row now does the obvious thing a row in a navigation list should do: it
+ * opens the thing it names. Setup moved into that tab's header, where it is one
+ * click from the Sessions it configures rather than a portal fighting the
+ * sidebar for stacking order.
  */
-
-interface Binding {
-  mode: "local" | "cloud";
-  enabled: boolean;
-}
-
-export interface HealthIssue {
-  state: "ok" | "degraded" | "stopped";
-  reason: string;
-  nextStep: string;
-}
-
-export interface CaptureHealth {
-  state: "ok" | "degraded" | "stopped";
-  summary: string;
-  issues: HealthIssue[];
-  flaggedSessions: number;
-  failedRows: number;
-  pendingRows: number;
-}
 
 export function CaptureControl() {
   const currentProject = useProjectStore.use.currentProject();
   const projectPath = currentProject?.path ?? null;
+  const { addTab } = useLayoutStore.use.actions();
 
   const [binding, setBinding] = useState<Binding | null>(null);
   const [health, setHealth] = useState<CaptureHealth | null>(null);
-  const [open, setOpen] = useState(false);
 
   useEffect(() => {
     if (!projectPath) {
       setBinding(null);
+      setHealth(null);
       return;
     }
     let cancelled = false;
-    void invoke<Binding | null>("capture_binding", { projectPath })
-      .then((result) => {
-        if (!cancelled) setBinding(result);
-      })
-      // A workspace whose store cannot be opened is reported through the
-      // capture-health signal, not by breaking this row.
-      .catch(() => {
-        if (!cancelled) setBinding(null);
-      });
-    void invoke<CaptureHealth>("capture_health", { projectPath })
-      .then((result) => {
-        if (!cancelled) setHealth(result);
-      })
-      .catch(() => {
-        if (!cancelled) setHealth(null);
-      });
+    const read = () => {
+      void invoke<Binding | null>("capture_binding", { projectPath })
+        .then((result) => !cancelled && setBinding(result))
+        // A Workspace whose store cannot be opened reports that through the
+        // health signal below, not by breaking this row.
+        .catch(() => !cancelled && setBinding(null));
+      void invoke<CaptureHealth>("capture_health", { projectPath })
+        .then((result) => !cancelled && setHealth(result))
+        .catch(() => !cancelled && setHealth(null));
+    };
+    read();
+    // Capture state changes from inside the Artifacts tab, from the git watcher
+    // and from the drain — none of which this row hears about. A slow poll is
+    // the honest cost of not inventing an event channel for one status line.
+    const timer = setInterval(read, 15_000);
     return () => {
       cancelled = true;
+      clearInterval(timer);
     };
-    // Re-read when the popover closes, so enabling is reflected immediately.
-  }, [projectPath, open]);
+  }, [projectPath]);
 
   if (!projectPath) return null;
 
   const capturing = binding?.enabled ?? false;
-  // Health outranks the plain capturing/paused label. The entire reason this
-  // signal exists is that a Workspace can look fine and be recording nothing.
-  const degraded = health?.state === "degraded";
-  const stopped = health?.state === "stopped" && capturing;
-  const label = !binding
-    ? "Session capture"
-    : stopped || degraded
-      ? (health?.summary ?? "Capture needs attention")
-      : capturing
-        ? `Capturing · ${binding.mode === "cloud" ? "Cloud" : "Local"}`
-        : "Capture paused";
+  const attention = health?.state === "degraded" || health?.state === "stopped";
 
   return (
     <div className="px-1.5 pb-1 shrink-0">
-      <Popover.Root open={open} onOpenChange={setOpen}>
-        <Popover.Trigger asChild>
-          <button
-            type="button"
-            className="flex w-full items-center gap-2 rounded px-2 py-1 text-left text-[12px] text-[var(--text-secondary)] outline-none hover:bg-[var(--bg-hover)]"
-            title={health?.summary ?? "Session capture for this Workspace"}
-          >
-            {stopped ? (
-              <CircleSlash size={13} className="text-[var(--text-danger)]" />
-            ) : degraded ? (
-              <TriangleAlert size={13} className="text-[var(--text-warning)]" />
-            ) : (
-              <CircleDot
-                size={13}
-                className={
-                  capturing
-                    ? "text-[var(--text-success)]"
-                    : "text-[var(--text-tertiary)]"
-                }
-              />
+      <button
+        type="button"
+        onClick={() =>
+          addTab({
+            id: "artifacts",
+            type: "artifacts",
+            title: "Artifacts",
+            closable: true,
+            dirty: false,
+            data: {},
+          })
+        }
+        className="flex w-full items-center gap-2 rounded px-2 py-1 text-left text-[12px] text-[var(--text-secondary)] outline-none hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
+        title={health?.summary ?? "Sessions captured in this Workspace"}
+      >
+        <Layers size={13} className="shrink-0" />
+        <span className="truncate">Artifacts</span>
+        <span className="ml-auto flex items-center gap-1.5">
+          {attention ? (
+            <TriangleAlert
+              size={11}
+              className={
+                health?.state === "stopped"
+                  ? "text-[var(--status-error)]"
+                  : "text-[var(--status-warning)]"
+              }
+            />
+          ) : null}
+          {/* A dot rather than a word: the row already says what it is, and
+           *  "Capturing · Local" in a 244px sidebar is mostly truncation. */}
+          <span
+            className={cn(
+              "size-1.5 rounded-full",
+              capturing ? "bg-[var(--status-info)]" : "bg-[var(--text-ghost)]",
             )}
-            <span className="truncate">{label}</span>
-            {!binding && (
-              <span className="ml-auto text-[11px] text-[var(--text-tertiary)]">Off</span>
-            )}
-          </button>
-        </Popover.Trigger>
-        <Popover.Portal>
-          <Popover.Content side="right" align="start" sideOffset={6} className="z-50">
-            <CapturePopover
-            projectPath={projectPath}
-            health={health}
-            onClose={() => setOpen(false)}
           />
-          </Popover.Content>
-        </Popover.Portal>
-      </Popover.Root>
+        </span>
+      </button>
     </div>
   );
 }

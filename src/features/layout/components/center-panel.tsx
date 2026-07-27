@@ -30,6 +30,7 @@ const SettingsPanel = lazy(() => import("@/features/settings/components/settings
 const LogPanel = lazy(() => import("@/features/log/components/log-panel").then(m => ({ default: m.LogPanel })));
 const PomodoroPanel = lazy(() => import("@/features/pomodoro/components/pomodoro-panel").then(m => ({ default: m.PomodoroPanel })));
 const MissionControlPanel = lazy(() => import("@/features/mission-control/components/mission-control-panel").then(m => ({ default: m.MissionControlPanel })));
+const ArtifactsPanel = lazy(() => import("@/features/artifacts/components/artifacts-panel").then(m => ({ default: m.ArtifactsPanel })));
 const ModelChatPanel = lazy(() => import("@/features/model-chat/components/model-chat-panel").then(m => ({ default: m.ModelChatPanel })));
 const MemoryPanel = lazy(() => import("@/features/memory/components/memory-panel").then(m => ({ default: m.MemoryPanel })));
 import { useProjectStore } from "@/features/project/stores/project-store";
@@ -60,6 +61,7 @@ import {
   FileText,
   Columns2,
   LayoutDashboard,
+  Layers,
 } from "lucide-react";
 import type { TabType } from "@/lib/constants";
 
@@ -84,6 +86,7 @@ const tabIcons: Record<TabType, React.ElementType> = {
   unsupported: Code,
   pomodoro: Timer,
   "mission-control": LayoutDashboard,
+  artifacts: Layers,
 };
 
 const GROUP_OF = (t: Tab) => t.groupId ?? "main";
@@ -540,6 +543,8 @@ function TabContent({ tab }: { tab: Tab }) {
       return <PomodoroPanel />;
     case "mission-control":
       return <MissionControlPanel />;
+    case "artifacts":
+      return <ArtifactsPanel />;
     case "media":
       return <MediaViewer filePath={tab.data.filePath as string} />;
     case "svg":

@@ -234,33 +234,33 @@ fn a_dead_watcher_moves_the_workspace_to_stopped() {
 }
 
 #[test]
-fn a_workspace_that_was_never_enabled_reports_stopped_with_the_reason() {
+fn a_workspace_that_was_never_enabled_is_off_rather_than_broken() {
     let dir = tempfile::tempdir().unwrap();
     let store = store_in(dir.path());
     let health = health(&store, no_watcher_needed());
 
-    assert_eq!(health.state, HealthState::Stopped);
-    assert!(
-        health.issues.iter().any(|i| i.reason.contains("not enabled")),
-        "{:?}",
-        health.issues
-    );
+    // Not `Stopped`. Nobody asked this Workspace to record anything, so there is
+    // no fault to report — and reporting one lights three alarms (no binding, no
+    // watcher, no writer lock) on the very first Workspace a new user opens.
+    assert_eq!(health.state, HealthState::Off);
+    assert!(health.issues.is_empty(), "{:?}", health.issues);
+    assert_eq!(health.summary, "Session capture is off");
 }
 
 #[test]
-fn a_paused_workspace_reports_stopped_and_says_nothing_was_lost() {
+fn a_paused_workspace_is_off_and_still_reports_what_it_holds() {
     let dir = tempfile::tempdir().unwrap();
     let store = bound(dir.path());
     disable(&store).unwrap();
 
     let health = health(&store, no_watcher_needed());
-    assert_eq!(health.state, HealthState::Stopped);
-    let paused = health
-        .issues
-        .iter()
-        .find(|i| i.reason.contains("paused"))
-        .expect("a paused issue");
-    assert!(paused.next_step.contains("Nothing recorded has been lost"));
+    // Pausing is a choice the developer made. Nothing is wrong.
+    assert_eq!(health.state, HealthState::Off);
+    assert!(health.issues.is_empty(), "{:?}", health.issues);
+    assert_eq!(health.summary, "Session capture is paused");
+    // The counts survive the pause — work captured before it is still there.
+    assert_eq!(health.pending_rows, 0);
+    assert_eq!(health.flagged_sessions, 0);
 }
 
 #[test]

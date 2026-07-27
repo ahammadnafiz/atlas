@@ -641,9 +641,10 @@ export function WorkspaceSidebar() {
        *  titlebar drag zone so it clears the traffic lights. */}
       <OrgSwitcher />
 
-      {/* Session capture for the current Workspace. Lives in this panel header
-       *  because this is where Workspaces are already managed — putting it in
-       *  Settings would file it somewhere nobody looks for it. */}
+      {/* Sessions captured in the current Workspace. Sits above the other
+       *  header actions because it is Workspace-scoped, unlike Console/Logs —
+       *  and carries the recording dot, so whether work is being recorded is
+       *  answerable without opening anything. */}
       <CaptureControl />
 
       {/* Header actions. */}
