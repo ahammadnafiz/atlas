@@ -717,6 +717,105 @@ impl Store {
         }
     }
 
+    // ── Binding ─────────────────────────────────────────────────────────────
+
+    /// How this Workspace is bound, or `None` if capture was never enabled.
+    pub fn binding(&self) -> Result<Option<Binding>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT workspace_id, root, mode, slug, org_id, root_commit_sha,
+                        fingerprint_is_shallow, git_url, enabled, created_at
+                   FROM binding WHERE id = 1",
+                [],
+                |row| {
+                    let mode: String = row.get(2)?;
+                    Ok(Binding {
+                        workspace_id: row.get(0)?,
+                        root: row.get(1)?,
+                        mode: WorkspaceMode::parse(&mode).unwrap_or(WorkspaceMode::Local),
+                        slug: row.get(3)?,
+                        org_id: row.get(4)?,
+                        root_commit_sha: row.get(5)?,
+                        fingerprint_is_shallow: row.get::<_, i64>(6)? != 0,
+                        git_url: row.get(7)?,
+                        enabled: row.get::<_, i64>(8)? != 0,
+                        created_at: parse_time(row.get::<_, String>(9)?),
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    /// Bind, or refresh an existing binding's detected signals.
+    ///
+    /// Idempotent by construction — the singleton row is upserted rather than
+    /// inserted, so re-opening the popover for an already-bound Workspace shows
+    /// its state instead of offering to create a second one. `created_at` is
+    /// preserved so "capturing since" stays true.
+    pub fn upsert_binding(
+        &self,
+        workspace_id: &str,
+        root: &str,
+        mode: WorkspaceMode,
+        root_commit_sha: Option<&str>,
+        fingerprint_is_shallow: bool,
+        git_url: Option<&str>,
+    ) -> Result<()> {
+        self.require_writer()?;
+        let now = Utc::now().to_rfc3339();
+        self.conn.execute(
+            "INSERT INTO binding
+                (id, workspace_id, root, mode, root_commit_sha, fingerprint_is_shallow,
+                 git_url, enabled, created_at, updated_at)
+             VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, 1, ?7, ?7)
+             ON CONFLICT (id) DO UPDATE SET
+                 workspace_id = ?1,
+                 root = ?2,
+                 mode = ?3,
+                 root_commit_sha = ?4,
+                 fingerprint_is_shallow = ?5,
+                 git_url = ?6,
+                 enabled = 1,
+                 updated_at = ?7",
+            rusqlite::params![
+                workspace_id,
+                root,
+                mode.as_str(),
+                root_commit_sha,
+                i64::from(fingerprint_is_shallow),
+                git_url,
+                now,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Record the Organisation this Workspace was registered to.
+    ///
+    /// Separate from [`Store::upsert_binding`] because it is a different event:
+    /// binding is local and immediate, registration is a server round-trip that
+    /// must succeed before anything local changes.
+    pub fn set_cloud_binding(&self, org_id: &str, slug: &str) -> Result<()> {
+        self.require_writer()?;
+        self.conn.execute(
+            "UPDATE binding SET mode = 'cloud', org_id = ?1, slug = ?2, updated_at = ?3
+              WHERE id = 1",
+            rusqlite::params![org_id, slug, Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    /// Stop or resume capture. Never deletes what is already recorded.
+    pub fn set_binding_enabled(&self, enabled: bool) -> Result<()> {
+        self.require_writer()?;
+        self.conn.execute(
+            "UPDATE binding SET enabled = ?1, updated_at = ?2 WHERE id = 1",
+            rusqlite::params![i64::from(enabled), Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
     // ── Checkpoints and the commit cursor ───────────────────────────────────
 
     /// Create a Checkpoint, or leave the existing one alone.

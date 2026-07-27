@@ -400,6 +400,53 @@ pub struct FileTouch {
     pub created_at: DateTime<Utc>,
 }
 
+/// How a Workspace is bound, and whether it is capturing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Binding {
+    pub workspace_id: String,
+    pub root: String,
+    pub mode: WorkspaceMode,
+    /// The Workspace's handle within its Organisation. `None` until Cloud.
+    pub slug: Option<String>,
+    pub org_id: Option<String>,
+    /// Root commit. Advisory — it pre-selects and warns, it never gates.
+    pub root_commit_sha: Option<String>,
+    /// The fingerprint came from a shallow clone's graft boundary, so it is not
+    /// the true root and must not be treated as authoritative.
+    pub fingerprint_is_shallow: bool,
+    /// Normalised origin URL. `None` when there is no remote — which binds fine.
+    pub git_url: Option<String>,
+    /// Capture stops when this is false; nothing already recorded is deleted.
+    pub enabled: bool,
+    pub created_at: DateTime<Utc>,
+}
+
+impl Binding {
+    /// Is this Workspace recording right now?
+    pub fn is_capturing(&self) -> bool {
+        self.enabled
+    }
+}
+
+/// What Atlas could work out about a directory before anything is bound.
+///
+/// Drives the enable popover: it shows what was detected rather than asking the
+/// developer to type it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceDetection {
+    pub root: String,
+    pub is_git_repository: bool,
+    /// True for a repository with no commits yet — `git init` and nothing else.
+    pub has_commits: bool,
+    pub root_commit_sha: Option<String>,
+    pub is_shallow: bool,
+    pub git_url: Option<String>,
+    /// A default Slug proposal, from the directory name.
+    pub suggested_slug: String,
+}
+
 /// Whether a Checkpoint's commit is still in the history.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

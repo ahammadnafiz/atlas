@@ -16,7 +16,7 @@ use rusqlite::Connection;
 use crate::error::{Error, Result};
 
 /// Bump when adding a migration, and add the matching arm in [`migrate`].
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 
 pub fn migrate(conn: &Connection) -> Result<()> {
     let found: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
@@ -39,6 +39,9 @@ pub fn migrate(conn: &Connection) -> Result<()> {
     }
     if found < 3 {
         conn.execute_batch(V3)?;
+    }
+    if found < 4 {
+        conn.execute_batch(V4)?;
     }
 
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -321,6 +324,39 @@ CREATE INDEX IF NOT EXISTS idx_checkpoint_patch
     ON checkpoint (patch_id);
 CREATE INDEX IF NOT EXISTS idx_checkpoint_outbox
     ON checkpoint (sync_state);
+"#;
+
+const V4: &str = r#"
+-- How this Workspace is bound, and whether it is capturing at all.
+--
+-- One row: a store belongs to exactly one Workspace, so `id = 1` is a
+-- singleton, enforced by the CHECK rather than by convention.
+--
+-- The identity signals are evidence, never gates. A repository with no remote,
+-- a shallow clone whose grafted boundary is not the true root, a squashed
+-- history, a fresh repository joining existing work — every one of those is a
+-- legitimate repository someone actually has, and every one of them would be
+-- locked out by treating a fingerprint as proof. They pre-select and they warn.
+CREATE TABLE IF NOT EXISTS binding (
+    id              INTEGER PRIMARY KEY CHECK (id = 1),
+    workspace_id    TEXT NOT NULL,
+    root            TEXT NOT NULL,
+    mode            TEXT NOT NULL DEFAULT 'local',
+    -- Set once the Workspace is registered to an Organisation.
+    slug            TEXT,
+    org_id          TEXT,
+    -- Advisory. Null for a non-git Workspace, or one with no commits yet.
+    root_commit_sha TEXT,
+    -- The grafted boundary of a shallow clone is not the true root, so the
+    -- fingerprint it yields is stored but flagged as not authoritative.
+    fingerprint_is_shallow INTEGER NOT NULL DEFAULT 0,
+    -- Advisory, normalised. Null when there is no remote — which binds fine.
+    git_url         TEXT,
+    -- Disabling stops new records without deleting existing ones.
+    enabled         INTEGER NOT NULL DEFAULT 1,
+    created_at      TEXT NOT NULL,
+    updated_at      TEXT NOT NULL
+);
 "#;
 
 /// Index names the store guarantees. Exposed so a test can assert they survived

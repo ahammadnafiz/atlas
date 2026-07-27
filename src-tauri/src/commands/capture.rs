@@ -45,14 +45,17 @@ use atlas_checkpoint::{
 };
 use tauri::{AppHandle, Manager};
 
-/// What the middleware knows about a session, learned at send time.
+/// What the middleware knows about one agent session, learned at send time.
+///
+/// Distinct from `atlas_checkpoint::Binding`, which is how the *Workspace* is
+/// bound (mode, Slug, fingerprints). This is per-conversation routing state.
 ///
 /// Resolved from the manager's session snapshot rather than from
 /// `SharedMemoryStore::session_meta`: that store is only populated when the
 /// per-project memory-sharing toggle is on, which is off by default, so reusing
 /// it would silently capture nothing for most users.
 #[derive(Clone)]
-struct Binding {
+struct SessionBinding {
     workspace_root: PathBuf,
     source: Source,
     native_session_id: String,
@@ -67,18 +70,18 @@ struct Binding {
 /// Work for the capture thread.
 enum Job {
     Prompt {
-        binding: Binding,
+        binding: SessionBinding,
         prompt: String,
     },
     Turn {
-        binding: Binding,
+        binding: SessionBinding,
         native_message_id: String,
         role: Role,
         mode: Mode,
         body: String,
     },
     ToolCall {
-        binding: Binding,
+        binding: SessionBinding,
         native_call_id: String,
         tool_name: ToolName,
         title: Option<String>,
@@ -106,10 +109,10 @@ enum Job {
         workspace_id: String,
     },
     FinishTurn {
-        binding: Binding,
+        binding: SessionBinding,
     },
     Usage {
-        binding: Binding,
+        binding: SessionBinding,
         totals: TokenTotals,
     },
 }
@@ -123,7 +126,7 @@ struct PendingWrite {
 
 /// App-wide capture state: the session registry and the worker's channel.
 pub struct CaptureState {
-    sessions: Mutex<HashMap<String, Binding>>,
+    sessions: Mutex<HashMap<String, SessionBinding>>,
     /// `existed_before` per (tool call, path), sampled the first time we see the
     /// call and reused when it completes.
     ///
@@ -178,7 +181,7 @@ impl CaptureState {
             let mut sessions = self.sessions.lock().expect("capture registry");
             let entry = sessions
                 .entry(session_id.to_string())
-                .or_insert_with(|| Binding {
+                .or_insert_with(|| SessionBinding {
                     workspace_root: PathBuf::from(cwd),
                     source: source_for(plugin_id),
                     native_session_id: session_id.to_string(),
@@ -220,7 +223,7 @@ impl CaptureState {
         });
     }
 
-    fn binding(&self, session_id: &str) -> Option<Binding> {
+    fn binding(&self, session_id: &str) -> Option<SessionBinding> {
         self.sessions
             .lock()
             .expect("capture registry")
@@ -283,6 +286,100 @@ impl Default for CaptureState {
     }
 }
 
+// ── Command surface ─────────────────────────────────────────────────────────
+//
+// These are synchronous store reads and writes, not delta-stream work, so they
+// run on the caller's thread rather than through the capture worker. They are
+// fast (one SQLite row, a handful of `git` reads) and the popover needs an
+// answer to render at all.
+
+/// What Atlas can work out about a directory before anything is bound.
+///
+/// Drives the popover's "Detected" block: origin, root commit, whether this is
+/// a repository at all.
+#[tauri::command]
+pub fn capture_detect(project_path: String) -> Result<atlas_checkpoint::WorkspaceDetection, String> {
+    Ok(atlas_checkpoint::detect(std::path::Path::new(&project_path)))
+}
+
+/// How this Workspace is bound, or `null` if capture was never enabled.
+#[tauri::command]
+pub fn capture_binding(project_path: String) -> Result<Option<atlas_checkpoint::Binding>, String> {
+    let store = open_store(&project_path)?;
+    store.binding().map_err(|e| e.to_string())
+}
+
+/// Turn capture on for this Workspace.
+///
+/// Local mode makes no network call and needs no account, which is the whole
+/// point: Atlas has to be useful before anyone signs up for anything.
+#[tauri::command]
+pub fn capture_enable(
+    project_path: String,
+    mode: String,
+) -> Result<atlas_checkpoint::Binding, String> {
+    let mode = WorkspaceMode::parse(&mode)
+        .ok_or_else(|| format!("unknown workspace mode: {mode}"))?;
+    let root = std::path::Path::new(&project_path);
+    let store = open_store(&project_path)?;
+
+    let binding = atlas_checkpoint::bind(&store, &project_path, root, mode)
+        .map_err(|e| e.to_string())?;
+
+    // Establish the commit cursor immediately, so the first commit after
+    // enabling is linked rather than waiting for a walk that has no baseline.
+    let _ = atlas_checkpoint::walk_new_commits(&store, &project_path, root, mode);
+    Ok(binding)
+}
+
+/// Re-read the identity signals for an already-bound Workspace.
+///
+/// Called after the inline `git init` offer: the Workspace must start producing
+/// Checkpoints without a restart, which it can only do once the fingerprint it
+/// had no way to know is filled in.
+#[tauri::command]
+pub fn capture_refresh(project_path: String) -> Result<Option<atlas_checkpoint::Binding>, String> {
+    let root = std::path::Path::new(&project_path);
+    let store = open_store(&project_path)?;
+    let binding = atlas_checkpoint::refresh_detection(&store, root).map_err(|e| e.to_string())?;
+    if let Some(binding) = &binding {
+        let _ = atlas_checkpoint::walk_new_commits(&store, &project_path, root, binding.mode);
+    }
+    Ok(binding)
+}
+
+/// Stop capturing. Nothing already recorded is deleted.
+#[tauri::command]
+pub fn capture_disable(project_path: String) -> Result<(), String> {
+    atlas_checkpoint::disable(&open_store(&project_path)?).map_err(|e| e.to_string())
+}
+
+/// Initialise a repository in a non-git Workspace, then re-detect.
+///
+/// Framed in the UI as unlocking commit linkage rather than as a requirement,
+/// because that is what it is: Sessions are captured either way.
+#[tauri::command]
+pub fn capture_git_init(project_path: String) -> Result<Option<atlas_checkpoint::Binding>, String> {
+    let status = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&project_path)
+        .arg("init")
+        .output()
+        .map_err(|e| format!("git init: {e}"))?;
+    if !status.status.success() {
+        return Err(String::from_utf8_lossy(&status.stderr).trim().to_string());
+    }
+    capture_refresh(project_path)
+}
+
+/// Open a Workspace's store for a one-shot command.
+///
+/// A second window holding the writer lock still gets a readable store, so the
+/// popover renders; only the write paths refuse.
+fn open_store(project_path: &str) -> Result<Store, String> {
+    Store::open(atlas_checkpoint::atlas_dir(project_path)).map_err(|e| e.to_string())
+}
+
 /// Which capture path a session came from.
 ///
 /// The distinction matters downstream: the native agent reports a real
@@ -305,7 +402,7 @@ fn worker(rx: mpsc::Receiver<Job>) {
     while let Ok(job) = rx.recv() {
         // A commit walk is not tied to a Session, so it carries its own root
         // rather than a binding.
-        let (binding, root) = match &job {
+        let (session_binding, root) = match &job {
             Job::WalkCommits { workspace_root, .. } => (None, workspace_root.clone()),
             Job::Prompt { binding, .. }
             | Job::Turn { binding, .. }
@@ -346,15 +443,22 @@ fn worker(rx: mpsc::Receiver<Job>) {
             continue;
         }
 
+        // Capture is opt-in per Workspace, and pausing it must actually stop new
+        // records. An unbound Workspace records nothing at all: the developer
+        // has not asked for it, and writing a store for every directory they
+        // ever opened an agent in would be a surprise rather than a feature.
+        let Ok(Some(workspace)) = store.binding() else {
+            continue;
+        };
+        if !workspace.is_capturing() {
+            continue;
+        }
+        let mode = workspace.mode;
+
         // The commit walk needs the store but no Session, so it is handled
         // before the Session-scoped jobs below.
         if let Job::WalkCommits { workspace_id, .. } = &job {
-            match atlas_checkpoint::walk_new_commits(
-                store,
-                workspace_id,
-                &root,
-                WorkspaceMode::Local,
-            ) {
+            match atlas_checkpoint::walk_new_commits(store, workspace_id, &root, mode) {
                 Ok(outcome) if outcome.checkpoints_created > 0 => tracing::info!(
                     target: "atlas::capture",
                     commits = outcome.commits_seen,
@@ -396,7 +500,7 @@ fn worker(rx: mpsc::Receiver<Job>) {
             continue;
         }
 
-        let Some(binding) = binding else { continue };
+        let Some(binding) = session_binding else { continue };
         let key = SessionKey {
             // The Workspace binding proper arrives with the enable popover; until
             // then a Workspace is its project directory, which is the same
@@ -406,7 +510,7 @@ fn worker(rx: mpsc::Receiver<Job>) {
             native_session_id: binding.native_session_id.clone(),
         };
 
-        let mut capture = Capture::new(store, WorkspaceMode::Local);
+        let mut capture = Capture::new(store, mode);
         let outcome = match job {
             // Already handled above; it needs no Session.
             Job::WalkCommits { .. } => Ok(()),
@@ -522,7 +626,7 @@ struct ToolCallJob {
 fn record_tool_call(
     capture: &mut Capture<'_>,
     session_id: &str,
-    binding: &Binding,
+    binding: &SessionBinding,
     job: ToolCallJob,
 ) -> atlas_checkpoint::Result<()> {
     let call_id = capture.record_tool_call(

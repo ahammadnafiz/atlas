@@ -187,6 +187,70 @@ pub fn recent_commits(repo: &Path, limit: usize) -> Result<Vec<String>> {
     Ok(out.lines().map(str::trim).filter(|l| !l.is_empty()).map(str::to_string).collect())
 }
 
+/// The repository's root commit — the identity that survives forks, folder
+/// renames and remote changes.
+///
+/// **Advisory, never authoritative.** A shallow clone's grafted boundary is not
+/// the true root, a squashed history has a different one, and every repository
+/// created from the same GitHub template shares one. So this pre-selects and
+/// warns; it never gates. Hard-gating on it would break every one of those, all
+/// of which are repositories someone actually has.
+pub fn root_commit(repo: &Path) -> Option<String> {
+    let out = run(repo, &["rev-list", "--max-parents=0", "HEAD"]).ok()?;
+    // A repository with several root commits (a merged-in unrelated history)
+    // has no single fingerprint. The last is the oldest.
+    out.lines().last().map(str::trim).map(str::to_string).filter(|s| !s.is_empty())
+}
+
+/// Is this a shallow clone?
+///
+/// Worth knowing precisely because its root commit is a graft boundary rather
+/// than the true root — the fingerprint it yields is stored but must not be
+/// treated as authoritative.
+pub fn is_shallow(repo: &Path) -> bool {
+    run(repo, &["rev-parse", "--is-shallow-repository"])
+        .map(|out| out.trim() == "true")
+        .unwrap_or(false)
+}
+
+/// The `origin` remote's URL, normalised.
+pub fn origin_url(repo: &Path) -> Option<String> {
+    let out = run(repo, &["remote", "get-url", "origin"]).ok()?;
+    let url = out.trim();
+    (!url.is_empty()).then(|| normalize_git_url(url))
+}
+
+/// Reduce a git remote URL to a comparable identity.
+///
+/// `git@github.com:tryatlas/atlas.git`, `https://github.com/tryatlas/atlas.git`
+/// and `ssh://git@github.com/tryatlas/atlas` all describe the same repository,
+/// and Connect has to recognise that — otherwise switching a remote from SSH to
+/// HTTPS looks like a different project.
+pub fn normalize_git_url(raw: &str) -> String {
+    let mut url = raw.trim().to_string();
+
+    for prefix in ["ssh://", "https://", "http://", "git://"] {
+        if let Some(rest) = url.strip_prefix(prefix) {
+            url = rest.to_string();
+            break;
+        }
+    }
+    // `git@host:owner/repo` — the scp-like form, where the colon is a path
+    // separator rather than a port.
+    if let Some(rest) = url.strip_prefix("git@") {
+        url = rest.replacen(':', "/", 1);
+    } else if let Some((userinfo, rest)) = url.split_once('@') {
+        // Any other embedded credential is identity noise, not identity.
+        if !userinfo.contains('/') {
+            url = rest.to_string();
+        }
+    }
+
+    url = url.trim_end_matches('/').to_string();
+    url = url.strip_suffix(".git").unwrap_or(&url).to_string();
+    url.to_lowercase()
+}
+
 /// Is a history rewrite in progress right now?
 ///
 /// Mid-rebase, commits are transiently unreachable — the old ones are already
@@ -712,6 +776,75 @@ mod tests {
 
         std::fs::create_dir_all(repo.path().join(".git/rebase-merge")).unwrap();
         assert!(rewrite_in_progress(repo.path()));
+    }
+
+    #[test]
+    fn the_root_commit_is_the_oldest_and_survives_later_history() {
+        let repo = TestRepo::new();
+        repo.write("a", "1");
+        let root = repo.commit_all("initial");
+        repo.write("b", "2");
+        repo.commit_all("second");
+        assert_eq!(root_commit(repo.path()).as_deref(), Some(root.as_str()));
+    }
+
+    #[test]
+    fn a_repository_with_no_commits_has_no_fingerprint() {
+        assert_eq!(root_commit(TestRepo::new().path()), None);
+    }
+
+    #[test]
+    fn remote_urls_normalise_to_the_same_identity() {
+        // Switching a remote from SSH to HTTPS must not look like a different
+        // project.
+        let expected = "github.com/tryatlas/atlas";
+        for raw in [
+            "git@github.com:tryatlas/atlas.git",
+            "https://github.com/tryatlas/atlas.git",
+            "https://github.com/tryatlas/atlas",
+            "ssh://git@github.com/tryatlas/atlas.git",
+            "https://github.com/TryAtlas/Atlas.git",
+            "https://token:x-oauth-basic@github.com/tryatlas/atlas.git",
+            "git://github.com/tryatlas/atlas.git/",
+        ] {
+            assert_eq!(normalize_git_url(raw), expected, "for {raw}");
+        }
+    }
+
+    #[test]
+    fn different_repositories_do_not_normalise_together() {
+        assert_ne!(
+            normalize_git_url("git@github.com:tryatlas/atlas.git"),
+            normalize_git_url("git@github.com:tryatlas/server.git")
+        );
+    }
+
+    #[test]
+    fn a_repository_with_no_remote_reports_no_origin() {
+        let repo = TestRepo::new();
+        repo.write("a", "1");
+        repo.commit_all("initial");
+        assert_eq!(origin_url(repo.path()), None);
+    }
+
+    #[test]
+    fn an_origin_is_read_and_normalised() {
+        let repo = TestRepo::new();
+        repo.write("a", "1");
+        repo.commit_all("initial");
+        repo.git(&["remote", "add", "origin", "git@github.com:tryatlas/atlas.git"]);
+        assert_eq!(
+            origin_url(repo.path()).as_deref(),
+            Some("github.com/tryatlas/atlas")
+        );
+    }
+
+    #[test]
+    fn an_ordinary_clone_is_not_shallow() {
+        let repo = TestRepo::new();
+        repo.write("a", "1");
+        repo.commit_all("initial");
+        assert!(!is_shallow(repo.path()));
     }
 
     #[test]

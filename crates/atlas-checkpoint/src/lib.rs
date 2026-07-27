@@ -50,6 +50,7 @@
 //! what ends up in the store.
 
 pub mod blobs;
+pub mod binding;
 pub mod capture;
 pub mod checkpoint;
 pub mod git;
@@ -67,8 +68,9 @@ pub use capture::{
 };
 pub use error::{Error, Result};
 pub use checkpoint::{reconcile_rewrites, walk_new_commits, ReconcileOutcome, WalkOutcome};
+pub use binding::{bind, detect, disable, enable, refresh_detection};
 pub use model::{
-    AgentEdit, Checkpoint, LinkState, FileTouch, Message, Mode, Role, Session, Source, SyncState, TokenTotals, ToolCall,
+    AgentEdit, Binding, Checkpoint, LinkState, WorkspaceDetection, FileTouch, Message, Mode, Role, Session, Source, SyncState, TokenTotals, ToolCall,
     ToolStatus, TurnState, WorkspaceMode,
 };
 pub use schema::{REQUIRED_INDEXES, SCHEMA_VERSION};
