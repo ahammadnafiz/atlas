@@ -76,6 +76,11 @@ atlas-codeindex = { path = "../crates/atlas-codeindex" }
 # Structured side-by-side git diff engine (vendors delta's word-diff). Drives
 # `commands::gitdiff` (diff viewer + editor gutter).
 atlas-gitdiff = { path = "../crates/atlas-gitdiff" }
+# Single source of truth for secret redaction. Capture scrubs agent content on
+# the way *into* the local store rather than on the way out to the network, so
+# nothing downstream — sync, export, share, support bundles — has to remember to
+# do it. Pure crate: no I/O, no async, no Tauri.
+atlas-redact = { path = "../crates/atlas-redact" }
 dirs = "6"
 sha2 = "0.10"
 # URL parsing for the embedded browser (`commands::browser`). Already in the

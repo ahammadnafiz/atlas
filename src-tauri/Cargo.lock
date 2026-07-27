@@ -359,6 +359,7 @@ dependencies = [
  "atlas-embed",
  "atlas-gitdiff",
  "atlas-memory",
+ "atlas-redact",
  "atlas-review",
  "atlas-terminal",
  "base64 0.21.7",
@@ -527,6 +528,14 @@ dependencies = [
  "tokio",
  "tracing",
  "usearch",
+]
+
+[[package]]
+name = "atlas-redact"
+version = "0.1.0"
+dependencies = [
+ "regex",
+ "serde_json",
 ]
 
 [[package]]
