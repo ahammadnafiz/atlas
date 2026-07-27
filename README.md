@@ -82,6 +82,8 @@ Prompts, code, file paths, notes, terminal I/O, browser URLs, and API keys are n
 
 **The update check is separate.** Atlas asks for the latest version on launch, independently of the telemetry toggle, because an app that stops learning about security updates when you decline analytics is a worse deal than the one you thought you were making. It has its own switch: **Settings → Updates → "Automatic updates"**.
 
+**Session capture is local-only by default.** The [Checkpoints](#checkpoints) record of your agent sessions is written to `.atlas/sessions.db` on your machine and stays there — no account required, and nothing is sent anywhere until you explicitly opt in to sync.
+
 ---
 
 ## Getting started
