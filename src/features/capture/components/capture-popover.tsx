@@ -4,6 +4,8 @@ import { Check, CircleDot, GitBranch, Loader2, Lock } from "lucide-react";
 
 import { useAuthStore } from "@/features/auth/stores/auth-store";
 
+import type { CaptureHealth } from "./capture-control";
+
 /**
  * Turning session capture on for a Workspace.
  *
@@ -50,10 +52,12 @@ interface Detection {
 
 interface Props {
   projectPath: string;
+  /** Why capture is degraded or stopped, if it is. */
+  health: CaptureHealth | null;
   onClose: () => void;
 }
 
-export function CapturePopover({ projectPath, onClose }: Props) {
+export function CapturePopover({ projectPath, health, onClose }: Props) {
   const signedIn = useAuthStore.use.snapshot().status === "signed-in";
 
   const [binding, setBinding] = useState<Binding | null>(null);
@@ -103,6 +107,8 @@ export function CapturePopover({ projectPath, onClose }: Props) {
         <StatusPill binding={binding} />
       </header>
 
+      <HealthDetail health={health} />
+
       {binding ? (
         <BoundState
           binding={binding}
@@ -133,6 +139,46 @@ export function CapturePopover({ projectPath, onClose }: Props) {
         </p>
       )}
     </div>
+  );
+}
+
+/**
+ * Why capture is degraded or stopped.
+ *
+ * One signal to notice in the header, the detail available on click. Each
+ * condition carries a next step, because "capture stopped" without a cause is
+ * only marginally better than the silence it replaced.
+ *
+ * Nothing renders while healthy — a permanent green banner trains people to
+ * stop reading the thing they are supposed to notice.
+ */
+function HealthDetail({ health }: { health: CaptureHealth | null }) {
+  if (!health || health.state === "ok" || health.issues.length === 0) return null;
+
+  const stopped = health.state === "stopped";
+  return (
+    <ul
+      className={`mb-2 space-y-1.5 rounded px-2 py-1.5 ${
+        stopped ? "bg-[var(--bg-danger-subtle)]" : "bg-[var(--bg-warning-subtle)]"
+      }`}
+    >
+      {health.issues.map((issue) => (
+        <li key={issue.reason} className="text-[11px]">
+          <p
+            className={
+              issue.state === "stopped"
+                ? "text-[var(--text-danger)]"
+                : "text-[var(--text-warning)]"
+            }
+          >
+            {issue.reason}
+          </p>
+          {issue.nextStep && (
+            <p className="text-[var(--text-tertiary)]">{issue.nextStep}</p>
+          )}
+        </li>
+      ))}
+    </ul>
   );
 }
 

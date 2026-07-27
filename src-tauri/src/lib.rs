@@ -360,6 +360,7 @@ pub fn run() {
             commands::capture::capture_refresh,
             commands::capture::capture_disable,
             commands::capture::capture_git_init,
+            commands::capture::capture_health,
             commands::git_watcher::git_watch_status,
             commands::mention_search::mention_search,
             commands::mention_search::mention_cache_set_knowledge,

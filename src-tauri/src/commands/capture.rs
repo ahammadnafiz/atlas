@@ -372,6 +372,33 @@ pub fn capture_git_init(project_path: String) -> Result<Option<atlas_checkpoint:
     capture_refresh(project_path)
 }
 
+/// The capture-health state for a Workspace.
+///
+/// Watcher liveness is read from the watcher registry itself rather than
+/// inferred from "no events lately" — a quiet repository and a dead watcher are
+/// indistinguishable from the event stream, which is exactly how the clear-all
+/// bug stayed invisible.
+#[tauri::command]
+pub fn capture_health(
+    project_path: String,
+    workspace_id: Option<String>,
+    watchers: tauri::State<'_, super::git_watcher::GitWatcherState>,
+) -> Result<atlas_checkpoint::CaptureHealth, String> {
+    let root = std::path::Path::new(&project_path);
+    let store = open_store(&project_path)?;
+
+    let expects_watcher = atlas_checkpoint::git::is_repository(root);
+    let watcher_attached = expects_watcher
+        && watchers.is_watching(workspace_id.as_deref().unwrap_or(&project_path));
+
+    atlas_checkpoint::evaluate_health(
+        &store,
+        &project_path,
+        atlas_checkpoint::HostSignals { watcher_attached, expects_watcher },
+    )
+    .map_err(|e| e.to_string())
+}
+
 /// Open a Workspace's store for a one-shot command.
 ///
 /// A second window holding the writer lock still gets a readable store, so the

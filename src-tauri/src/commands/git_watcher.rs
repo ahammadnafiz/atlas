@@ -91,6 +91,16 @@ impl GitWatcherState {
         *self.refs_cache.write() = None;
     }
 
+    /// Is a watcher currently attached for this workspace?
+    ///
+    /// The capture-health signal asks the registry directly rather than
+    /// inferring liveness from event silence — a quiet repository and a dead
+    /// watcher produce exactly the same (absence of) events, which is why the
+    /// clear-all bug went unnoticed for as long as it did.
+    pub fn is_watching(&self, workspace_id: &str) -> bool {
+        self.watchers.read().contains_key(workspace_id)
+    }
+
     /// Shared handle for the watcher closure to invalidate the cache
     /// from outside `impl GitWatcherState`. Arc-cloning is constant
     /// time; the closure ends up owning a second Arc and writes

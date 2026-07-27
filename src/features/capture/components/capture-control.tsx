@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import * as Popover from "@radix-ui/react-popover";
 import { invoke } from "@tauri-apps/api/core";
-import { CircleDot } from "lucide-react";
+import { CircleDot, CircleSlash, TriangleAlert } from "lucide-react";
 
 import { useProjectStore } from "@/features/project/stores/project-store";
 
@@ -23,11 +23,27 @@ interface Binding {
   enabled: boolean;
 }
 
+export interface HealthIssue {
+  state: "ok" | "degraded" | "stopped";
+  reason: string;
+  nextStep: string;
+}
+
+export interface CaptureHealth {
+  state: "ok" | "degraded" | "stopped";
+  summary: string;
+  issues: HealthIssue[];
+  flaggedSessions: number;
+  failedRows: number;
+  pendingRows: number;
+}
+
 export function CaptureControl() {
   const currentProject = useProjectStore.use.currentProject();
   const projectPath = currentProject?.path ?? null;
 
   const [binding, setBinding] = useState<Binding | null>(null);
+  const [health, setHealth] = useState<CaptureHealth | null>(null);
   const [open, setOpen] = useState(false);
 
   useEffect(() => {
@@ -45,6 +61,13 @@ export function CaptureControl() {
       .catch(() => {
         if (!cancelled) setBinding(null);
       });
+    void invoke<CaptureHealth>("capture_health", { projectPath })
+      .then((result) => {
+        if (!cancelled) setHealth(result);
+      })
+      .catch(() => {
+        if (!cancelled) setHealth(null);
+      });
     return () => {
       cancelled = true;
     };
@@ -54,11 +77,17 @@ export function CaptureControl() {
   if (!projectPath) return null;
 
   const capturing = binding?.enabled ?? false;
+  // Health outranks the plain capturing/paused label. The entire reason this
+  // signal exists is that a Workspace can look fine and be recording nothing.
+  const degraded = health?.state === "degraded";
+  const stopped = health?.state === "stopped" && capturing;
   const label = !binding
     ? "Session capture"
-    : capturing
-      ? `Capturing · ${binding.mode === "cloud" ? "Cloud" : "Local"}`
-      : "Capture paused";
+    : stopped || degraded
+      ? (health?.summary ?? "Capture needs attention")
+      : capturing
+        ? `Capturing · ${binding.mode === "cloud" ? "Cloud" : "Local"}`
+        : "Capture paused";
 
   return (
     <div className="px-1.5 pb-1 shrink-0">
@@ -67,16 +96,22 @@ export function CaptureControl() {
           <button
             type="button"
             className="flex w-full items-center gap-2 rounded px-2 py-1 text-left text-[12px] text-[var(--text-secondary)] outline-none hover:bg-[var(--bg-hover)]"
-            title="Session capture for this Workspace"
+            title={health?.summary ?? "Session capture for this Workspace"}
           >
-            <CircleDot
-              size={13}
-              className={
-                capturing
-                  ? "text-[var(--text-success)]"
-                  : "text-[var(--text-tertiary)]"
-              }
-            />
+            {stopped ? (
+              <CircleSlash size={13} className="text-[var(--text-danger)]" />
+            ) : degraded ? (
+              <TriangleAlert size={13} className="text-[var(--text-warning)]" />
+            ) : (
+              <CircleDot
+                size={13}
+                className={
+                  capturing
+                    ? "text-[var(--text-success)]"
+                    : "text-[var(--text-tertiary)]"
+                }
+              />
+            )}
             <span className="truncate">{label}</span>
             {!binding && (
               <span className="ml-auto text-[11px] text-[var(--text-tertiary)]">Off</span>
@@ -85,7 +120,11 @@ export function CaptureControl() {
         </Popover.Trigger>
         <Popover.Portal>
           <Popover.Content side="right" align="start" sideOffset={6} className="z-50">
-            <CapturePopover projectPath={projectPath} onClose={() => setOpen(false)} />
+            <CapturePopover
+            projectPath={projectPath}
+            health={health}
+            onClose={() => setOpen(false)}
+          />
           </Popover.Content>
         </Popover.Portal>
       </Popover.Root>

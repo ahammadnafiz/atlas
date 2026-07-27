@@ -1006,6 +1006,57 @@ impl Store {
         )?)
     }
 
+    /// Can this store actually be written to right now?
+    ///
+    /// Distinct from holding the writer lock: the lock says another window is
+    /// recording, this says the disk is full or the directory is read-only. Both
+    /// stop capture, and a developer needs to be told which.
+    ///
+    /// Verified by writing rather than by inspecting permissions — a read-only
+    /// volume, a full disk and a revoked directory permission all look fine to a
+    /// metadata check and all fail at the moment it matters.
+    pub fn check_writable(&self) -> Result<()> {
+        let probe = self.root.join(".write-probe");
+        std::fs::write(&probe, b"")
+            .map_err(|e| Error::Storage(format!("{}: {e}", self.root.display())))?;
+        let _ = std::fs::remove_file(&probe);
+        Ok(())
+    }
+
+    /// Sessions flagged during capture — a redaction or storage failure.
+    pub fn flagged_session_count(&self, workspace_id: &str) -> Result<i64> {
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*) FROM agent_session
+              WHERE workspace_id = ?1 AND needs_attention = 1",
+            [workspace_id],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// How many rows across every synced table are in `state`.
+    ///
+    /// Counts Sessions, Messages, tool calls and Checkpoints together, because
+    /// "3 pending" should mean three things waiting rather than three of one
+    /// arbitrary kind.
+    pub fn row_count_in_state(&self, workspace_id: &str, state: SyncState) -> Result<i64> {
+        Ok(self.conn.query_row(
+            "SELECT
+               (SELECT COUNT(*) FROM agent_session
+                 WHERE workspace_id = ?1 AND sync_state = ?2)
+             + (SELECT COUNT(*) FROM agent_message
+                 WHERE sync_state = ?2
+                   AND session_id IN (SELECT id FROM agent_session WHERE workspace_id = ?1))
+             + (SELECT COUNT(*) FROM tool_call
+                 WHERE sync_state = ?2
+                   AND session_id IN (SELECT id FROM agent_session WHERE workspace_id = ?1))
+             + (SELECT COUNT(*) FROM checkpoint
+                 WHERE sync_state = ?2
+                   AND session_id IN (SELECT id FROM agent_session WHERE workspace_id = ?1))",
+            rusqlite::params![workspace_id, state.as_str()],
+            |row| row.get(0),
+        )?)
+    }
+
     /// Every index the store guarantees, as the database actually has them.
     pub fn index_names(&self) -> Result<Vec<String>> {
         let mut stmt = self
