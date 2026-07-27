@@ -36,10 +36,12 @@ use std::sync::mpsc;
 use std::sync::Mutex;
 
 use atlas_agents::{
-    MessageRole, OutboundMiddleware, SessionDelta, SessionDeltaEnvelope,
+    MessageRole, OutboundMiddleware, SessionDelta, SessionDeltaEnvelope, ToolCallStatus,
 };
+use atlas_checkpoint::tools::{extract_paths, resolve_path, ResolvedPath, ToolName};
 use atlas_checkpoint::{
-    Capture, Mode, Role, SessionKey, Source, Store, TokenTotals, TurnContent, WorkspaceMode,
+    Capture, FileWrite, Mode, Role, SessionKey, Source, Store, TokenTotals, ToolCallContent,
+    ToolStatus, TurnContent, WorkspaceMode,
 };
 use tauri::{AppHandle, Manager};
 
@@ -75,6 +77,26 @@ enum Job {
         mode: Mode,
         body: String,
     },
+    ToolCall {
+        binding: Binding,
+        native_call_id: String,
+        tool_name: ToolName,
+        title: Option<String>,
+        kind: Option<String>,
+        status: ToolStatus,
+        locations: serde_json::Value,
+        arguments: Option<String>,
+        result: Option<String>,
+        /// Paths this call touches, with whether each existed *before* the agent
+        /// wrote — sampled on first sighting, because after the write the answer
+        /// is unknowable.
+        writes: Vec<PendingWrite>,
+        /// The call has finished, so the file on disk is now what the agent
+        /// left and can be hashed.
+        terminal: bool,
+        /// The patch an edit-shaped call applied, when the arguments carry one.
+        patch: Option<String>,
+    },
     FinishTurn {
         binding: Binding,
     },
@@ -84,9 +106,25 @@ enum Job {
     },
 }
 
+/// A file a tool call is about to write, and what we knew before it did.
+#[derive(Clone)]
+struct PendingWrite {
+    path: ResolvedPath,
+    existed_before: bool,
+}
+
 /// App-wide capture state: the session registry and the worker's channel.
 pub struct CaptureState {
     sessions: Mutex<HashMap<String, Binding>>,
+    /// `existed_before` per (tool call, path), sampled the first time we see the
+    /// call and reused when it completes.
+    ///
+    /// This has to be sampled on the emit thread rather than on the worker: the
+    /// first-sighting delta arrives *before* the agent performs the write, and
+    /// that is the only moment the answer is knowable. A `stat` is microseconds,
+    /// so it does not meaningfully cost the hot path — unlike hashing the file,
+    /// which is deferred to the worker.
+    pending_writes: Mutex<HashMap<String, Vec<PendingWrite>>>,
     tx: mpsc::Sender<Job>,
 }
 
@@ -103,6 +141,7 @@ impl CaptureState {
             .expect("capture worker thread");
         Self {
             sessions: Mutex::new(HashMap::new()),
+            pending_writes: Mutex::new(HashMap::new()),
             tx,
         }
     }
@@ -161,6 +200,46 @@ impl CaptureState {
             .cloned()
     }
 
+    /// Note which files a call is about to touch, and whether each existed.
+    ///
+    /// Sampled once per call — the first sighting arrives before the agent
+    /// writes, and every later sighting reuses that answer. Re-sampling on the
+    /// completion update would always report `true`, which would make the link
+    /// rule credit the agent for files a human wrote.
+    fn sample_writes(
+        &self,
+        call_id: &str,
+        workspace_root: &std::path::Path,
+        locations: &[serde_json::Value],
+        arguments: &serde_json::Value,
+    ) -> Vec<PendingWrite> {
+        let mut pending = self.pending_writes.lock().expect("pending writes");
+        if let Some(existing) = pending.get(call_id) {
+            return existing.clone();
+        }
+
+        let writes: Vec<PendingWrite> = extract_paths(locations, arguments)
+            .into_iter()
+            .map(|raw| {
+                let path = resolve_path(&raw, workspace_root);
+                let existed_before = workspace_root.join(&path.path).exists();
+                PendingWrite { path, existed_before }
+            })
+            .collect();
+
+        if !writes.is_empty() {
+            pending.insert(call_id.to_string(), writes.clone());
+        }
+        writes
+    }
+
+    fn forget_writes(&self, call_id: &str) {
+        self.pending_writes
+            .lock()
+            .expect("pending writes")
+            .remove(call_id);
+    }
+
     fn submit(&self, job: Job) {
         // A dead worker must not take the agent down with it. The turn is lost,
         // which is what the capture-health signal exists to surface.
@@ -199,6 +278,7 @@ fn worker(rx: mpsc::Receiver<Job>) {
         let binding = match &job {
             Job::Prompt { binding, .. }
             | Job::Turn { binding, .. }
+            | Job::ToolCall { binding, .. }
             | Job::FinishTurn { binding }
             | Job::Usage { binding, .. } => binding.clone(),
         };
@@ -281,6 +361,40 @@ fn worker(rx: mpsc::Receiver<Job>) {
                 // attach to. Normal, not an error.
                 None => Ok(()),
             },
+            Job::ToolCall {
+                native_call_id,
+                tool_name,
+                title,
+                kind,
+                status,
+                locations,
+                arguments,
+                result,
+                writes,
+                terminal,
+                patch,
+                ..
+            } => match session_ids.get(&binding.native_session_id) {
+                Some(session_id) => record_tool_call(
+                    &mut capture,
+                    session_id,
+                    &binding,
+                    ToolCallJob {
+                        native_call_id,
+                        tool_name,
+                        title,
+                        kind,
+                        status,
+                        locations,
+                        arguments,
+                        result,
+                        writes,
+                        terminal,
+                        patch,
+                    },
+                ),
+                None => Ok(()),
+            },
             Job::FinishTurn { .. } => match session_ids.get(&binding.native_session_id) {
                 Some(session_id) => capture.finish_turn(session_id, binding.turn_seq),
                 None => Ok(()),
@@ -296,6 +410,131 @@ fn worker(rx: mpsc::Receiver<Job>) {
             // this is the operator-facing half.
             tracing::warn!(target: "atlas::capture", "capture failed: {e}");
         }
+    }
+}
+
+/// The worker's view of one tool call.
+struct ToolCallJob {
+    native_call_id: String,
+    tool_name: ToolName,
+    title: Option<String>,
+    kind: Option<String>,
+    status: ToolStatus,
+    locations: serde_json::Value,
+    arguments: Option<String>,
+    result: Option<String>,
+    writes: Vec<PendingWrite>,
+    terminal: bool,
+    patch: Option<String>,
+}
+
+/// Write the tool call, then — once it has finished — hash what it left on disk.
+///
+/// The hash is taken here rather than at turn end, because by turn end the
+/// developer may already have edited the file, and recording their content as
+/// the agent's is exactly the false attribution the link rule exists to prevent.
+/// Reading the file is real I/O, which is why it happens on the worker thread
+/// and not on the emit thread that sampled `existed_before`.
+fn record_tool_call(
+    capture: &mut Capture<'_>,
+    session_id: &str,
+    binding: &Binding,
+    job: ToolCallJob,
+) -> atlas_checkpoint::Result<()> {
+    let call_id = capture.record_tool_call(
+        session_id,
+        ToolCallContent {
+            turn_seq: binding.turn_seq,
+            native_call_id: Some(&job.native_call_id),
+            tool_name: job.tool_name,
+            title: job.title.as_deref(),
+            kind: job.kind.as_deref(),
+            status: job.status,
+            locations: &job.locations,
+            arguments: job.arguments.as_deref(),
+            result: job.result.as_deref().map(str::as_bytes),
+        },
+    )?;
+
+    if !job.terminal {
+        return Ok(());
+    }
+
+    for write in &job.writes {
+        let absolute = binding.workspace_root.join(&write.path.path);
+        // A file the call was going to write that is no longer there was
+        // deleted. There is no content hash for a deletion — the marker is the
+        // evidence the link rule uses instead.
+        let (sha256_after, deleted) = match std::fs::read(&absolute) {
+            Ok(bytes) => (Some(atlas_checkpoint::hash_written_content(&bytes)), false),
+            Err(_) => (None, true),
+        };
+
+        capture.record_file_write(
+            session_id,
+            &call_id,
+            binding.turn_seq,
+            FileWrite {
+                path: &write.path,
+                sha256_after,
+                existed_before: write.existed_before,
+                deleted,
+            },
+        )?;
+
+        if let Some(patch) = &job.patch {
+            capture.record_edit_patch(
+                session_id,
+                &call_id,
+                binding.turn_seq,
+                &write.path.path,
+                patch,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Serialise a call's arguments for storage, dropping an empty object rather
+/// than storing `{}` on every shell command.
+fn serialize_arguments(arguments: &serde_json::Value) -> Option<String> {
+    match arguments {
+        serde_json::Value::Object(map) if map.is_empty() => None,
+        serde_json::Value::Null => None,
+        other => Some(other.to_string()),
+    }
+}
+
+/// The patch an edit-shaped call applied, from whatever shape its arguments use.
+///
+/// Attribution's input, and unrecoverable once the Session ends and the file
+/// moves on — so a best-effort reconstruction from the before/after strings is
+/// worth more than nothing. Agents that hand over a real diff are preferred.
+fn edit_patch(arguments: &serde_json::Value) -> Option<String> {
+    for key in ["patch", "diff"] {
+        if let Some(patch) = arguments.get(key).and_then(serde_json::Value::as_str) {
+            if !patch.trim().is_empty() {
+                return Some(patch.to_string());
+            }
+        }
+    }
+
+    let old = ["old_string", "oldText", "old_str"]
+        .iter()
+        .find_map(|k| arguments.get(k).and_then(serde_json::Value::as_str));
+    let new = ["new_string", "newText", "new_str", "content"]
+        .iter()
+        .find_map(|k| arguments.get(k).and_then(serde_json::Value::as_str));
+
+    match (old, new) {
+        (None, None) => None,
+        (old, new) => Some(format!(
+            "--- before\n+++ after\n{}{}",
+            old.map(|o| format!("-{}\n", o.replace('\n', "\n-")))
+                .unwrap_or_default(),
+            new.map(|n| format!("+{}\n", n.replace('\n', "\n+")))
+                .unwrap_or_default(),
+        )),
     }
 }
 
@@ -343,6 +582,57 @@ impl OutboundMiddleware<SessionDeltaEnvelope> for CaptureMiddleware {
                     mode,
                     body,
                 });
+            }
+
+            SessionDelta::ToolCallUpserted { tool_call, .. } => {
+                let status = match tool_call.status {
+                    ToolCallStatus::Pending => ToolStatus::Pending,
+                    ToolCallStatus::Running => ToolStatus::Running,
+                    ToolCallStatus::Completed => ToolStatus::Completed,
+                    ToolCallStatus::Failed => ToolStatus::Failed,
+                };
+                let terminal =
+                    matches!(status, ToolStatus::Completed | ToolStatus::Failed);
+
+                // Derived, never the wire value: the runtime's `tool_name` is a
+                // display title for ACP agents, and grouping by it would produce
+                // one bucket per file the agent touched.
+                let tool_name = atlas_checkpoint::canonical_name(
+                    Some(&tool_call.tool_name),
+                    tool_call.title.as_deref(),
+                    tool_call.kind.as_deref(),
+                    &tool_call.arguments,
+                );
+
+                let writes = if tool_name.writes_files() {
+                    state.sample_writes(
+                        &tool_call.id,
+                        &binding.workspace_root,
+                        &tool_call.locations,
+                        &tool_call.arguments,
+                    )
+                } else {
+                    Vec::new()
+                };
+
+                state.submit(Job::ToolCall {
+                    binding,
+                    native_call_id: tool_call.id.clone(),
+                    tool_name,
+                    title: tool_call.title.clone(),
+                    kind: tool_call.kind.clone(),
+                    status,
+                    locations: serde_json::Value::Array(tool_call.locations.clone()),
+                    arguments: serialize_arguments(&tool_call.arguments),
+                    result: tool_call.result.clone(),
+                    writes,
+                    terminal,
+                    patch: edit_patch(&tool_call.arguments),
+                });
+
+                if terminal {
+                    state.forget_writes(&tool_call.id);
+                }
             }
 
             SessionDelta::UsageUpdated { usage } => {

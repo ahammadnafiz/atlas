@@ -403,11 +403,26 @@ fn apply_tool_call(
                 tc.arguments = normalise_tool_input(Some(input));
             }
             if let Some(t) = title.clone() {
-                tc.tool_name = t.clone();
+                // Only the display title is refreshed. `tool_name` keeps its
+                // first-sighting value: for the native agent that IS the real
+                // tool name ("Read", "Bash"), and overwriting it with a later
+                // title threw that away — leaving no field anywhere carrying the
+                // name, which is what session capture needs to group by.
                 tc.title = Some(t);
             }
             if let Some(k) = kind.clone() {
                 tc.kind = Some(k);
+            }
+            // Locations arrive late. Many agents attach them only on the
+            // completion update, and this branch previously never read them —
+            // so the paths an edit touched were silently lost, and the visible
+            // symptom was a Checkpoint that never formed. Empty is treated as
+            // "no news" rather than "cleared", because an update carrying only
+            // a status must not erase paths we already have.
+            if let Some(locations) = v.get("locations").and_then(|l| l.as_array()) {
+                if !locations.is_empty() {
+                    tc.locations = locations.clone();
+                }
             }
             if let Some(result) = formatted.clone() {
                 tc.result = Some(result);
@@ -468,4 +483,178 @@ fn apply_tool_call(
             tool_call,
         },
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::events::DeltaSink;
+    use std::sync::Arc;
+
+    struct NullSink;
+    impl DeltaSink for NullSink {
+        fn emit(&self, _envelope: SessionDeltaEnvelope) {}
+    }
+
+    fn session() -> (Emitter, Mutex<SessionState>) {
+        let emitter = Emitter::new(Arc::new(NullSink));
+        let state = Mutex::new(SessionState::new(
+            AgentId(uuid::Uuid::nil()),
+            "sess-1".into(),
+            "/tmp/project".into(),
+            "claude-code".into(),
+        ));
+        (emitter, state)
+    }
+
+    /// The only tool call in the session.
+    fn only_tool_call(state: &Mutex<SessionState>) -> ToolCall {
+        let st = state.lock();
+        st.messages
+            .iter()
+            .flat_map(|m| m.tool_calls.iter())
+            .next()
+            .expect("a tool call")
+            .clone()
+    }
+
+    #[test]
+    fn locations_arriving_only_on_a_completion_update_are_captured() {
+        // The defect this pins: many agents attach `locations` only when the
+        // call completes, and the upsert branch used to never read the field.
+        // The symptom was not a visible error — it was a Checkpoint that never
+        // formed, because the paths the edit touched were silently lost.
+        let (emitter, state) = session();
+
+        apply_session_update(
+            &emitter,
+            &state,
+            serde_json::from_value(serde_json::json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "tc-1",
+                "title": "Edit src/lib.rs",
+                "kind": "edit",
+                "status": "in_progress",
+            }))
+            .expect("tool_call decodes"),
+        );
+        assert!(only_tool_call(&state).locations.is_empty());
+
+        apply_session_update(
+            &emitter,
+            &state,
+            serde_json::from_value(serde_json::json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "tc-1",
+                "status": "completed",
+                "locations": [{ "path": "/tmp/project/src/lib.rs" }],
+            }))
+            .expect("tool_call_update decodes"),
+        );
+
+        let tc = only_tool_call(&state);
+        assert_eq!(tc.status, ToolCallStatus::Completed);
+        assert_eq!(tc.locations.len(), 1, "locations from the update were dropped");
+        assert_eq!(tc.locations[0]["path"], "/tmp/project/src/lib.rs");
+    }
+
+    #[test]
+    fn a_later_update_without_locations_does_not_erase_the_ones_we_have() {
+        let (emitter, state) = session();
+
+        apply_session_update(
+            &emitter,
+            &state,
+            serde_json::from_value(serde_json::json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "tc-1",
+                "title": "Edit src/lib.rs",
+                "kind": "edit",
+                "status": "in_progress",
+                "locations": [{ "path": "/tmp/project/src/lib.rs" }],
+            }))
+            .unwrap(),
+        );
+        apply_session_update(
+            &emitter,
+            &state,
+            serde_json::from_value(serde_json::json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "tc-1",
+                "status": "completed",
+            }))
+            .unwrap(),
+        );
+
+        assert_eq!(only_tool_call(&state).locations.len(), 1);
+    }
+
+    #[test]
+    fn the_first_sighting_tool_name_survives_a_later_title_change() {
+        // For the native agent the first-sighting title IS the real tool name
+        // ("Read", "Bash"). Overwriting `tool_name` with every later title threw
+        // that away, leaving no field anywhere carrying the name that session
+        // capture needs to group by.
+        let (emitter, state) = session();
+
+        apply_session_update(
+            &emitter,
+            &state,
+            serde_json::from_value(serde_json::json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "tc-1",
+                "title": "Bash",
+                "kind": "execute",
+                "status": "in_progress",
+            }))
+            .unwrap(),
+        );
+        apply_session_update(
+            &emitter,
+            &state,
+            serde_json::from_value(serde_json::json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "tc-1",
+                "title": "Bash(cargo test --package atlas-review)",
+                "status": "completed",
+            }))
+            .unwrap(),
+        );
+
+        let tc = only_tool_call(&state);
+        assert_eq!(tc.tool_name, "Bash", "the name must not churn with the title");
+        assert_eq!(
+            tc.title.as_deref(),
+            Some("Bash(cargo test --package atlas-review)"),
+            "the display title must still refresh"
+        );
+    }
+
+    #[test]
+    fn a_failed_tool_call_keeps_its_failed_status() {
+        let (emitter, state) = session();
+        apply_session_update(
+            &emitter,
+            &state,
+            serde_json::from_value(serde_json::json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "tc-1",
+                "title": "Bash",
+                "kind": "execute",
+                "status": "in_progress",
+            }))
+            .unwrap(),
+        );
+        apply_session_update(
+            &emitter,
+            &state,
+            serde_json::from_value(serde_json::json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "tc-1",
+                "status": "failed",
+            }))
+            .unwrap(),
+        );
+        assert_eq!(only_tool_call(&state).status, ToolCallStatus::Failed);
+    }
 }

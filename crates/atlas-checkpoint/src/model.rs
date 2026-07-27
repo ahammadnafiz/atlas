@@ -310,3 +310,105 @@ impl Message {
         self.body_ref.is_some()
     }
 }
+
+/// How a tool call ended.
+///
+/// Recording this costs nothing — ACP supplies it — and it makes "what did the
+/// agent try that didn't work" answerable, which is often the most useful
+/// question about a Session and a facet Entire's UI cannot offer at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolStatus {
+    Pending,
+    Running,
+    Completed,
+    Failed,
+}
+
+impl ToolStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Running => "running",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "pending" => Some(Self::Pending),
+            "running" => Some(Self::Running),
+            "completed" => Some(Self::Completed),
+            "failed" => Some(Self::Failed),
+            _ => None,
+        }
+    }
+}
+
+/// One tool invocation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolCall {
+    pub id: String,
+    pub session_id: String,
+    pub seq: i64,
+    pub turn_seq: i64,
+    /// Canonical, derived — see [`crate::tools::canonical_name`]. This is what
+    /// the sidebar groups by.
+    pub tool_name: crate::tools::ToolName,
+    /// What the agent called it, for display.
+    pub title: Option<String>,
+    /// ACP's category.
+    pub kind: Option<String>,
+    pub status: ToolStatus,
+    /// Pre-extracted paths, as the agent reported them.
+    pub locations: serde_json::Value,
+    pub arguments: Option<String>,
+    pub arguments_ref: Option<String>,
+    pub result: Option<String>,
+    pub result_ref: Option<String>,
+    /// The result was not text and was stored verbatim rather than scrubbed.
+    pub result_binary: bool,
+    pub created_at: DateTime<Utc>,
+    pub sync_state: SyncState,
+}
+
+/// A file the agent wrote, as it stood immediately after the write.
+///
+/// Both discriminating fields are captured at write time and are unrecoverable
+/// afterwards. By the time a commit lands the file exists either way, and the
+/// agent's version has been overwritten — so the asymmetric link rule can only
+/// work if these were recorded when they were still true.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileTouch {
+    pub id: String,
+    pub tool_call_id: String,
+    pub session_id: String,
+    pub turn_seq: i64,
+    pub seq: i64,
+    /// NFC-normalised and workspace-relative.
+    pub path: String,
+    /// Hash of what the agent produced. `None` for a deletion.
+    pub sha256_after: Option<String>,
+    /// Whether the file existed before the agent wrote it. The link rule is
+    /// asymmetric on exactly this: an existing file links on path alone, a new
+    /// one only on a content match.
+    pub existed_before: bool,
+    pub deleted: bool,
+    /// Written outside the Workspace root, so it can never match a commit.
+    pub out_of_repo: bool,
+    pub created_at: DateTime<Utc>,
+}
+
+/// The patch an edit-shaped call applied. Attribution's input.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentEdit {
+    pub id: String,
+    pub tool_call_id: String,
+    pub session_id: String,
+    pub turn_seq: i64,
+    pub path: String,
+    pub patch: Option<String>,
+    pub patch_ref: Option<String>,
+    pub created_at: DateTime<Utc>,
+}

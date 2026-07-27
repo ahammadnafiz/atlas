@@ -16,7 +16,7 @@ use rusqlite::Connection;
 use crate::error::{Error, Result};
 
 /// Bump when adding a migration, and add the matching arm in [`migrate`].
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 pub fn migrate(conn: &Connection) -> Result<()> {
     let found: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
@@ -33,6 +33,9 @@ pub fn migrate(conn: &Connection) -> Result<()> {
 
     if found < 1 {
         conn.execute_batch(V1)?;
+    }
+    if found < 2 {
+        conn.execute_batch(V2)?;
     }
 
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -141,6 +144,111 @@ CREATE INDEX IF NOT EXISTS idx_session_started
     ON agent_session (workspace_id, started_at);
 "#;
 
+const V2: &str = r#"
+-- What the agent actually did. A row per invocation, never content embedded in
+-- a Message body — three independent reasons, any one sufficient:
+--
+--   * The session-detail sidebar's live counts (Tool calls 4 · File edits 1 ·
+--     Bash 1 · Read 2) have to be a GROUP BY. Inside a body they would mean
+--     parsing a blob per Session, and board-level filters would full-scan.
+--   * A tool `result` is the largest payload in a Session — a read of a big
+--     file, a verbose test run. Spilling it independently of the row is what
+--     actually keeps rows under the storage row cap.
+--   * `arguments` and `result` are the highest-risk content for secrets, so
+--     redaction needs them individually addressable.
+CREATE TABLE IF NOT EXISTS tool_call (
+    id             TEXT PRIMARY KEY,
+    session_id     TEXT NOT NULL REFERENCES agent_session(id) ON DELETE CASCADE,
+    seq            INTEGER NOT NULL,
+    turn_seq       INTEGER NOT NULL,
+    -- The agent's own id for the call — the idempotency key across the
+    -- first-sighting event and every later update.
+    native_call_id TEXT,
+    -- Derived, not handed over: the wire has no canonical tool name. Grouping by
+    -- the raw wire value would produce one bucket per file the agent touched.
+    tool_name      TEXT NOT NULL,
+    -- The human display string, kept separately so the detail view can show what
+    -- the agent called it without the facet counts inheriting the churn.
+    title          TEXT,
+    kind           TEXT,
+    status         TEXT NOT NULL,
+    locations      TEXT NOT NULL DEFAULT '[]',
+    arguments      TEXT,
+    arguments_ref  TEXT,
+    result         TEXT,
+    result_ref     TEXT,
+    -- A non-UTF8 result (a compiled binary, an image) is stored verbatim and
+    -- skipped by string redaction rather than lossily decoded and corrupted.
+    result_binary  INTEGER NOT NULL DEFAULT 0,
+    created_at     TEXT NOT NULL,
+    sync_state     TEXT NOT NULL DEFAULT 'local',
+    sync_attempts  INTEGER NOT NULL DEFAULT 0,
+
+    UNIQUE (session_id, seq)
+);
+
+-- The derived subset produced by file-writing calls. A shell command or a file
+-- read yields neither this nor an edit patch, which is exactly why they cannot
+-- stand in for a general tool-call record.
+--
+-- `existed_before` and `sha256_after` are captured at write time and are
+-- unrecoverable afterwards: by the time a commit lands the file exists either
+-- way, and the agent's version has been overwritten. The asymmetric link rule
+-- is built entirely on those two facts.
+CREATE TABLE IF NOT EXISTS file_touch (
+    id             TEXT PRIMARY KEY,
+    tool_call_id   TEXT NOT NULL REFERENCES tool_call(id) ON DELETE CASCADE,
+    session_id     TEXT NOT NULL REFERENCES agent_session(id) ON DELETE CASCADE,
+    turn_seq       INTEGER NOT NULL,
+    seq            INTEGER NOT NULL,
+    -- NFC-normalised, workspace-relative. macOS hands back NFD while git stores
+    -- NFC, and a byte comparison of the two fails silently.
+    path           TEXT NOT NULL,
+    sha256_after   TEXT,
+    existed_before INTEGER NOT NULL,
+    deleted        INTEGER NOT NULL DEFAULT 0,
+    -- Written outside the Workspace root. Can never match a commit, and is
+    -- flagged so it is not counted as pending agent work forever.
+    out_of_repo    INTEGER NOT NULL DEFAULT 0,
+    created_at     TEXT NOT NULL
+);
+
+-- Attribution's input. The metric — the agent-versus-human line split — is a
+-- pure function over stored rows and can be computed and backfilled whenever;
+-- the patch cannot be recaptured once the Session ends and the file moves on.
+CREATE TABLE IF NOT EXISTS agent_edit (
+    id           TEXT PRIMARY KEY,
+    tool_call_id TEXT NOT NULL REFERENCES tool_call(id) ON DELETE CASCADE,
+    session_id   TEXT NOT NULL REFERENCES agent_session(id) ON DELETE CASCADE,
+    turn_seq     INTEGER NOT NULL,
+    path         TEXT NOT NULL,
+    patch        TEXT,
+    patch_ref    TEXT,
+    created_at   TEXT NOT NULL
+);
+
+-- The sidebar's per-kind counts.
+CREATE INDEX IF NOT EXISTS idx_tool_call_facets
+    ON tool_call (session_id, tool_name);
+CREATE INDEX IF NOT EXISTS idx_tool_call_session_seq
+    ON tool_call (session_id, seq);
+CREATE INDEX IF NOT EXISTS idx_tool_call_outbox
+    ON tool_call (sync_state, seq);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_tool_call_native_id
+    ON tool_call (session_id, native_call_id)
+    WHERE native_call_id IS NOT NULL;
+
+-- The link rule's lookup: every path a Session touched.
+CREATE INDEX IF NOT EXISTS idx_file_touch_path
+    ON file_touch (session_id, path);
+-- …and the reverse, which is what turns an observed commit into candidate
+-- Sessions without scanning every Session in the Workspace.
+CREATE INDEX IF NOT EXISTS idx_file_touch_by_path
+    ON file_touch (path);
+CREATE INDEX IF NOT EXISTS idx_agent_edit_session
+    ON agent_edit (session_id, turn_seq);
+"#;
+
 /// Index names the store guarantees. Exposed so a test can assert they survived
 /// a migration — an index silently dropped is a full scan nobody notices until
 /// a developer with a year of history opens the board.
@@ -151,4 +259,11 @@ pub const REQUIRED_INDEXES: &[&str] = &[
     "idx_message_facets",
     "idx_message_native_id",
     "idx_session_started",
+    "idx_tool_call_facets",
+    "idx_tool_call_session_seq",
+    "idx_tool_call_outbox",
+    "idx_tool_call_native_id",
+    "idx_file_touch_path",
+    "idx_file_touch_by_path",
+    "idx_agent_edit_session",
 ];

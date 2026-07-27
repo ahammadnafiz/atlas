@@ -20,8 +20,11 @@
 use crate::blobs;
 use crate::error::{Error, Result};
 use crate::model::*;
-use crate::store::{MessageInput, Store};
+use crate::store::{
+    AgentEditInput, FileTouchInput, MessageInput, Store, ToolCallInput, ToolPayload,
+};
 use crate::title;
+use crate::tools::{ResolvedPath, ToolName};
 
 /// Identifies one agent conversation to the capture path.
 #[derive(Debug, Clone)]
@@ -30,6 +33,45 @@ pub struct SessionKey {
     pub source: Source,
     /// The agent's own id for this conversation.
     pub native_session_id: String,
+}
+
+/// One tool invocation, as it arrived from the agent.
+pub struct ToolCallContent<'a> {
+    pub turn_seq: i64,
+    /// The agent's own id for the call — the key that turns a later update into
+    /// an update rather than a duplicate row.
+    pub native_call_id: Option<&'a str>,
+    /// Derived; see [`crate::tools::canonical_name`].
+    pub tool_name: ToolName,
+    pub title: Option<&'a str>,
+    pub kind: Option<&'a str>,
+    pub status: ToolStatus,
+    pub locations: &'a serde_json::Value,
+    /// Raw; scrubbed on the way in.
+    pub arguments: Option<&'a str>,
+    /// Raw bytes, so a non-text payload survives intact.
+    pub result: Option<&'a [u8]>,
+}
+
+/// A file the agent wrote, described at the moment it wrote it.
+pub struct FileWrite<'a> {
+    pub path: &'a ResolvedPath,
+    /// Hash of what the agent produced. `None` for a deletion.
+    pub sha256_after: Option<String>,
+    /// Whether the file existed beforehand — determined at write time, because
+    /// afterwards it is unknowable.
+    pub existed_before: bool,
+    pub deleted: bool,
+}
+
+/// Hash the content an agent just wrote.
+///
+/// Kept beside the write so the hash is of what the *agent* produced, not of
+/// whatever is on disk at turn end — by which point the developer may already
+/// have edited it, and recording their content as the agent's is exactly the
+/// false attribution the link rule exists to prevent.
+pub fn hash_written_content(content: &[u8]) -> String {
+    crate::blobs::key_for(content)
 }
 
 /// One finalized turn, ready to record.
@@ -118,6 +160,102 @@ impl<'a> Capture<'a> {
         self.store.complete_turn(session_id, turn_seq)
     }
 
+    /// Record a tool invocation, or update the one already recorded.
+    ///
+    /// `arguments` and `result` are scrubbed here on the same on-write basis as
+    /// message bodies — a command that prints a token puts it in `result`, which
+    /// makes these the highest-risk content in a Session.
+    ///
+    /// A non-UTF-8 result is stored verbatim with a binary marker and skipped by
+    /// string redaction. Lossily decoding it to scan would corrupt the payload on
+    /// the way back out, and there is no secret to be found in bytes that cannot
+    /// be read as text.
+    pub fn record_tool_call(&mut self, session_id: &str, call: ToolCallContent<'_>) -> Result<String> {
+        let arguments = match call.arguments {
+            Some(raw) => Some(self.scrub_or_flag(session_id, raw)?),
+            None => None,
+        };
+
+        let result_text = match call.result {
+            Some(bytes) => match atlas_redact::redact_bytes(bytes) {
+                Some(_) => Some(self.scrub_or_flag(
+                    session_id,
+                    std::str::from_utf8(bytes).expect("redact_bytes already validated"),
+                )?),
+                None => None,
+            },
+            None => None,
+        };
+        let result = match (&result_text, call.result) {
+            (Some(text), _) => ToolPayload::Text(text),
+            (None, Some(bytes)) => ToolPayload::Binary(bytes),
+            (None, None) => ToolPayload::None,
+        };
+
+        self.store.upsert_tool_call(ToolCallInput {
+            session_id,
+            turn_seq: call.turn_seq,
+            native_call_id: call.native_call_id,
+            tool_name: call.tool_name,
+            title: call.title,
+            kind: call.kind,
+            status: call.status,
+            locations: call.locations,
+            arguments: arguments.as_deref(),
+            result,
+            sync_state: self.mode.initial_sync_state(),
+        })
+    }
+
+    /// Record a file the agent wrote, hashing what it produced.
+    ///
+    /// The two facts that make the link rule work are captured **here**, at write
+    /// time, and are unrecoverable afterwards. By the time a commit lands the
+    /// file exists either way, so `existed_before` is gone; and the human may
+    /// already have edited the file, so hashing at turn end would record their
+    /// content as the agent's.
+    pub fn record_file_write(
+        &mut self,
+        session_id: &str,
+        tool_call_id: &str,
+        turn_seq: i64,
+        write: FileWrite<'_>,
+    ) -> Result<String> {
+        self.store.record_file_touch(FileTouchInput {
+            tool_call_id,
+            session_id,
+            turn_seq,
+            path: &write.path.path,
+            sha256_after: write.sha256_after.as_deref(),
+            existed_before: write.existed_before,
+            deleted: write.deleted,
+            out_of_repo: write.path.out_of_repo,
+        })
+    }
+
+    /// Record the patch an edit-shaped call applied.
+    ///
+    /// Attribution's input. The metric is a pure function over stored rows and
+    /// can be computed and backfilled whenever; the patch cannot be recaptured
+    /// once the Session ends and the file moves on.
+    pub fn record_edit_patch(
+        &mut self,
+        session_id: &str,
+        tool_call_id: &str,
+        turn_seq: i64,
+        path: &str,
+        patch: &str,
+    ) -> Result<String> {
+        let scrubbed = self.scrub_or_flag(session_id, patch)?;
+        self.store.record_agent_edit(AgentEditInput {
+            tool_call_id,
+            session_id,
+            turn_seq,
+            path,
+            patch: Some(&scrubbed),
+        })
+    }
+
     /// Record token totals for a Session.
     ///
     /// Note the caller is responsible for not passing a context-window gauge as
@@ -126,6 +264,22 @@ impl<'a> Capture<'a> {
     /// the accurate figures are backfilled from the agent's own transcript.
     pub fn record_usage(&mut self, session_id: &str, totals: &TokenTotals) -> Result<()> {
         self.store.set_token_totals(session_id, totals)
+    }
+
+    /// Scrub, flagging the Session and failing closed if scrubbing did not
+    /// complete. Shared by every path that writes agent content.
+    fn scrub_or_flag(&mut self, session_id: &str, raw: &str) -> Result<String> {
+        match scrub(raw) {
+            Ok(scrubbed) => {
+                let _ = self.store.add_redaction_counts(session_id, &scrubbed.counts);
+                Ok(scrubbed.text)
+            }
+            Err(err) => {
+                let reason = err.to_string();
+                let _ = self.store.flag_needs_attention(session_id, &reason);
+                Err(err)
+            }
+        }
     }
 
     fn record_content(&mut self, session_id: &str, content: TurnContent) -> Result<Option<String>> {

@@ -57,15 +57,20 @@ pub mod model;
 mod schema;
 mod store;
 pub mod title;
+pub mod tools;
 
 pub use blobs::{BlobStore, PREVIEW_BYTES, SPILL_THRESHOLD_BYTES};
-pub use capture::{Capture, SessionKey, TurnContent};
+pub use capture::{
+    hash_written_content, Capture, FileWrite, SessionKey, ToolCallContent, TurnContent,
+};
 pub use error::{Error, Result};
 pub use model::{
-    Message, Mode, Role, Session, Source, SyncState, TokenTotals, TurnState, WorkspaceMode,
+    AgentEdit, FileTouch, Message, Mode, Role, Session, Source, SyncState, TokenTotals, ToolCall,
+    ToolStatus, TurnState, WorkspaceMode,
 };
 pub use schema::{REQUIRED_INDEXES, SCHEMA_VERSION};
 pub use store::{MessageInput, Store};
+pub use tools::{canonical_name, ResolvedPath, ToolName};
 
 /// The per-project state directory Atlas already uses, under a Workspace root.
 ///

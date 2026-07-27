@@ -23,6 +23,7 @@ use crate::blobs::{self, BlobStore};
 use crate::error::{Error, Result};
 use crate::lock::WriterLock;
 use crate::model::*;
+use crate::tools::ToolName;
 use crate::schema;
 
 /// A Workspace's recorded Sessions.
@@ -459,6 +460,262 @@ impl Store {
         Ok(out)
     }
 
+    // ── Tool calls, file touches and edit patches ───────────────────────────
+
+    /// Record one tool invocation, or update the one already recorded.
+    ///
+    /// A call arrives at least twice — a first sighting and one or more updates
+    /// carrying the status, the result, and (often only now) the locations. The
+    /// agent's own call id is the idempotency key that makes the second sighting
+    /// an update rather than a duplicate row.
+    ///
+    /// `arguments` and `result` are **already redacted** and, if binary, already
+    /// marked as such: the store does not scrub, `capture` does.
+    pub fn upsert_tool_call(&mut self, input: ToolCallInput<'_>) -> Result<String> {
+        self.require_writer()?;
+
+        // Spill outside the transaction, for the same reason message bodies do:
+        // a tool result is the largest payload in a Session, and holding a write
+        // transaction across a file write serialises capture behind the disk.
+        let (arguments, arguments_ref) = self.split_payload(input.arguments)?;
+        let (result, result_ref) = match input.result {
+            ToolPayload::Text(text) => self.split_payload(Some(text))?,
+            ToolPayload::Binary(bytes) => (None, Some(self.blobs.put(bytes)?)),
+            ToolPayload::None => (None, None),
+        };
+        let result_binary = matches!(input.result, ToolPayload::Binary(_));
+        let locations = serde_json::to_string(input.locations).unwrap_or_else(|_| "[]".into());
+        let now = Utc::now();
+
+        let tx = self.conn.transaction()?;
+
+        if let Some(native_id) = input.native_call_id {
+            let existing: Option<String> = tx
+                .query_row(
+                    "SELECT id FROM tool_call WHERE session_id = ?1 AND native_call_id = ?2",
+                    rusqlite::params![input.session_id, native_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if let Some(id) = existing {
+                // An update carrying only a status must not erase the payload or
+                // the locations we already have — `COALESCE` on a NULL argument
+                // means "no news", not "cleared". This is the store-side half of
+                // the same rule the runtime now follows for locations.
+                tx.execute(
+                    "UPDATE tool_call
+                        SET tool_name = ?2,
+                            title = COALESCE(?3, title),
+                            kind = COALESCE(?4, kind),
+                            status = ?5,
+                            locations = CASE WHEN ?6 = '[]' THEN locations ELSE ?6 END,
+                            arguments = COALESCE(?7, arguments),
+                            arguments_ref = COALESCE(?8, arguments_ref),
+                            result = COALESCE(?9, result),
+                            result_ref = COALESCE(?10, result_ref),
+                            result_binary = CASE WHEN ?11 = 1 THEN 1 ELSE result_binary END
+                      WHERE id = ?1",
+                    rusqlite::params![
+                        id,
+                        input.tool_name.as_str(),
+                        input.title,
+                        input.kind,
+                        input.status.as_str(),
+                        locations,
+                        arguments,
+                        arguments_ref,
+                        result,
+                        result_ref,
+                        i64::from(result_binary),
+                    ],
+                )?;
+                tx.commit()?;
+                return Ok(id);
+            }
+        }
+
+        let seq = next_seq(&tx)?;
+        let id = format!("tc-{}", uuid::Uuid::new_v4().simple());
+        tx.execute(
+            "INSERT INTO tool_call
+                (id, session_id, seq, turn_seq, native_call_id, tool_name, title, kind,
+                 status, locations, arguments, arguments_ref, result, result_ref,
+                 result_binary, created_at, sync_state)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+            rusqlite::params![
+                id,
+                input.session_id,
+                seq,
+                input.turn_seq,
+                input.native_call_id,
+                input.tool_name.as_str(),
+                input.title,
+                input.kind,
+                input.status.as_str(),
+                locations,
+                arguments,
+                arguments_ref,
+                result,
+                result_ref,
+                i64::from(result_binary),
+                now.to_rfc3339(),
+                input.sync_state.as_str(),
+            ],
+        )?;
+        tx.commit()?;
+        Ok(id)
+    }
+
+    /// Record a file the agent wrote.
+    ///
+    /// One record per write, so a file written twice in one turn produces two —
+    /// and the link rule consumes the *last*, since that is the content the turn
+    /// left behind.
+    pub fn record_file_touch(&mut self, input: FileTouchInput<'_>) -> Result<String> {
+        self.require_writer()?;
+        let tx = self.conn.transaction()?;
+        let seq = next_seq(&tx)?;
+        let id = format!("ft-{}", uuid::Uuid::new_v4().simple());
+        tx.execute(
+            "INSERT INTO file_touch
+                (id, tool_call_id, session_id, turn_seq, seq, path, sha256_after,
+                 existed_before, deleted, out_of_repo, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            rusqlite::params![
+                id,
+                input.tool_call_id,
+                input.session_id,
+                input.turn_seq,
+                seq,
+                input.path,
+                input.sha256_after,
+                i64::from(input.existed_before),
+                i64::from(input.deleted),
+                i64::from(input.out_of_repo),
+                Utc::now().to_rfc3339(),
+            ],
+        )?;
+        tx.commit()?;
+        Ok(id)
+    }
+
+    /// Record the patch an edit-shaped call applied.
+    pub fn record_agent_edit(&mut self, input: AgentEditInput<'_>) -> Result<String> {
+        self.require_writer()?;
+        let (patch, patch_ref) = self.split_payload(input.patch)?;
+        let id = format!("ae-{}", uuid::Uuid::new_v4().simple());
+        self.conn.execute(
+            "INSERT INTO agent_edit
+                (id, tool_call_id, session_id, turn_seq, path, patch, patch_ref, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            rusqlite::params![
+                id,
+                input.tool_call_id,
+                input.session_id,
+                input.turn_seq,
+                input.path,
+                patch,
+                patch_ref,
+                Utc::now().to_rfc3339(),
+            ],
+        )?;
+        Ok(id)
+    }
+
+    pub fn tool_calls_for_session(&self, session_id: &str) -> Result<Vec<ToolCall>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {TOOL_CALL_COLUMNS} FROM tool_call WHERE session_id = ?1 ORDER BY seq"
+        ))?;
+        let rows = stmt.query_map([session_id], row_to_tool_call)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Count tool calls by canonical name — the sidebar's *Bash 1 · Read 2 ·
+    /// File edits 1*.
+    ///
+    /// Answerable from the covering index alone. No message body is read and no
+    /// blob is touched, which is the entire reason tool calls are rows.
+    pub fn tool_call_counts(&self, session_id: &str) -> Result<Vec<(ToolName, i64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT tool_name, COUNT(*) FROM tool_call WHERE session_id = ?1 GROUP BY tool_name",
+        )?;
+        let rows = stmt.query_map([session_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (name, count) = row?;
+            out.push((ToolName::parse(&name).unwrap_or(ToolName::Other), count));
+        }
+        Ok(out)
+    }
+
+    /// Read a tool call's result, from the row or its blob.
+    ///
+    /// Returns raw bytes because the result may not be text — a binary payload
+    /// round-trips byte-identically rather than being lossily decoded.
+    pub fn tool_call_result(&self, call: &ToolCall) -> Result<Option<Vec<u8>>> {
+        if let Some(key) = &call.result_ref {
+            return self.blobs.get(key).map(Some);
+        }
+        Ok(call.result.clone().map(String::into_bytes))
+    }
+
+    pub fn file_touches_for_session(&self, session_id: &str) -> Result<Vec<FileTouch>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {FILE_TOUCH_COLUMNS} FROM file_touch WHERE session_id = ?1 ORDER BY seq"
+        ))?;
+        let rows = stmt.query_map([session_id], row_to_file_touch)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// The last touch of each path in a turn — what the turn left behind, and
+    /// therefore what the link rule compares against a commit.
+    pub fn latest_file_touches(&self, session_id: &str) -> Result<Vec<FileTouch>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {FILE_TOUCH_COLUMNS} FROM file_touch
+              WHERE session_id = ?1
+                AND seq IN (
+                    SELECT MAX(seq) FROM file_touch
+                     WHERE session_id = ?1 GROUP BY turn_seq, path
+                )
+              ORDER BY seq"
+        ))?;
+        let rows = stmt.query_map([session_id], row_to_file_touch)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn agent_edits_for_session(&self, session_id: &str) -> Result<Vec<AgentEdit>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, tool_call_id, session_id, turn_seq, path, patch, patch_ref, created_at
+               FROM agent_edit WHERE session_id = ?1 ORDER BY created_at",
+        )?;
+        let rows = stmt.query_map([session_id], |row| {
+            Ok(AgentEdit {
+                id: row.get(0)?,
+                tool_call_id: row.get(1)?,
+                session_id: row.get(2)?,
+                turn_seq: row.get(3)?,
+                path: row.get(4)?,
+                patch: row.get(5)?,
+                patch_ref: row.get(6)?,
+                created_at: parse_time(row.get::<_, String>(7)?),
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Inline it, or spill it and return the key.
+    fn split_payload(&self, value: Option<&str>) -> Result<(Option<String>, Option<String>)> {
+        match value {
+            None => Ok((None, None)),
+            Some(text) if blobs::should_spill(text) => {
+                Ok((None, Some(self.blobs.put(text.as_bytes())?)))
+            }
+            Some(text) => Ok((Some(text.to_string()), None)),
+        }
+    }
+
     // ── Maintenance ─────────────────────────────────────────────────────────
 
     /// Turns still marked open on startup were abandoned — the process died
@@ -500,6 +757,105 @@ pub struct MessageInput<'a> {
     /// calling here, so there is exactly one place that can be forgotten.
     pub body: &'a str,
     pub sync_state: SyncState,
+}
+
+/// A tool call's result payload, which is not always text.
+pub enum ToolPayload<'a> {
+    None,
+    /// Already redacted.
+    Text(&'a str),
+    /// Not valid UTF-8 — a compiled binary, an image, a truncated read. Stored
+    /// verbatim and skipped by string redaction, because lossy-decoding it to
+    /// scan would corrupt the payload on the way back out for no benefit: there
+    /// is no secret to find in bytes that cannot be read as text.
+    Binary(&'a [u8]),
+}
+
+/// Everything needed to record or update one tool call.
+pub struct ToolCallInput<'a> {
+    pub session_id: &'a str,
+    pub turn_seq: i64,
+    /// The agent's own id for the call — the idempotency key across its first
+    /// sighting and every later update.
+    pub native_call_id: Option<&'a str>,
+    /// Derived; see [`crate::tools::canonical_name`].
+    pub tool_name: ToolName,
+    pub title: Option<&'a str>,
+    pub kind: Option<&'a str>,
+    pub status: ToolStatus,
+    pub locations: &'a serde_json::Value,
+    /// **Already redacted.**
+    pub arguments: Option<&'a str>,
+    pub result: ToolPayload<'a>,
+    pub sync_state: SyncState,
+}
+
+pub struct FileTouchInput<'a> {
+    pub tool_call_id: &'a str,
+    pub session_id: &'a str,
+    pub turn_seq: i64,
+    /// NFC-normalised, workspace-relative.
+    pub path: &'a str,
+    pub sha256_after: Option<&'a str>,
+    pub existed_before: bool,
+    pub deleted: bool,
+    pub out_of_repo: bool,
+}
+
+pub struct AgentEditInput<'a> {
+    pub tool_call_id: &'a str,
+    pub session_id: &'a str,
+    pub turn_seq: i64,
+    pub path: &'a str,
+    /// **Already redacted.**
+    pub patch: Option<&'a str>,
+}
+
+const TOOL_CALL_COLUMNS: &str = "id, session_id, seq, turn_seq, tool_name, title, kind, status, \
+     locations, arguments, arguments_ref, result, result_ref, result_binary, created_at, sync_state";
+
+fn row_to_tool_call(row: &rusqlite::Row<'_>) -> rusqlite::Result<ToolCall> {
+    let tool_name: String = row.get(4)?;
+    let status: String = row.get(7)?;
+    let locations: String = row.get(8)?;
+    let sync_state: String = row.get(15)?;
+    Ok(ToolCall {
+        id: row.get(0)?,
+        session_id: row.get(1)?,
+        seq: row.get(2)?,
+        turn_seq: row.get(3)?,
+        tool_name: ToolName::parse(&tool_name).unwrap_or(ToolName::Other),
+        title: row.get(5)?,
+        kind: row.get(6)?,
+        status: ToolStatus::parse(&status).unwrap_or(ToolStatus::Completed),
+        locations: serde_json::from_str(&locations).unwrap_or(serde_json::Value::Array(Vec::new())),
+        arguments: row.get(9)?,
+        arguments_ref: row.get(10)?,
+        result: row.get(11)?,
+        result_ref: row.get(12)?,
+        result_binary: row.get::<_, i64>(13)? != 0,
+        created_at: parse_time(row.get::<_, String>(14)?),
+        sync_state: SyncState::parse(&sync_state).unwrap_or(SyncState::Local),
+    })
+}
+
+const FILE_TOUCH_COLUMNS: &str = "id, tool_call_id, session_id, turn_seq, seq, path, \
+     sha256_after, existed_before, deleted, out_of_repo, created_at";
+
+fn row_to_file_touch(row: &rusqlite::Row<'_>) -> rusqlite::Result<FileTouch> {
+    Ok(FileTouch {
+        id: row.get(0)?,
+        tool_call_id: row.get(1)?,
+        session_id: row.get(2)?,
+        turn_seq: row.get(3)?,
+        seq: row.get(4)?,
+        path: row.get(5)?,
+        sha256_after: row.get(6)?,
+        existed_before: row.get::<_, i64>(7)? != 0,
+        deleted: row.get::<_, i64>(8)? != 0,
+        out_of_repo: row.get::<_, i64>(9)? != 0,
+        created_at: parse_time(row.get::<_, String>(10)?),
+    })
 }
 
 /// Next value of the store-wide monotonic sequence.
