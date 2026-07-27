@@ -6,6 +6,10 @@ Atlas wraps a code editor, a multi-session AI chat (with first-class Claude Code
 
 > Status: pre-1.0. Targets macOS for now; Linux/Windows are reachable from the same Tauri build but untested.
 
+## Checkpoints
+
+Atlas records every agent session locally in `.atlas/sessions.db`, with secrets scrubbed before anything touches disk. When you commit — from any tool, even with Atlas closed — the commit is linked back to the session that produced it as a Checkpoint, and links survive rebases and amends. Local mode works fully offline with no account.
+
 ---
 
 ## Table of contents
