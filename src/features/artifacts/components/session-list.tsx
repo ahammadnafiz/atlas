@@ -160,10 +160,12 @@ function SessionRow({
           {session.model ?? ""}
         </span>
 
-        <span className="w-[104px] shrink-0 text-right text-[11px] text-[var(--text-tertiary)]">
-          {session.checkpointCount === 0
-            ? "no checkpoints"
-            : `${session.checkpointCount} checkpoint${session.checkpointCount === 1 ? "" : "s"}`}
+        {/* Zero renders as silence, not as "no checkpoints" filler — a list
+         *  where most rows print their own absence reads as one long shrug.
+         *  The fixed width stays so the columns hold their alignment. */}
+        <span className="w-[104px] shrink-0 text-right text-[11px] tabular-nums text-[var(--text-tertiary)]">
+          {session.checkpointCount > 0 &&
+            `${session.checkpointCount} checkpoint${session.checkpointCount === 1 ? "" : "s"}`}
         </span>
       </button>
     </li>

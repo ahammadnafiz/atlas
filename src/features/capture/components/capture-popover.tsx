@@ -79,7 +79,9 @@ export function CapturePopover({ projectPath, health, onChanged, onClose }: Prop
 
   const [binding, setBinding] = useState<Binding | null>(null);
   const [detection, setDetection] = useState<Detection | null>(null);
-  const [importPreview, setImportPreview] = useState<ImportPreview | null>(null);
+  /** `undefined` while the read is in flight, `null` once it failed — the
+   *  Cloud "Continue" button needs the difference to gate honestly. */
+  const [importPreview, setImportPreview] = useState<ImportPreview | null | undefined>(undefined);
   const [view, setView] = useState<View>({ kind: "main" });
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -90,7 +92,8 @@ export function CapturePopover({ projectPath, health, onChanged, onClose }: Prop
         invoke<Binding | null>("capture_binding", { projectPath }),
         invoke<Detection>("capture_detect", { projectPath }),
         // Read-only and cheap — the "history N sessions on disk" row and both
-        // disclosure steps feed off it.
+        // disclosure steps feed off it. A failure lands as `null`, which the
+        // Cloud path surfaces with a retry instead of silently no-opping.
         invoke<ImportPreview>("capture_import_preview", { projectPath }).catch(() => null),
       ]);
       setBinding(current);
@@ -105,18 +108,32 @@ export function CapturePopover({ projectPath, health, onChanged, onClose }: Prop
     void load();
   }, [load]);
 
+  /** Re-read just the preview — the retry for a failed preview load. */
+  const retryPreview = useCallback(async () => {
+    setImportPreview(undefined);
+    try {
+      setImportPreview(await invoke<ImportPreview>("capture_import_preview", { projectPath }));
+    } catch {
+      setImportPreview(null);
+    }
+  }, [projectPath]);
+
   const run = async (action: () => Promise<unknown>) => {
     setBusy(true);
     setError(null);
     try {
       await action();
-      await load();
-      onChanged();
       return true;
     } catch (e) {
       setError(String(e));
       return false;
     } finally {
+      // Always re-read, success or not: a multi-step action (Cloud confirm,
+      // Connect) can fail after its first mutation landed, and showing the
+      // pre-action state over a Workspace that changed is a lie. `load` never
+      // clears `error` on success, so the failure stays visible.
+      await load();
+      onChanged();
       setBusy(false);
     }
   };
@@ -162,8 +179,11 @@ export function CapturePopover({ projectPath, health, onChanged, onClose }: Prop
             cloudOrgs={cloudOrgs}
             busy={busy}
             run={run}
+            onRetryPreview={() => void retryPreview()}
             onCancel={onClose}
             onCloudEnable={(orgId, slug) => {
+              // Belt to the button's braces — Continue is disabled until the
+              // preview is in, so this guard should never fire.
               if (!importPreview) return;
               setView({ kind: "cloud-confirm", orgId, slug, preview: importPreview });
             }}
@@ -388,7 +408,7 @@ function BoundState({
   binding: Binding;
   detection: Detection | null;
   health: CaptureHealth | null;
-  importPreview: ImportPreview | null;
+  importPreview: ImportPreview | null | undefined;
   cloudOrgs: Array<Organisation & { remoteId: string }>;
   signedIn: boolean;
   busy: boolean;
@@ -506,16 +526,19 @@ function UnboundState({
   cloudOrgs,
   busy,
   run,
+  onRetryPreview,
   onCancel,
   onCloudEnable,
 }: {
   projectPath: string;
   detection: Detection | null;
-  importPreview: ImportPreview | null;
+  /** `undefined` = still loading, `null` = the read failed. */
+  importPreview: ImportPreview | null | undefined;
   cloudReason: string | null;
   cloudOrgs: Array<Organisation & { remoteId: string }>;
   busy: boolean;
   run: (action: () => Promise<unknown>) => Promise<boolean>;
+  onRetryPreview: () => void;
   onCancel: () => void;
   onCloudEnable: (orgId: string, slug: string) => void;
 }) {
@@ -543,9 +566,17 @@ function UnboundState({
     mode === "cloud" ? slug : "",
   );
 
+  // Cloud's Continue opens the disclosure step, which is built from the import
+  // preview — without it there is nothing to disclose, so the button waits
+  // (loading) or points at the retry (failed) instead of silently no-opping.
+  const previewLoading = mode === "cloud" && importPreview === undefined;
   const cloudReady =
     mode === "local" ||
-    (!!orgId && slug.trim().length > 0 && slugState.kind !== "taken" && slugState.kind !== "checking");
+    (!!orgId &&
+      slug.trim().length > 0 &&
+      slugState.kind !== "taken" &&
+      slugState.kind !== "checking" &&
+      importPreview != null);
 
   return (
     <div className="space-y-2">
@@ -593,10 +624,28 @@ function UnboundState({
             />
           )}
 
+          {/* The preview read failed: Continue has nothing to disclose, so say
+           *  so where it blocks, with the retry right there. */}
+          {mode === "cloud" && importPreview === null && (
+            <div className="flex items-center justify-between gap-2 rounded bg-[var(--status-warning-muted)] px-2 py-1.5">
+              <span className="text-[11px] text-[var(--status-warning)]">
+                Couldn't read this Workspace's history.
+              </span>
+              <button
+                type="button"
+                onClick={onRetryPreview}
+                className="flex shrink-0 items-center gap-1 rounded px-1.5 py-0.5 text-[11px] text-[var(--text-primary)] underline underline-offset-2 transition-colors duration-150 hover:no-underline focus-visible:ring-1 focus-visible:ring-[var(--border-focus)] active:scale-[0.97]"
+              >
+                <RefreshCw size={10} />
+                Retry
+              </button>
+            </div>
+          )}
+
           <div className="flex justify-end gap-2 pt-1">
             <GhostButton label="Cancel" onClick={onCancel} disabled={busy} />
             <PrimaryButton
-              busy={busy}
+              busy={busy || previewLoading}
               disabled={!cloudReady}
               onClick={() => {
                 if (mode === "local") {
@@ -1134,7 +1183,7 @@ function Detected({
   importPreview,
 }: {
   detection: Detection | null;
-  importPreview: ImportPreview | null;
+  importPreview: ImportPreview | null | undefined;
 }) {
   if (!detection) return null;
 

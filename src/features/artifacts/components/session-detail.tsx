@@ -1,18 +1,20 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import {
+  Bot,
   Brain,
   ChevronDown,
   ChevronRight,
+  ChevronUp,
   GitCommitHorizontal,
   Loader2,
   Sparkles,
   TriangleAlert,
   Unlink,
   User,
-  Wrench,
 } from "lucide-react";
 
+import { CachedMarkdown } from "@/lib/markdown-cache";
 import { cn } from "@/lib/utils";
 
 import {
@@ -86,6 +88,18 @@ export function SessionDetail({ detail, projectPath }: Props) {
     [detail.entries],
   );
 
+  /** Tool calls per turn, for the quiet meta line under each prompt. Computed
+   *  from the unfiltered entries — hiding tool calls must not zero the count. */
+  const callsByTurn = useMemo(() => {
+    const calls = new Map<number, number>();
+    for (const entry of detail.entries) {
+      if (entry.kind === "tool_call") {
+        calls.set(entry.turnSeq, (calls.get(entry.turnSeq) ?? 0) + 1);
+      }
+    }
+    return calls;
+  }, [detail.entries]);
+
   // A new Session or a filter change restarts the window from the top.
   useEffect(() => {
     setRenderCount(WINDOW_CHUNK);
@@ -143,21 +157,40 @@ export function SessionDetail({ detail, projectPath }: Props) {
           </p>
         ) : (
           <>
-            {/* The gutter: a continuous line the glyph nodes sit on. */}
-            <ul className="relative mt-5 space-y-3 before:absolute before:bottom-1 before:left-[11px] before:top-1 before:w-px before:bg-[var(--border-default)]">
-              {rendered.map((entry) => (
-                <li
-                  key={entry.id}
-                  className="relative pl-9"
-                  ref={(node) => {
-                    if (node) entryRefs.current.set(entry.id, node);
-                    else entryRefs.current.delete(entry.id);
-                  }}
-                >
-                  <GutterNode entry={entry} />
-                  <Entry entry={entry} projectPath={projectPath} expandAllTools={expandAllTools} />
-                </li>
-              ))}
+            {/* The gutter: a continuous line the glyph nodes sit on. A run of
+             *  tool calls in one turn is a cluster — one agent node on the
+             *  first call, the rest indented under it with no node of their
+             *  own, so the line runs uninterrupted behind them. */}
+            <ul className="relative mt-5 before:absolute before:bottom-1 before:left-[11px] before:top-1 before:w-px before:bg-[var(--border-default)]">
+              {rendered.map((entry, index) => {
+                const prev = index > 0 ? rendered[index - 1] : null;
+                const inCluster =
+                  entry.kind === "tool_call" &&
+                  prev?.kind === "tool_call" &&
+                  prev.turnSeq === entry.turnSeq;
+                return (
+                  <li
+                    key={entry.id}
+                    className={cn(
+                      "relative",
+                      entry.kind === "tool_call" ? "pl-12" : "pl-9",
+                      index > 0 && (inCluster ? "mt-1" : "mt-3"),
+                    )}
+                    ref={(node) => {
+                      if (node) entryRefs.current.set(entry.id, node);
+                      else entryRefs.current.delete(entry.id);
+                    }}
+                  >
+                    {!inCluster && <GutterNode entry={entry} />}
+                    <Entry
+                      entry={entry}
+                      projectPath={projectPath}
+                      expandAllTools={expandAllTools}
+                      calls={callsByTurn.get(entry.turnSeq) ?? 0}
+                    />
+                  </li>
+                );
+              })}
             </ul>
             {renderCount < visible.length && (
               <button
@@ -190,7 +223,9 @@ export function SessionDetail({ detail, projectPath }: Props) {
   );
 }
 
-/** The glyph on the gutter line — the entry's kind at a glance. */
+/** The glyph on the gutter line — the entry's kind at a glance. A tool-call
+ *  cluster gets one agent node (the Bot) on its first call; the calls
+ *  themselves carry their names and failure chips in their own rows. */
 function GutterNode({ entry }: { entry: TimelineEntry }) {
   const failed = entry.kind === "tool_call" && entry.toolStatus === "failed";
   const orphaned = entry.kind === "checkpoint" && entry.linkState === "orphaned";
@@ -202,7 +237,7 @@ function GutterNode({ entry }: { entry: TimelineEntry }) {
         : entry.kind === "thinking"
           ? Brain
           : entry.kind === "tool_call"
-            ? Wrench
+            ? Bot
             : orphaned
               ? Unlink
               : GitCommitHorizontal;
@@ -256,11 +291,13 @@ function Header({ detail }: { detail: Detail }) {
           </span>
         ))}
         {(s.insertions > 0 || s.deletions > 0) && (
-          <span>
-            <span className="pr-2">·</span>
-            <span className="text-[var(--status-success)]">+{s.insertions}</span>
-            {" / "}
-            <span className="text-[var(--status-error)]">-{s.deletions}</span>
+          <span className="font-mono">
+            {facts.length > 0 && <span className="pr-2 font-sans">·</span>}
+            {s.insertions > 0 && (
+              <span className="text-[var(--status-success)]">+{s.insertions}</span>
+            )}
+            {s.insertions > 0 && s.deletions > 0 && " / "}
+            {s.deletions > 0 && <span className="text-[var(--status-error)]">-{s.deletions}</span>}
           </span>
         )}
       </div>
@@ -284,14 +321,17 @@ function Entry({
   entry,
   projectPath,
   expandAllTools,
+  calls,
 }: {
   entry: TimelineEntry;
   projectPath: string;
   expandAllTools: boolean;
+  /** Tool calls in this entry's turn, for the meta line under a prompt. */
+  calls: number;
 }) {
   switch (entry.kind) {
     case "prompt":
-      return <Prompt entry={entry} projectPath={projectPath} />;
+      return <Prompt entry={entry} projectPath={projectPath} calls={calls} />;
     case "response":
       return <Response entry={entry} projectPath={projectPath} />;
     case "thinking":
@@ -303,21 +343,110 @@ function Entry({
   }
 }
 
-/** What the developer asked. Boxed, because it is the anchor of a turn. */
-function Prompt({ entry, projectPath }: { entry: TimelineEntry; projectPath: string }) {
+/** Roughly fourteen 13px lines. Anything taller clamps behind a fade. */
+const CLAMP_MAX_PX = 340;
+/** Slack so a body a couple of lines over the limit doesn't earn a toggle. */
+const CLAMP_SLACK_PX = 60;
+
+/**
+ * Long bodies render clamped with a bottom fade and an explicit toggle.
+ *
+ * A single pasted prompt can be hundreds of lines, and the timeline exists to
+ * read the *sequence* — any one body is expandable in place. Expansion is
+ * instant by design: there is no height animation, so `prefers-reduced-motion`
+ * has nothing to fight. Measured with a ResizeObserver rather than a line
+ * count, because "Show full" can swell a body after mount.
+ */
+function Clamp({ children }: { children: ReactNode }) {
+  const innerRef = useRef<HTMLDivElement | null>(null);
+  const [overflows, setOverflows] = useState(false);
+  const [expanded, setExpanded] = useState(false);
+
+  useEffect(() => {
+    const el = innerRef.current;
+    if (!el) return;
+    const measure = () => {
+      const next = el.offsetHeight > CLAMP_MAX_PX + CLAMP_SLACK_PX;
+      setOverflows((current) => (current === next ? current : next));
+    };
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, []);
+
+  const clamped = overflows && !expanded;
+
   return (
-    <div className="rounded-lg border border-[var(--border-default)] bg-[var(--bg-raised)] px-3 py-2.5">
-      <Body entry={entry} projectPath={projectPath} className="text-[13px] text-[var(--text-primary)]" />
-      <p className="mt-1.5 text-[11px] text-[var(--text-tertiary)]">{relative(entry.at)}</p>
+    <div>
+      <div
+        className={cn(
+          clamped &&
+            "max-h-[340px] overflow-hidden [-webkit-mask-image:linear-gradient(to_bottom,black_calc(100%-56px),transparent)] [mask-image:linear-gradient(to_bottom,black_calc(100%-56px),transparent)]",
+        )}
+      >
+        <div ref={innerRef}>{children}</div>
+      </div>
+      {overflows && (
+        <button
+          type="button"
+          onClick={() => setExpanded((v) => !v)}
+          className="mt-1.5 flex items-center gap-1 rounded text-[11px] text-[var(--text-secondary)] transition-colors duration-150 hover:text-[var(--text-primary)] focus-visible:ring-1 focus-visible:ring-[var(--border-focus)] active:scale-[0.98]"
+        >
+          {expanded ? <ChevronUp size={11} /> : <ChevronDown size={11} />}
+          {expanded ? "Show less" : "Show more"}
+        </button>
+      )}
     </div>
   );
 }
 
-/** What the agent said back. Unboxed, so the conversation reads as prose. */
+/** What the developer asked. Boxed, because it is the anchor of a turn — with
+ *  the turn's measurements (when, how many tool calls it triggered) as a quiet
+ *  meta line under the box rather than furniture inside it. */
+function Prompt({
+  entry,
+  projectPath,
+  calls,
+}: {
+  entry: TimelineEntry;
+  projectPath: string;
+  calls: number;
+}) {
+  const meta = [relative(entry.at), calls > 0 ? `${calls} call${calls === 1 ? "" : "s"}` : null]
+    .filter((part): part is string => part !== null)
+    .join(" · ");
+
+  return (
+    <div>
+      <div className="rounded-lg border border-[var(--border-default)] bg-[var(--bg-raised)] px-3 py-2.5">
+        <Clamp>
+          <Body
+            entry={entry}
+            projectPath={projectPath}
+            className="text-[13px] text-[var(--text-primary)]"
+          />
+        </Clamp>
+      </div>
+      {meta && <p className="mt-1 text-[11px] text-[var(--text-tertiary)]">{meta}</p>}
+    </div>
+  );
+}
+
+/** What the agent said back. Unboxed, so the conversation reads as prose —
+ *  and through the app's cached markdown renderer, so code fences and lists
+ *  in agent output stop reading as prose soup. */
 function Response({ entry, projectPath }: { entry: TimelineEntry; projectPath: string }) {
   return (
     <div className="py-0.5">
-      <Body entry={entry} projectPath={projectPath} className="text-[13px] text-[var(--text-secondary)]" />
+      <Clamp>
+        <Body
+          entry={entry}
+          projectPath={projectPath}
+          markdown
+          className="text-[13px] text-[var(--text-secondary)]"
+        />
+      </Clamp>
     </div>
   );
 }
@@ -514,9 +643,15 @@ function Checkpoint({ entry }: { entry: TimelineEntry }) {
 
       {(entry.insertions > 0 || entry.deletions > 0) && (
         <span className="shrink-0 font-mono text-[11px]">
-          <span className="text-[var(--status-success)]">+{entry.insertions}</span>
-          <span className="text-[var(--text-ghost)]"> / </span>
-          <span className="text-[var(--status-error)]">-{entry.deletions}</span>
+          {entry.insertions > 0 && (
+            <span className="text-[var(--status-success)]">+{entry.insertions}</span>
+          )}
+          {entry.insertions > 0 && entry.deletions > 0 && (
+            <span className="text-[var(--text-ghost)]"> / </span>
+          )}
+          {entry.deletions > 0 && (
+            <span className="text-[var(--status-error)]">-{entry.deletions}</span>
+          )}
         </span>
       )}
     </div>
@@ -529,24 +664,42 @@ function Body({
   entry,
   projectPath,
   className,
+  markdown = false,
 }: {
   entry: TimelineEntry;
   projectPath: string;
   className?: string;
+  /** Render through the cached markdown pipeline (responses only — prompts
+   *  are verbatim developer input and must not be reinterpreted). */
+  markdown?: boolean;
 }) {
   const [full, setFull] = useState<string | null>(null);
   const truncated = entry.truncated && full === null;
+
+  const notice = truncated && (
+    <>
+      <span className="ml-1 text-[11px] text-[var(--text-tertiary)]">
+        … {compact(entry.bodyBytes)} bytes not shown
+      </span>
+      {entry.bodyRef && (
+        <ShowFull projectPath={projectPath} blobRef={entry.bodyRef} onLoaded={setFull} />
+      )}
+    </>
+  );
+
+  if (markdown) {
+    return (
+      <div className="break-words">
+        <CachedMarkdown source={full ?? entry.text ?? ""} className={className} />
+        {truncated && <p className="mt-1 -ml-1">{notice}</p>}
+      </div>
+    );
+  }
+
   return (
     <div className={cn("whitespace-pre-wrap break-words", className)}>
       {full ?? entry.text}
-      {truncated && (
-        <span className="ml-1 text-[11px] text-[var(--text-tertiary)]">
-          … {compact(entry.bodyBytes)} bytes not shown
-        </span>
-      )}
-      {truncated && entry.bodyRef && (
-        <ShowFull projectPath={projectPath} blobRef={entry.bodyRef} onLoaded={setFull} />
-      )}
+      {notice}
     </div>
   );
 }
@@ -631,30 +784,17 @@ function Rail({
 
   return (
     <aside className="w-[240px] shrink-0 overflow-y-auto border-l border-[var(--border-default)] px-4 py-4">
-      {checkpoints.length > 0 && (
-        <section className="mb-5">
-          <h3 className="pb-1.5 text-[11px] font-medium text-[var(--text-primary)]">
-            Checkpoints
-          </h3>
-          <ul className="space-y-0.5">
-            {checkpoints.map((checkpoint) => (
-              <li key={checkpoint.id}>
-                <button
-                  type="button"
-                  onClick={() => onJump(checkpoint.id)}
-                  className="flex w-full items-baseline gap-2 rounded px-1.5 py-1 text-left transition-colors duration-150 hover:bg-[var(--bg-hover)] focus-visible:ring-1 focus-visible:ring-[var(--border-focus)] active:bg-[var(--bg-active)]"
-                >
-                  <span className="shrink-0 font-mono text-[10px] text-[var(--text-tertiary)]">
-                    {checkpoint.commitSha?.slice(0, 7)}
-                  </span>
-                  <span className="min-w-0 truncate text-[11px] text-[var(--text-secondary)]">
-                    {checkpoint.commitSubject ?? "—"}
-                  </span>
-                </button>
-              </li>
-            ))}
-          </ul>
-        </section>
+      {checkpoints.length > 0 ? (
+        <JumpTo checkpoints={checkpoints} onJump={onJump} />
+      ) : (
+        /* Zero is a fact worth one quiet sentence, not an empty rail — the
+         * difference between "imported, so never linked" and "nothing was
+         * linked" is exactly what someone staring at zero wants to know. */
+        <p className="mb-5 text-[11px] leading-relaxed text-[var(--text-tertiary)]">
+          {detail.summary.source === "external_jsonl"
+            ? "Imported session — commits aren't linked to imported history."
+            : "No commits were linked to this session."}
+        </p>
       )}
 
       <section>
@@ -744,6 +884,83 @@ function Rail({
         </label>
       </section>
     </aside>
+  );
+}
+
+/**
+ * The rail's Checkpoints, as a "Jump to" dropdown.
+ *
+ * A dropdown rather than a permanent list because the list competes with the
+ * filters for the rail's small width, and jumping is a one-shot act: open,
+ * pick, land. The jump itself goes through the same pending-jump mechanism the
+ * timeline already settles over renders (filter reveal, window growth, scroll).
+ */
+function JumpTo({
+  checkpoints,
+  onJump,
+}: {
+  checkpoints: TimelineEntry[];
+  onJump: (id: string) => void;
+}) {
+  const [open, setOpen] = useState(false);
+
+  return (
+    <section className="mb-5">
+      <button
+        type="button"
+        aria-expanded={open}
+        onClick={() => setOpen((v) => !v)}
+        className="flex w-full items-center justify-between gap-2 rounded border border-[var(--border-default)] px-2 py-1.5 transition-colors duration-150 hover:bg-[var(--bg-hover)] focus-visible:ring-1 focus-visible:ring-[var(--border-focus)] active:bg-[var(--bg-active)]"
+      >
+        <span className="text-[11px] font-medium text-[var(--text-primary)]">Jump to</span>
+        <span className="flex items-center gap-1.5 text-[11px] text-[var(--text-tertiary)]">
+          {checkpoints.length} checkpoint{checkpoints.length === 1 ? "" : "s"}
+          <ChevronDown
+            size={11}
+            className={cn("transition-transform duration-150 ease-out", open && "rotate-180")}
+          />
+        </span>
+      </button>
+
+      {open && (
+        <ul className="mt-1 max-h-[240px] overflow-y-auto rounded border border-[var(--border-default)] bg-[var(--bg-raised)] p-0.5">
+          {checkpoints.map((checkpoint) => {
+            const meta = [
+              checkpoint.commitSha?.slice(0, 7) ?? null,
+              checkpoint.files.length > 0
+                ? `${checkpoint.files.length} file${checkpoint.files.length === 1 ? "" : "s"}`
+                : null,
+            ]
+              .filter((part): part is string => part !== null)
+              .join(" · ");
+            return (
+              <li key={checkpoint.id}>
+                <button
+                  type="button"
+                  onClick={() => {
+                    onJump(checkpoint.id);
+                    setOpen(false);
+                  }}
+                  className="w-full rounded px-1.5 py-1.5 text-left transition-colors duration-150 hover:bg-[var(--bg-hover)] focus-visible:ring-1 focus-visible:ring-[var(--border-focus)] active:bg-[var(--bg-active)]"
+                >
+                  <span className="block truncate text-[11px] text-[var(--text-primary)]">
+                    {checkpoint.commitSubject ??
+                      (checkpoint.linkState === "orphaned"
+                        ? "Commit no longer reachable"
+                        : "Subject unavailable")}
+                  </span>
+                  {meta && (
+                    <span className="mt-0.5 block font-mono text-[10px] text-[var(--text-tertiary)]">
+                      {meta}
+                    </span>
+                  )}
+                </button>
+              </li>
+            );
+          })}
+        </ul>
+      )}
+    </section>
   );
 }
 
