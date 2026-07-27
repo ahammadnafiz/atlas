@@ -1,5 +1,4 @@
-<!-- #todo BANNER: replace with a wide product banner (1584x396 works well) -->
-![Atlas](landing/og-image.png)
+[![Atlas](landing/banner.svg)](https://www.tryatlas.cc/)
 
 <div align="center">
 
@@ -8,41 +7,30 @@
 [![Latest release](https://img.shields.io/github/v/release/pacifio/atlas?include_prereleases&label=Release&style=for-the-badge)](https://github.com/pacifio/atlas/releases)
 [![Contributors](https://img.shields.io/github/contributors/pacifio/atlas?style=for-the-badge)](https://github.com/pacifio/atlas/graphs/contributors)
 
-**[Download](https://github.com/pacifio/atlas/releases)** · **[Discord](https://discord.gg/GmnFggaPfP)** · **[Docs](https://cersei.tryatlas.cc/docs)** · **[Roadmap](#roadmap)**
+**[Download](https://github.com/pacifio/atlas/releases)** · **[Discord](https://discord.gg/GmnFggaPfP)** · **[Docs](https://cersei.tryatlas.cc/docs)** · **[Contributing](CONTRIBUTING.md)** · **[Issues](https://github.com/pacifio/atlas/issues)** · **[Roadmap](#roadmap)**
 
 </div>
 
 # Atlas
 
-<!-- #todo one-liner not settled — three candidates on the table -->
-
-Atlas is version control for coding agents. Run **Claude Code**, **Codex**, and Atlas's own native agent side by side on the same codebase, with shared memory between them and a searchable history of what each one changed.
-
-<!-- #todo six bullets is one too many — "Semantic recall" overlaps "One memory, three agents" -->
+Atlas is version control for coding agents at scale. Run **Claude Code**, **Codex**, and Atlas's own native agent side by side on the same codebase, with shared memory between them and a searchable history of what each one changed.
 
 - **Run agents in parallel.** Multiple sessions across tabs, each streaming independently. Switching tabs never freezes or drops a run in flight.
-- **One memory, three agents.** A decision Claude Code made shows up in Codex's next prompt. Plans, file changes, failures, and architecture notes are shared automatically.
-- **Semantic recall on every turn.** Your message is embedded on-device and matched against the project index, so relevant history is pulled into context without you re-explaining it.
+- **One memory, three agents.** A decision Claude Code made shows up in Codex's next prompt. Plans, file changes, failures, and architecture notes are shared automatically, matched on-device against what you're asking about.
 - **Your notes are agent context.** Markdown in `.atlas/knowledge/`, plus the `CLAUDE.md` and `AGENTS.md` you already wrote, feed every agent in the project.
 - **`@` anything into a prompt.** Files, folders, symbols, branches, commits, notes, papers, and past sessions resolve locally before the prompt is sent.
 - **Local by default.** Code, notes, and sessions stay on your machine. Sign in and create an organisation when you want to sync across a team.
 
 **[Join the Discord](https://discord.gg/GmnFggaPfP)** · `#general` chat · `#dev` build questions · `#feature-requests` ideas · `#bugs` report breakage
 
-## Download
-
-Grab the latest `.dmg` from [tryatlas.cc](https://www.tryatlas.cc/) or the [releases page](https://github.com/pacifio/atlas/releases). macOS is the supported platform.
-
-<!-- #todo homebrew tap so this becomes `brew install atlas` -->
-
-Prefer to compile it yourself? See [Build from source](#build-from-source).
+Start with [CONTRIBUTING.md](CONTRIBUTING.md) to send a change, or [open an issue](https://github.com/pacifio/atlas/issues) for anything you hit.
 
 ## Table of contents
 
-- [Download](#download)
 - [Why Atlas](#why-atlas)
 - [How it works](#how-it-works)
 - [Features](#features)
+- [Download](#download)
 - [Build from source](#build-from-source)
 - [Contributing](#contributing)
 - [Roadmap](#roadmap)
@@ -51,14 +39,14 @@ Prefer to compile it yourself? See [Build from source](#build-from-source).
 
 ## Why Atlas
 
-<!-- #todo bullets to be refined in a later pass -->
+Agents now write a large share of the code and keep none of the reasoning behind it. Atlas records both, and makes them queryable: what changed, by whose agent, at what point in time.
 
-- **Agents start from zero every session.** Atlas keeps a persistent, on-device memory of decisions, plans, and changes, and pushes the relevant parts into each new turn.
-- **Switching agents loses everything.** In Atlas, the first message of a new session carries a curated fact pack plus the tail of your last session — including one from a different agent.
-- **You can't review what you can't see.** Every session is stored and searchable, alongside a real commit graph and file-level diffs of what actually landed.
-- **Context lives in ten places.** The knowledge base, `CLAUDE.md`, `AGENTS.md`, Claude Code's own memory files, and Codex's history are folded into one index every agent reads from.
+- **Agents start from zero every session.** Atlas keeps a persistent on-device memory of decisions, plans, and changes, and pushes the relevant parts into every turn.
+- **Switching agents loses the thread.** The first message of a new session carries a curated fact pack and the tail of your last one, even when that session ran on a different agent.
+- **You can't review what you can't see.** Every session is stored and searchable, next to a real commit graph and file-level diffs of what actually landed.
+- **Context lives in ten places.** The knowledge base, `CLAUDE.md`, `AGENTS.md`, Claude Code's memory files, and Codex's history fold into one index every agent reads from.
 - **Nothing is locked in.** Notes are markdown, canvases are JSON, sessions are JSONL, and the editor is a file on disk. Close Atlas and pick up in vim.
-- **Built for agents, not adapted for them.** Atlas is not a fork of an existing editor with a chat pane added. It is what an IDE looks like when agents are the primary user.
+- **Built for agents from the ground up.** The agent runtime, shared memory, and session history are the foundation the rest of the app is built on.
 
 ## How it works
 
@@ -123,6 +111,12 @@ Works with no account and no network.
 | **Split view** | Up to three resizable columns, each with its own tabs |
 | **Activity log** | Every significant event in the project, filterable, with rows you can pin across restarts |
 
+## Download
+
+Grab the latest `.dmg` from [tryatlas.cc](https://www.tryatlas.cc/) or the [releases page](https://github.com/pacifio/atlas/releases). macOS is the supported platform.
+
+<!-- #todo homebrew tap so this becomes `brew install atlas` -->
+
 ## Build from source
 
 Linux and Windows build from the same Tauri codebase but are untested.
@@ -158,15 +152,13 @@ See [CONTRIBUTING.md](CONTRIBUTING.md). Two things catch people out:
 
 ## Roadmap
 
-<!-- #todo roadmap wording to be worked on later -->
-
-- Source control for agents
-- AI gateway via Atlas accounts
-- Timeline boards covering how team members are changing code
-- Organisational agents
-- Pick up work from any device
-- Issue tracking
-- Shared documentation
+- **Source control for agents.** The organisation-wide half: agent history from every machine on the team rolled into one queryable record.
+- **AI gateway via Atlas accounts.** Route any provider through your Atlas account, with usage and spend visible per person and per agent.
+- **Timeline boards covering how team members are changing code.** A shared view of what each person's agents shipped, and when.
+- **Organisational agents.** Agents scoped to a team, carrying the organisation's own memory, skills, and conventions.
+- **Pick up work from any device.** Sessions, notes, and workspace state follow you to the next machine.
+- **Issue tracking.** Issues that carry the agent sessions and commits that resolved them.
+- **Shared documentation.** One knowledge base across the team, readable by every agent in it.
 
 ## Local by default
 
