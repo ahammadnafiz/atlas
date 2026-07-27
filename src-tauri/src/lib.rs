@@ -229,6 +229,10 @@ pub fn run() {
         .manage(commands::memory_chat::MemoryChatState::new())
         .manage(commands::memory_sharing::MemorySharingState::new())
         .manage(commands::shared_memory::SharedMemoryStore::new())
+        // Owns the per-Workspace session stores and the capture worker
+        // thread. Managed before `install_manager` runs its pipeline so a
+        // delta arriving early finds it.
+        .manage(commands::capture::CaptureState::new())
         .manage(commands::updater::UpdaterState::new())
         // Drop a window's per-window index + mention caches when it closes, so
         // its file watcher stops and memory is freed (these states are keyed by

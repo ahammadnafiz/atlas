@@ -52,6 +52,11 @@ impl TauriDeltaSink {
             // Broadcast first so the UI updates before any heavier work.
             .with(Arc::new(BroadcastMiddleware { app: app.clone() }))
             .with(Arc::new(TelemetryMiddleware { app: app.clone() }))
+            // Session capture lives here rather than on the event bus because
+            // the bus drops events for a lagging subscriber, and a dropped event
+            // is a turn missing from the permanent record. This stage only
+            // enqueues; all disk work happens on the capture worker thread.
+            .with(Arc::new(super::capture::CaptureMiddleware { app: app.clone() }))
             .with(Arc::new(MemoryIngestMiddleware { app }));
         Self { pipeline }
     }
@@ -376,9 +381,36 @@ pub async fn agents_send(
     let Ok(snapshot) = manager.snapshot(&key) else {
         return Err(atlas_agents::Error::UnknownSession.to_string());
     };
+    let current_model = snapshot.current_model.clone();
+    let plugin_id = snapshot.plugin_id.clone();
     let cwd = snapshot.cwd;
 
-    // No cwd or sharing disabled → bare send (no capture, no injection).
+    // Session capture: record the prompt and bind the session.
+    //
+    // This has to happen here rather than in the delta middleware, because the
+    // user's prompt is never emitted as a delta — the session actor skips it
+    // deliberately (the frontend adds user messages optimistically) and turn
+    // start is a bare status flip. A delta subscriber alone would produce
+    // Sessions with no prompts and no titles.
+    //
+    // Note it uses `text`, not the memory-prefixed string composed below:
+    // Atlas's injected context blocks are machinery, not something the user
+    // said, and a Session titled after an injected block would be nonsense.
+    // Placed before the bare-send branch so capture does not depend on whether
+    // memory sharing happens to be enabled for the project.
+    // `plugin_id` rather than `agent_id`: the latter is a per-process UUID, and
+    // the former ("claude-code", "codex", the native agent's id) is both what a
+    // reader wants to see on a timeline row and what tells capture whether this
+    // is an ACP-hosted agent or the native one.
+    app.state::<super::capture::CaptureState>().note_prompt(
+        &key.session_id,
+        &cwd,
+        &plugin_id,
+        current_model.as_deref(),
+        &text,
+    );
+
+    // No cwd or sharing disabled → bare send (no injection).
     if cwd.is_empty() || !sharing.is_enabled(&cwd) {
         return manager.send(&key, text).map_err(|e| e.to_string());
     }

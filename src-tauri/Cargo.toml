@@ -81,6 +81,10 @@ atlas-gitdiff = { path = "../crates/atlas-gitdiff" }
 # nothing downstream — sync, export, share, support bundles — has to remember to
 # do it. Pure crate: no I/O, no async, no Tauri.
 atlas-redact = { path = "../crates/atlas-redact" }
+# The agent-session record: local SQLite store, redact-on-write capture, and
+# (from ATL-83 on) commit linkage. Tauri-free, so its whole surface is
+# testable against a real database and a real git repository.
+atlas-checkpoint = { path = "../crates/atlas-checkpoint" }
 dirs = "6"
 sha2 = "0.10"
 # URL parsing for the embedded browser (`commands::browser`). Already in the

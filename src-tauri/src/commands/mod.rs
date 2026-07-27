@@ -13,6 +13,7 @@ pub mod modelchat_sessions;
 pub mod compose_prompt;
 pub mod fileindex;
 pub mod canvas;
+pub mod capture;
 pub mod claude;
 pub mod clipboard;
 pub mod codebase_index;
