@@ -97,6 +97,14 @@ enum Job {
         /// The patch an edit-shaped call applied, when the arguments carry one.
         patch: Option<String>,
     },
+    /// Walk from the last-seen commit to HEAD and link what it finds.
+    ///
+    /// Not tied to a Session — it is driven by the repository moving, and the
+    /// Sessions it might link to are whatever the store already holds.
+    WalkCommits {
+        workspace_root: PathBuf,
+        workspace_id: String,
+    },
     FinishTurn {
         binding: Binding,
     },
@@ -192,6 +200,26 @@ impl CaptureState {
         });
     }
 
+    /// The repository moved, or a Workspace was just opened — walk for new
+    /// commits.
+    ///
+    /// This is the **in-process consumer** of the git watcher. The walk is
+    /// invoked from the watcher callback directly rather than by round-tripping
+    /// through the frontend, so commit detection does not depend on a window
+    /// being open, on the frontend having subscribed, or on a renderer that may
+    /// be busy.
+    ///
+    /// Also called on Workspace open, and that call is not a fallback: a watcher
+    /// exists only for a Workspace activated at least once this app session, so
+    /// for a never-activated or evicted Workspace the open-time walk is the only
+    /// thing that will ever link its commits.
+    pub fn note_git_change(&self, workspace_root: &std::path::Path) {
+        self.submit(Job::WalkCommits {
+            workspace_root: workspace_root.to_path_buf(),
+            workspace_id: workspace_root.to_string_lossy().to_string(),
+        });
+    }
+
     fn binding(&self, session_id: &str) -> Option<Binding> {
         self.sessions
             .lock()
@@ -275,15 +303,18 @@ fn worker(rx: mpsc::Receiver<Job>) {
     let mut session_ids: HashMap<String, String> = HashMap::new();
 
     while let Ok(job) = rx.recv() {
-        let binding = match &job {
+        // A commit walk is not tied to a Session, so it carries its own root
+        // rather than a binding.
+        let (binding, root) = match &job {
+            Job::WalkCommits { workspace_root, .. } => (None, workspace_root.clone()),
             Job::Prompt { binding, .. }
             | Job::Turn { binding, .. }
             | Job::ToolCall { binding, .. }
             | Job::FinishTurn { binding }
-            | Job::Usage { binding, .. } => binding.clone(),
+            | Job::Usage { binding, .. } => {
+                (Some(binding.clone()), binding.workspace_root.clone())
+            }
         };
-
-        let root = binding.workspace_root.clone();
         let store = stores.entry(root.clone()).or_insert_with(|| {
             match Store::open(atlas_checkpoint::atlas_dir(&root)) {
                 Ok(store) => {
@@ -315,6 +346,33 @@ fn worker(rx: mpsc::Receiver<Job>) {
             continue;
         }
 
+        // The commit walk needs the store but no Session, so it is handled
+        // before the Session-scoped jobs below.
+        if let Job::WalkCommits { workspace_id, .. } = &job {
+            match atlas_checkpoint::walk_new_commits(
+                store,
+                workspace_id,
+                &root,
+                WorkspaceMode::Local,
+            ) {
+                Ok(outcome) if outcome.checkpoints_created > 0 => tracing::info!(
+                    target: "atlas::capture",
+                    commits = outcome.commits_seen,
+                    checkpoints = outcome.checkpoints_created,
+                    "linked commits to sessions"
+                ),
+                Ok(outcome) if outcome.cursor_recovered => tracing::warn!(
+                    target: "atlas::capture",
+                    workspace = %root.display(),
+                    "commit cursor could not be resolved; recovered by re-scan"
+                ),
+                Ok(_) => {}
+                Err(e) => tracing::warn!(target: "atlas::capture", "commit walk failed: {e}"),
+            }
+            continue;
+        }
+
+        let Some(binding) = binding else { continue };
         let key = SessionKey {
             // The Workspace binding proper arrives with the enable popover; until
             // then a Workspace is its project directory, which is the same
@@ -326,6 +384,8 @@ fn worker(rx: mpsc::Receiver<Job>) {
 
         let mut capture = Capture::new(store, WorkspaceMode::Local);
         let outcome = match job {
+            // Already handled above; it needs no Session.
+            Job::WalkCommits { .. } => Ok(()),
             Job::Prompt { prompt, .. } => capture
                 .record_prompt(
                     &key,

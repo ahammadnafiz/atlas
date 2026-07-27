@@ -27,7 +27,7 @@ use notify::RecursiveMode;
 use notify_debouncer_full::new_debouncer;
 use parking_lot::RwLock;
 use serde::Serialize;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 use super::git::{git_refs_compute, GitRefs};
 
@@ -152,6 +152,7 @@ pub async fn git_watch_start(
             String,
         > {
             let project_str = root_for_task.to_string_lossy().into_owned();
+            let root_for_cb = root_for_task.clone();
             let app_for_cb = app_for_task.clone();
             let mut debouncer = new_debouncer(
                 Duration::from_millis(200),
@@ -163,6 +164,18 @@ pub async fn git_watch_start(
                         // the event, a fresh compute would be cheap
                         // *and* correct.
                         *refs_cache_for_cb.write() = None;
+
+                        // Session capture's commit walk. The first in-process
+                        // consumer of this watcher: everything else here goes
+                        // out as a window event for the frontend, but commit
+                        // detection must not depend on a window being open or
+                        // on a renderer being responsive. This only enqueues —
+                        // the walk itself runs on the capture worker thread, so
+                        // the debounced callback returns immediately.
+                        app_for_cb
+                            .state::<super::capture::CaptureState>()
+                            .note_git_change(&root_for_cb);
+
                         let _ = app_for_cb.emit(
                             "atlas:git-changed",
                             GitChangedPayload {
@@ -208,6 +221,14 @@ pub async fn git_watch_start(
     .await
     .map_err(|e| e.to_string())??;
 
+    // Open-time backfill. This is what catches every commit made while Atlas
+    // was closed — the decisive advantage over git hooks, which can only ever
+    // see commits made after they were installed. It is also the *only*
+    // mechanism for a Workspace that is never activated again, since a watcher
+    // exists only for workspaces activated at least once this app session.
+    app.state::<super::capture::CaptureState>()
+        .note_git_change(&root);
+
     state.watchers.write().insert(
         key,
         ActiveWatcher {
@@ -218,15 +239,24 @@ pub async fn git_watch_start(
     Ok(())
 }
 
+/// Stop watching one workspace.
+///
+/// The workspace id is **required**. It used to be optional, with a missing id
+/// meaning "drop every watcher" — and the frontend called it that way whenever
+/// the current project became null, killing commit detection for every open
+/// workspace at once. Nothing observed that, because a dead watcher and a quiet
+/// repository look identical from the outside. Making the id mandatory puts that
+/// failure out of reach rather than relying on call sites to remember; genuine
+/// teardown uses [`git_watch_stop_all`], which says what it does.
 #[tauri::command]
-pub fn git_watch_stop(workspace_id: Option<String>, state: State<'_, GitWatcherState>) {
-    match workspace_id {
-        Some(id) => {
-            state.watchers.write().remove(&id);
-        }
-        // No id (legacy / app teardown): drop everything.
-        None => state.watchers.write().clear(),
-    }
+pub fn git_watch_stop(workspace_id: String, state: State<'_, GitWatcherState>) {
+    state.watchers.write().remove(&workspace_id);
+}
+
+/// Drop every watcher. Application teardown only.
+#[tauri::command]
+pub fn git_watch_stop_all(state: State<'_, GitWatcherState>) {
+    state.watchers.write().clear();
 }
 
 #[derive(Debug, Clone, Serialize)]

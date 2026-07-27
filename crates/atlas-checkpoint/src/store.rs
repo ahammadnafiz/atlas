@@ -46,6 +46,7 @@ impl Store {
     pub fn open(atlas_dir: impl AsRef<Path>) -> Result<Self> {
         let root = atlas_dir.as_ref().to_path_buf();
         fs::create_dir_all(&root).map_err(|e| Error::Storage(format!("{}: {e}", root.display())))?;
+        ensure_self_ignored(&root);
 
         let writer_lock = match WriterLock::acquire(&root.join("sessions.lock")) {
             Ok(lock) => Some(lock),
@@ -716,6 +717,185 @@ impl Store {
         }
     }
 
+    // ── Checkpoints and the commit cursor ───────────────────────────────────
+
+    /// Create a Checkpoint, or leave the existing one alone.
+    ///
+    /// `(Session, commit)` is the idempotency key, so re-running the walk over
+    /// commits already seen creates nothing — which is what makes the bounded
+    /// re-scan recovery path safe.
+    pub fn upsert_checkpoint(&self, input: CheckpointInput<'_>) -> Result<String> {
+        self.require_writer()?;
+
+        if let Some(id) = self.checkpoint_id_for(input.session_id, input.commit_sha)? {
+            return Ok(id);
+        }
+
+        let id = format!("cp-{}", uuid::Uuid::new_v4().simple());
+        self.conn.execute(
+            "INSERT INTO checkpoint
+                (id, session_id, commit_sha, patch_id, link_state, branch,
+                 git_author_name, git_author_email, files_touched, insertions,
+                 deletions, created_at, sync_state)
+             VALUES (?1, ?2, ?3, ?4, 'linked', ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            rusqlite::params![
+                id,
+                input.session_id,
+                input.commit_sha,
+                input.patch_id,
+                input.branch,
+                input.git_author_name,
+                input.git_author_email,
+                serde_json::to_string(input.files_touched).unwrap_or_else(|_| "[]".into()),
+                input.insertions,
+                input.deletions,
+                Utc::now().to_rfc3339(),
+                input.sync_state.as_str(),
+            ],
+        )?;
+        Ok(id)
+    }
+
+    pub fn checkpoint_id_for(&self, session_id: &str, commit_sha: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT id FROM checkpoint WHERE session_id = ?1 AND commit_sha = ?2",
+                rusqlite::params![session_id, commit_sha],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    pub fn checkpoints_for_session(&self, session_id: &str) -> Result<Vec<Checkpoint>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {CHECKPOINT_COLUMNS} FROM checkpoint WHERE session_id = ?1 ORDER BY created_at"
+        ))?;
+        let rows = stmt.query_map([session_id], row_to_checkpoint)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn checkpoints_for_commit(&self, commit_sha: &str) -> Result<Vec<Checkpoint>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {CHECKPOINT_COLUMNS} FROM checkpoint WHERE commit_sha = ?1"
+        ))?;
+        let rows = stmt.query_map([commit_sha], row_to_checkpoint)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Every Checkpoint belonging to a Workspace's Sessions.
+    pub fn checkpoints_for_workspace(&self, workspace_id: &str) -> Result<Vec<Checkpoint>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {CHECKPOINT_COLUMNS} FROM checkpoint
+              WHERE session_id IN (SELECT id FROM agent_session WHERE workspace_id = ?1)
+              ORDER BY created_at"
+        ))?;
+        let rows = stmt.query_map([workspace_id], row_to_checkpoint)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Re-point a Checkpoint at the commit now carrying its change.
+    pub fn relink_checkpoint(&self, id: &str, commit_sha: &str) -> Result<()> {
+        self.require_writer()?;
+        self.conn.execute(
+            "UPDATE checkpoint SET commit_sha = ?2, link_state = 'linked' WHERE id = ?1",
+            rusqlite::params![id, commit_sha],
+        )?;
+        Ok(())
+    }
+
+    /// Mark a Checkpoint's commit as gone.
+    ///
+    /// Never deletes the row and never drops the Session link: losing the link
+    /// is a real event the record should be honest about, and it is recoverable
+    /// if the commit becomes reachable again.
+    pub fn orphan_checkpoint(&self, id: &str) -> Result<()> {
+        self.require_writer()?;
+        self.conn.execute(
+            "UPDATE checkpoint SET link_state = 'orphaned' WHERE id = ?1",
+            [id],
+        )?;
+        Ok(())
+    }
+
+    /// How far the commit walk has got for this Workspace.
+    pub fn commit_cursor(&self, workspace_id: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT last_seen_commit FROM workspace_cursor WHERE workspace_id = ?1",
+                [workspace_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten())
+    }
+
+    /// Advance the cursor.
+    ///
+    /// Called only after the Checkpoints for the range are durably written, so a
+    /// crash mid-walk re-processes rather than skips. `recovered` records that a
+    /// bounded re-scan was needed, which the capture-health signal surfaces.
+    pub fn set_commit_cursor(
+        &self,
+        workspace_id: &str,
+        commit: &str,
+        recovered: bool,
+    ) -> Result<()> {
+        self.require_writer()?;
+        self.conn.execute(
+            "INSERT INTO workspace_cursor (workspace_id, last_seen_commit, recovered, updated_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (workspace_id) DO UPDATE
+                SET last_seen_commit = ?2,
+                    recovered = ?3,
+                    updated_at = ?4",
+            rusqlite::params![
+                workspace_id,
+                commit,
+                i64::from(recovered),
+                Utc::now().to_rfc3339()
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Did the last walk have to recover its cursor by re-scanning?
+    pub fn cursor_recovered(&self, workspace_id: &str) -> Result<bool> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT recovered FROM workspace_cursor WHERE workspace_id = ?1",
+                [workspace_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .unwrap_or(0)
+            != 0)
+    }
+
+    /// Live Sessions in a Workspace, with the files each left behind.
+    ///
+    /// Only live Sessions: an imported one has no write-time `existed_before`,
+    /// and the link rule cannot honestly run without it.
+    pub fn link_candidates(&self, workspace_id: &str) -> Result<Vec<(String, Vec<FileTouch>)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id FROM agent_session WHERE workspace_id = ?1 AND source IN ('acp', 'cersei')",
+        )?;
+        let ids: Vec<String> = stmt
+            .query_map([workspace_id], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        let mut out = Vec::new();
+        for id in ids {
+            let touches = self.latest_file_touches(&id)?;
+            if !touches.is_empty() {
+                out.push((id, touches));
+            }
+        }
+        Ok(out)
+    }
+
     // ── Maintenance ─────────────────────────────────────────────────────────
 
     /// Turns still marked open on startup were abandoned — the process died
@@ -855,6 +1035,74 @@ fn row_to_file_touch(row: &rusqlite::Row<'_>) -> rusqlite::Result<FileTouch> {
         deleted: row.get::<_, i64>(8)? != 0,
         out_of_repo: row.get::<_, i64>(9)? != 0,
         created_at: parse_time(row.get::<_, String>(10)?),
+    })
+}
+
+/// Make `.atlas/` ignore itself.
+///
+/// The app separately offers to append `.atlas/` to the *project's* `.gitignore`,
+/// but that is a user-toggleable setting and a no-op on a repository that has no
+/// `.gitignore` yet — so it cannot be relied on. It matters much more now than it
+/// did when this directory only held small JSON files: a SQLite database brings
+/// `-wal` and `-shm` sidecars that change on every write, and if they are not
+/// ignored then `git add -A` sweeps them into the developer's commits, breaks
+/// `git checkout` with "local changes would be overwritten", and pushes the
+/// session store itself to a shared remote.
+///
+/// A `.gitignore` *inside* the directory ignores everything in it regardless of
+/// what the project's rules say, needs no setting, and needs no cooperation from
+/// a repository that may not exist yet. Best-effort: failing to write it is not
+/// worth refusing to record a Session over.
+fn ensure_self_ignored(root: &Path) {
+    let marker = root.join(".gitignore");
+    if marker.exists() {
+        return;
+    }
+    let _ = fs::write(
+        &marker,
+        "# Atlas per-project state. Never committed: it holds the local session\n\
+         # store (plus its SQLite -wal/-shm sidecars) and is machine-specific.\n\
+         *\n",
+    );
+}
+
+pub struct CheckpointInput<'a> {
+    pub session_id: &'a str,
+    pub commit_sha: &'a str,
+    pub patch_id: Option<&'a str>,
+    pub branch: Option<&'a str>,
+    pub git_author_name: Option<&'a str>,
+    pub git_author_email: Option<&'a str>,
+    pub files_touched: &'a [String],
+    pub insertions: i64,
+    pub deletions: i64,
+    pub sync_state: SyncState,
+}
+
+const CHECKPOINT_COLUMNS: &str = "id, session_id, commit_sha, patch_id, link_state, branch, \
+     git_author_name, git_author_email, files_touched, insertions, deletions, attribution, \
+     created_at, sync_state";
+
+fn row_to_checkpoint(row: &rusqlite::Row<'_>) -> rusqlite::Result<Checkpoint> {
+    let link_state: String = row.get(4)?;
+    let files: String = row.get(8)?;
+    let attribution: Option<String> = row.get(11)?;
+    let sync_state: String = row.get(13)?;
+    Ok(Checkpoint {
+        id: row.get(0)?,
+        session_id: row.get(1)?,
+        commit_sha: row.get(2)?,
+        patch_id: row.get(3)?,
+        link_state: LinkState::parse(&link_state).unwrap_or(LinkState::Linked),
+        branch: row.get(5)?,
+        git_author_name: row.get(6)?,
+        git_author_email: row.get(7)?,
+        files_touched: serde_json::from_str(&files).unwrap_or_default(),
+        insertions: row.get(9)?,
+        deletions: row.get(10)?,
+        attribution: attribution.and_then(|a| serde_json::from_str(&a).ok()),
+        created_at: parse_time(row.get::<_, String>(12)?),
+        sync_state: SyncState::parse(&sync_state).unwrap_or(SyncState::Local),
     })
 }
 

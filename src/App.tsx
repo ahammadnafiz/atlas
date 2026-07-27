@@ -940,7 +940,11 @@ export function App() {
     if (!currentProject) {
       fileIndex.closeProject().catch(() => {});
       markFileIndexClosed();
-      void invoke("git_watch_stop").catch(() => {});
+      // Deliberately does NOT stop git watchers. This branch runs whenever the
+      // *current* project becomes null, but watchers are per-workspace and a
+      // backgrounded workspace must keep watching — its commits still need
+      // linking to its Sessions. Tearing one down is `teardownHot`'s job, with
+      // the workspace id it actually owns.
       void invoke("recent_files_close_project").catch(() => {});
       // Drop the mention cache so the @-picker doesn't briefly
       // surface the previous project's notes / symbols on a fresh

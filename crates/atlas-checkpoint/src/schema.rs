@@ -16,7 +16,7 @@ use rusqlite::Connection;
 use crate::error::{Error, Result};
 
 /// Bump when adding a migration, and add the matching arm in [`migrate`].
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 pub fn migrate(conn: &Connection) -> Result<()> {
     let found: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
@@ -36,6 +36,9 @@ pub fn migrate(conn: &Connection) -> Result<()> {
     }
     if found < 2 {
         conn.execute_batch(V2)?;
+    }
+    if found < 3 {
+        conn.execute_batch(V3)?;
     }
 
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -249,6 +252,77 @@ CREATE INDEX IF NOT EXISTS idx_agent_edit_session
     ON agent_edit (session_id, turn_seq);
 "#;
 
+const V3: &str = r#"
+-- The slice of one Session whose work landed in one git commit.
+--
+-- Identified by the (Session, commit) pair, and that pair is the point: two
+-- Sessions contributing to one commit produce two Checkpoints sharing the
+-- commit, not one Checkpoint with two owners. One Session spanning five commits
+-- produces five. The pair is also the idempotency key, so re-running the walk
+-- over commits already seen is a no-op.
+--
+-- A Checkpoint carries no transcript of its own. The Messages remain the single
+-- copy — a relational store has no need of the self-contained snapshots that a
+-- git-stored checkpoint requires in order to survive a rebase.
+CREATE TABLE IF NOT EXISTS checkpoint (
+    id              TEXT PRIMARY KEY,
+    session_id      TEXT NOT NULL REFERENCES agent_session(id) ON DELETE CASCADE,
+    -- May change: a rewrite re-points this at the new commit carrying the same
+    -- change.
+    commit_sha      TEXT NOT NULL,
+    -- Stable across rebase and amend, because it hashes the diff rather than the
+    -- commit. Null for an empty diff, which never participates in matching.
+    patch_id        TEXT,
+    link_state      TEXT NOT NULL DEFAULT 'linked',
+    -- Empty on a detached HEAD. The timeline's branch filter simply does not
+    -- claim those Checkpoints.
+    branch          TEXT,
+    -- Verbatim from the commit, display-only. This is the identity ON the
+    -- commit, which is a different fact from the Atlas account whose agent ran:
+    -- pairing, rebasing a colleague's branch and bot commits all diverge. There
+    -- is deliberately no mapping from git email to Organisation member — git
+    -- emails are self-asserted and never verified, so treating one as proof of
+    -- identity would let anyone render commits as a colleague.
+    git_author_name  TEXT,
+    git_author_email TEXT,
+    files_touched   TEXT NOT NULL DEFAULT '[]',
+    insertions      INTEGER NOT NULL DEFAULT 0,
+    deletions       INTEGER NOT NULL DEFAULT 0,
+    -- The agent-versus-human line split. Stays null: this feature captures the
+    -- inputs and does not compute the metric, which is a pure function over
+    -- stored rows and can be backfilled across every existing Checkpoint later.
+    attribution     TEXT,
+    created_at      TEXT NOT NULL,
+    sync_state      TEXT NOT NULL DEFAULT 'local',
+    sync_attempts   INTEGER NOT NULL DEFAULT 0,
+
+    UNIQUE (session_id, commit_sha)
+);
+
+-- How far the commit walk has got, per Workspace. Advanced only after the
+-- Checkpoints for a range are durably written, so a crash mid-walk re-processes
+-- rather than skips.
+CREATE TABLE IF NOT EXISTS workspace_cursor (
+    workspace_id     TEXT PRIMARY KEY,
+    last_seen_commit TEXT,
+    -- Set when the cursor could not be resolved and a bounded re-scan was used
+    -- instead. Surfaces through the capture-health signal, because a Workspace
+    -- that silently stopped detecting commits is the failure this whole design
+    -- exists to avoid.
+    recovered        INTEGER NOT NULL DEFAULT 0,
+    updated_at       TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_checkpoint_commit
+    ON checkpoint (commit_sha);
+CREATE INDEX IF NOT EXISTS idx_checkpoint_session
+    ON checkpoint (session_id);
+CREATE INDEX IF NOT EXISTS idx_checkpoint_patch
+    ON checkpoint (patch_id);
+CREATE INDEX IF NOT EXISTS idx_checkpoint_outbox
+    ON checkpoint (sync_state);
+"#;
+
 /// Index names the store guarantees. Exposed so a test can assert they survived
 /// a migration — an index silently dropped is a full scan nobody notices until
 /// a developer with a year of history opens the board.
@@ -266,4 +340,8 @@ pub const REQUIRED_INDEXES: &[&str] = &[
     "idx_file_touch_path",
     "idx_file_touch_by_path",
     "idx_agent_edit_session",
+    "idx_checkpoint_commit",
+    "idx_checkpoint_session",
+    "idx_checkpoint_patch",
+    "idx_checkpoint_outbox",
 ];

@@ -353,6 +353,7 @@ pub fn run() {
             commands::git_ops::git_op_control,
             commands::git_watcher::git_watch_start,
             commands::git_watcher::git_watch_stop,
+            commands::git_watcher::git_watch_stop_all,
             commands::git_watcher::git_watch_status,
             commands::mention_search::mention_search,
             commands::mention_search::mention_cache_set_knowledge,

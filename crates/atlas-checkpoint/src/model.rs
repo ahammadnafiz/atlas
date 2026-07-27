@@ -400,6 +400,63 @@ pub struct FileTouch {
     pub created_at: DateTime<Utc>,
 }
 
+/// Whether a Checkpoint's commit is still in the history.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LinkState {
+    /// The commit is reachable, or was re-matched after a rewrite.
+    Linked,
+    /// The commit is gone and nothing carrying the same change could be found.
+    ///
+    /// A first-class state, not an error and not a deletion. Losing the link is
+    /// a real event — a squash collapses several patches into one that matches
+    /// none of them — and the record should say so rather than attach to the
+    /// wrong commit. The Session link is retained, so this is recoverable if the
+    /// commit becomes reachable again.
+    Orphaned,
+}
+
+impl LinkState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Linked => "linked",
+            Self::Orphaned => "orphaned",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "linked" => Some(Self::Linked),
+            "orphaned" => Some(Self::Orphaned),
+            _ => None,
+        }
+    }
+}
+
+/// The slice of one Session whose work landed in one git commit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Checkpoint {
+    pub id: String,
+    pub session_id: String,
+    pub commit_sha: String,
+    pub patch_id: Option<String>,
+    pub link_state: LinkState,
+    /// Empty on a detached HEAD.
+    pub branch: Option<String>,
+    /// Verbatim from the commit; display-only, and a different fact from the
+    /// Atlas account whose agent ran.
+    pub git_author_name: Option<String>,
+    pub git_author_email: Option<String>,
+    pub files_touched: Vec<String>,
+    pub insertions: i64,
+    pub deletions: i64,
+    /// Stays null — this feature captures Attribution's inputs and does not
+    /// compute the metric.
+    pub attribution: Option<serde_json::Value>,
+    pub created_at: DateTime<Utc>,
+    pub sync_state: SyncState,
+}
+
 /// The patch an edit-shaped call applied. Attribution's input.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentEdit {
