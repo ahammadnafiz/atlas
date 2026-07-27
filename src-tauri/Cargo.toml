@@ -173,7 +173,7 @@ opt-level = 3       # Default for release, restated for clarity
 # (Tauri, wry, tao, atlas-acp, atlas-agents, atlas-terminal, tokio, serde,
 # reqwest, etc.). First clean build pays a one-time ~3–5 minute cost;
 # subsequent rebuilds only recompile the app crate and are unaffected.
-# Net effect: `npx tauri dev` startup drops noticeably because Tauri's
+# Net effect: `bunx tauri dev` startup drops noticeably because Tauri's
 # runtime is no longer running unoptimized debug code.
 [profile.dev.package."*"]
 opt-level = 1
