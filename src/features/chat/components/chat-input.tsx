@@ -214,7 +214,7 @@ export const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(
               backgroundColor: "transparent",
             },
             ".cm-selectionBackground, ::selection": {
-              background: "var(--bg-selected) !important",
+              background: "var(--selection-bg) !important",
             },
           },
           { dark: true }

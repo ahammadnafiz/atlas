@@ -309,7 +309,7 @@
   }
 
   ::selection {
-    background: var(--accent-primary-muted);
+    background: var(--selection-bg);
     color: var(--text-primary);
   }
 
