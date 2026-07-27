@@ -19,7 +19,7 @@ import type { SessionSummary } from "../types";
 
 interface Props {
   sessions: SessionSummary[];
-  /** `null` while the first read is in flight. */
+  /** True while the first read for this Workspace is in flight. */
   loading: boolean;
   onOpen: (id: string) => void;
 }
@@ -129,7 +129,7 @@ function SessionRow({
       <button
         type="button"
         onClick={() => onOpen(session.id)}
-        className="group flex w-full items-center gap-3 rounded px-2 py-2 text-left hover:bg-[var(--bg-hover)]"
+        className="group flex w-full items-center gap-3 rounded px-2 py-2 text-left transition-colors duration-150 hover:bg-[var(--bg-hover)] focus-visible:ring-1 focus-visible:ring-[var(--border-focus)] active:bg-[var(--bg-active)]"
       >
         <span className="min-w-0 flex-1 truncate text-[13px] text-[var(--text-primary)]">
           {session.title ?? <span className="text-[var(--text-tertiary)]">Untitled session</span>}
@@ -143,6 +143,15 @@ function SessionRow({
             className="shrink-0 text-[var(--status-warning)]"
             aria-label={session.attentionReason ?? "Partially recorded"}
           />
+        )}
+
+        {/* Back-filled from an on-disk transcript, not captured live. Without
+         *  the chip these read as live captures whose commit linking failed —
+         *  the feature looking broken is exactly what the marker prevents. */}
+        {session.source === "external_jsonl" && (
+          <span className="hidden shrink-0 rounded border border-[var(--border-default)] px-1.5 py-0.5 text-[10px] text-[var(--text-tertiary)] sm:block">
+            imported
+          </span>
         )}
 
         {session.agent && <AgentBadge agent={session.agent} />}
@@ -164,16 +173,20 @@ function SessionRow({
 /**
  * Which agent produced the Session.
  *
- * Colour-coded per agent so a mixed list is scannable without reading. Colours
- * come from the status ramp rather than new tokens — Atlas has no per-vendor
- * palette and inventing one for two agents would be a token nobody else uses.
+ * Colour-coded per agent so a mixed list is scannable without reading, using
+ * the per-agent chip tokens the design system already carries — the status
+ * ramp is for status, and painting Claude with the warning colour made every
+ * row read as a problem. An unrecognised agent gets the neutral tone, not
+ * Claude's.
  */
-function AgentBadge({ agent }: { agent: string }) {
-  const tone = agent.includes("codex")
-    ? "text-[var(--status-info)] bg-[var(--status-info-muted)]"
-    : agent.includes("cersei")
-      ? "text-[var(--text-secondary)] bg-[var(--bg-selected)]"
-      : "text-[var(--status-warning)] bg-[var(--status-warning-muted)]";
+export function AgentBadge({ agent }: { agent: string }) {
+  const tone = agent.includes("claude")
+    ? "text-[var(--agent-claude-chip)] bg-[var(--agent-claude-chip-bg)]"
+    : agent.includes("codex")
+      ? "text-[var(--agent-codex-chip)] bg-[var(--agent-codex-chip-bg)]"
+      : agent.includes("cersei")
+        ? "text-[var(--agent-local-chip)] bg-[var(--agent-local-chip-bg)]"
+        : "text-[var(--text-secondary)] bg-[var(--bg-selected)]";
 
   return (
     <span

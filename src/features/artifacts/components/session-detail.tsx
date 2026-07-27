@@ -1,46 +1,76 @@
-import { useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import {
+  Brain,
   ChevronDown,
   ChevronRight,
   GitCommitHorizontal,
+  Loader2,
+  Sparkles,
   TriangleAlert,
   Unlink,
+  User,
+  Wrench,
 } from "lucide-react";
 
 import { cn } from "@/lib/utils";
 
 import {
   DEFAULT_FILTERS,
+  type ArtifactPayload,
   type SessionDetail as Detail,
   type TimelineEntry,
   type TimelineFilters,
 } from "../types";
+import { AgentBadge } from "./session-list";
 
 /**
  * One Session, as the ordered record of what happened.
  *
  * The layout is a timeline and a rail, because the two things a developer does
  * here are different in kind: *read* the sequence, and *find* one moment in it.
- * A single scrolling list serves the first and fails the second — which is why
- * the Checkpoint jump list and the kind filters live in their own column rather
- * than as controls sprinkled through the content.
+ * The timeline carries a gutter — a continuous line with a glyph node per entry
+ * — so the shape of a turn (prompt, thinking, tools, response, commit) is
+ * scannable without reading a word.
+ *
+ * Long Sessions are windowed: the first 300 visible entries render, and more
+ * are appended as the scroll approaches the bottom. Deliberately slice-based
+ * rather than a virtualizer — entries expand and collapse, so measured-height
+ * virtualization would fight the content, and a Session being *read* is
+ * scrolled forward, not randomly accessed. Jumping to a Checkpoint extends the
+ * window first.
  *
  * Everything shown is already redacted. Scrubbing happened before persistence,
  * so there is no way for this component to leak something the store does not
  * already hold.
  */
 
+/** How many visible entries render before the window has to grow. */
+const WINDOW_CHUNK = 300;
+
+/** Distance from the bottom (px) at which the window grows. */
+const WINDOW_MARGIN = 600;
+
 interface Props {
   detail: Detail;
+  /** Needed to fetch spilled payloads via `artifacts_payload`. */
+  projectPath: string;
 }
 
-export function SessionDetail({ detail }: Props) {
+export function SessionDetail({ detail, projectPath }: Props) {
   const [filters, setFilters] = useState<TimelineFilters>(DEFAULT_FILTERS);
+  /** Narrow tool calls to failed ones — the "which calls failed" question. */
+  const [failedOnly, setFailedOnly] = useState(false);
+  const [expandAllTools, setExpandAllTools] = useState(false);
+  const [renderCount, setRenderCount] = useState(WINDOW_CHUNK);
   const entryRefs = useRef(new Map<string, HTMLLIElement>());
+  const scrollRef = useRef<HTMLDivElement | null>(null);
+  /** A jump target waiting for its entry to be rendered. */
+  const [pendingJump, setPendingJump] = useState<string | null>(null);
 
   const visible = useMemo(
-    () => detail.entries.filter((entry) => passes(entry, filters)),
-    [detail.entries, filters],
+    () => detail.entries.filter((entry) => passes(entry, filters, failedOnly)),
+    [detail.entries, filters, failedOnly],
   );
 
   const checkpoints = useMemo(
@@ -48,35 +78,99 @@ export function SessionDetail({ detail }: Props) {
     [detail.entries],
   );
 
-  const jumpTo = (id: string) => {
-    entryRefs.current.get(id)?.scrollIntoView({ behavior: "smooth", block: "center" });
-  };
+  const failedCount = useMemo(
+    () =>
+      detail.entries.filter(
+        (entry) => entry.kind === "tool_call" && entry.toolStatus === "failed",
+      ).length,
+    [detail.entries],
+  );
+
+  // A new Session or a filter change restarts the window from the top.
+  useEffect(() => {
+    setRenderCount(WINDOW_CHUNK);
+    scrollRef.current?.scrollTo({ top: 0 });
+  }, [detail.summary.id, filters, failedOnly]);
+
+  const rendered = visible.slice(0, renderCount);
+
+  const onScroll = useCallback(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    if (
+      renderCount < visible.length &&
+      el.scrollTop + el.clientHeight >= el.scrollHeight - WINDOW_MARGIN
+    ) {
+      setRenderCount((count) => Math.min(count + WINDOW_CHUNK, visible.length));
+    }
+  }, [renderCount, visible.length]);
+
+  // Jump-to-Checkpoint has to survive both a filter that hides Checkpoints and
+  // a window that has not reached the target yet, so it settles over renders:
+  // reveal the kind, grow the window, then scroll.
+  useEffect(() => {
+    if (!pendingJump) return;
+    const index = visible.findIndex((entry) => entry.id === pendingJump);
+    if (index === -1) {
+      setFilters((current) =>
+        current.checkpoints ? current : { ...current, checkpoints: true },
+      );
+      return;
+    }
+    if (index >= renderCount) {
+      setRenderCount(index + 40);
+      return;
+    }
+    const node = entryRefs.current.get(pendingJump);
+    if (node) {
+      node.scrollIntoView({ behavior: "smooth", block: "center" });
+      setPendingJump(null);
+    }
+  }, [pendingJump, visible, renderCount]);
 
   return (
     <div className="flex h-full min-h-0">
-      <div className="min-h-0 flex-1 overflow-y-auto px-6 py-4">
+      <div ref={scrollRef} onScroll={onScroll} className="min-h-0 flex-1 overflow-y-auto px-6 py-4">
         <Header detail={detail} />
 
         {visible.length === 0 ? (
           <p className="py-10 text-center text-[12px] text-[var(--text-tertiary)]">
             {detail.entries.length === 0
               ? "Nothing was recorded in this session."
-              : "Every entry is hidden by the current filters."}
+              : failedOnly && failedCount === 0
+                ? "No tool calls failed in this session."
+                : "Every entry is hidden by the current filters."}
           </p>
         ) : (
-          <ul className="mt-5 space-y-3">
-            {visible.map((entry) => (
-              <li
-                key={entry.id}
-                ref={(node) => {
-                  if (node) entryRefs.current.set(entry.id, node);
-                  else entryRefs.current.delete(entry.id);
-                }}
+          <>
+            {/* The gutter: a continuous line the glyph nodes sit on. */}
+            <ul className="relative mt-5 space-y-3 before:absolute before:bottom-1 before:left-[11px] before:top-1 before:w-px before:bg-[var(--border-default)]">
+              {rendered.map((entry) => (
+                <li
+                  key={entry.id}
+                  className="relative pl-9"
+                  ref={(node) => {
+                    if (node) entryRefs.current.set(entry.id, node);
+                    else entryRefs.current.delete(entry.id);
+                  }}
+                >
+                  <GutterNode entry={entry} />
+                  <Entry entry={entry} projectPath={projectPath} expandAllTools={expandAllTools} />
+                </li>
+              ))}
+            </ul>
+            {renderCount < visible.length && (
+              <button
+                type="button"
+                onClick={() =>
+                  setRenderCount((count) => Math.min(count + WINDOW_CHUNK, visible.length))
+                }
+                className="mt-4 w-full rounded border border-[var(--border-default)] py-1.5 text-[11px] text-[var(--text-tertiary)] transition-colors duration-150 hover:bg-[var(--bg-hover)] hover:text-[var(--text-secondary)] focus-visible:ring-1 focus-visible:ring-[var(--border-focus)] active:scale-[0.99]"
               >
-                <Entry entry={entry} />
-              </li>
-            ))}
-          </ul>
+                {visible.length - renderCount} more entries — scroll or click to load
+              </button>
+            )}
+          </>
         )}
       </div>
 
@@ -84,10 +178,49 @@ export function SessionDetail({ detail }: Props) {
         detail={detail}
         filters={filters}
         onFiltersChange={setFilters}
+        failedCount={failedCount}
+        failedOnly={failedOnly}
+        onFailedOnlyChange={setFailedOnly}
+        expandAllTools={expandAllTools}
+        onExpandAllToolsChange={setExpandAllTools}
         checkpoints={checkpoints}
-        onJump={jumpTo}
+        onJump={setPendingJump}
       />
     </div>
+  );
+}
+
+/** The glyph on the gutter line — the entry's kind at a glance. */
+function GutterNode({ entry }: { entry: TimelineEntry }) {
+  const failed = entry.kind === "tool_call" && entry.toolStatus === "failed";
+  const orphaned = entry.kind === "checkpoint" && entry.linkState === "orphaned";
+  const Icon =
+    entry.kind === "prompt"
+      ? User
+      : entry.kind === "response"
+        ? Sparkles
+        : entry.kind === "thinking"
+          ? Brain
+          : entry.kind === "tool_call"
+            ? Wrench
+            : orphaned
+              ? Unlink
+              : GitCommitHorizontal;
+  return (
+    <span
+      aria-hidden
+      className={cn(
+        // Solid surface behind the glyph so it interrupts the line.
+        "absolute left-0 top-0.5 flex size-[23px] items-center justify-center rounded-full border bg-[var(--bg-surface)]",
+        failed
+          ? "border-[var(--status-error)] text-[var(--status-error)]"
+          : entry.kind === "prompt"
+            ? "border-[var(--border-strong)] text-[var(--text-secondary)]"
+            : "border-[var(--border-default)] text-[var(--text-tertiary)]",
+      )}
+    >
+      <Icon size={11} />
+    </span>
   );
 }
 
@@ -100,20 +233,20 @@ function Header({ detail }: { detail: Detail }) {
     duration(s.durationSeconds),
     count(s.checkpointCount, "Checkpoint"),
     count(s.filesTouched, "file"),
-    s.insertions || s.deletions ? null : undefined,
     s.totalTokens > 0 ? `${compact(s.totalTokens)} tokens` : null,
   ].filter((f): f is string => typeof f === "string" && f.length > 0);
 
   return (
     <header>
-      <h1 className="text-[18px] font-semibold leading-snug text-[var(--text-primary)]">
+      <h1 className="text-[18px] font-semibold leading-snug tracking-[-0.01em] text-[var(--text-primary)]">
         {s.title ?? "Untitled session"}
       </h1>
 
       <div className="mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-1 text-[11px] text-[var(--text-tertiary)]">
-        {s.agent && (
-          <span className="rounded bg-[var(--bg-selected)] px-1.5 py-0.5 font-mono text-[10px] text-[var(--text-secondary)]">
-            {s.agent}
+        {s.agent && <AgentBadge agent={s.agent} />}
+        {s.source === "external_jsonl" && (
+          <span className="rounded border border-[var(--border-default)] px-1.5 py-0.5 text-[10px] text-[var(--text-tertiary)]">
+            imported
           </span>
         )}
         {facts.map((fact, i) => (
@@ -147,36 +280,44 @@ function Header({ detail }: { detail: Detail }) {
   );
 }
 
-function Entry({ entry }: { entry: TimelineEntry }) {
+function Entry({
+  entry,
+  projectPath,
+  expandAllTools,
+}: {
+  entry: TimelineEntry;
+  projectPath: string;
+  expandAllTools: boolean;
+}) {
   switch (entry.kind) {
     case "prompt":
-      return <Prompt entry={entry} />;
+      return <Prompt entry={entry} projectPath={projectPath} />;
     case "response":
-      return <Response entry={entry} />;
+      return <Response entry={entry} projectPath={projectPath} />;
     case "thinking":
-      return <Thinking entry={entry} />;
+      return <Thinking entry={entry} projectPath={projectPath} />;
     case "tool_call":
-      return <ToolCall entry={entry} />;
+      return <ToolCall entry={entry} projectPath={projectPath} expandAll={expandAllTools} />;
     case "checkpoint":
       return <Checkpoint entry={entry} />;
   }
 }
 
 /** What the developer asked. Boxed, because it is the anchor of a turn. */
-function Prompt({ entry }: { entry: TimelineEntry }) {
+function Prompt({ entry, projectPath }: { entry: TimelineEntry; projectPath: string }) {
   return (
     <div className="rounded-lg border border-[var(--border-default)] bg-[var(--bg-raised)] px-3 py-2.5">
-      <Body entry={entry} className="text-[13px] text-[var(--text-primary)]" />
+      <Body entry={entry} projectPath={projectPath} className="text-[13px] text-[var(--text-primary)]" />
       <p className="mt-1.5 text-[11px] text-[var(--text-tertiary)]">{relative(entry.at)}</p>
     </div>
   );
 }
 
 /** What the agent said back. Unboxed, so the conversation reads as prose. */
-function Response({ entry }: { entry: TimelineEntry }) {
+function Response({ entry, projectPath }: { entry: TimelineEntry; projectPath: string }) {
   return (
-    <div className="px-3 py-0.5">
-      <Body entry={entry} className="text-[13px] text-[var(--text-secondary)]" />
+    <div className="py-0.5">
+      <Body entry={entry} projectPath={projectPath} className="text-[13px] text-[var(--text-secondary)]" />
     </div>
   );
 }
@@ -188,14 +329,14 @@ function Response({ entry }: { entry: TimelineEntry }) {
  * never what someone opened the timeline to read — but throwing it away would
  * lose the only record of *why* the agent did what it did.
  */
-function Thinking({ entry }: { entry: TimelineEntry }) {
+function Thinking({ entry, projectPath }: { entry: TimelineEntry; projectPath: string }) {
   const [open, setOpen] = useState(false);
   return (
-    <div className="px-3">
+    <div>
       <button
         type="button"
         onClick={() => setOpen((v) => !v)}
-        className="flex items-center gap-1 text-[11px] text-[var(--text-muted)] hover:text-[var(--text-secondary)]"
+        className="flex items-center gap-1 rounded px-1 py-0.5 text-[11px] text-[var(--text-muted)] transition-colors duration-150 hover:text-[var(--text-secondary)] focus-visible:ring-1 focus-visible:ring-[var(--border-focus)] active:scale-[0.98]"
       >
         {open ? <ChevronDown size={11} /> : <ChevronRight size={11} />}
         Thinking
@@ -203,6 +344,7 @@ function Thinking({ entry }: { entry: TimelineEntry }) {
       {open && (
         <Body
           entry={entry}
+          projectPath={projectPath}
           className="mt-1 border-l border-[var(--border-default)] pl-3 text-[12px] text-[var(--text-muted)]"
         />
       )}
@@ -215,19 +357,33 @@ function Thinking({ entry }: { entry: TimelineEntry }) {
  *
  * Collapsed by default because a Session has far more tool calls than messages,
  * and expanding all of them by default turns the timeline into a log dump — the
- * exact thing the filter rail exists to prevent.
+ * rail's "Expand all tool calls" is the explicit opt-in.
  */
-function ToolCall({ entry }: { entry: TimelineEntry }) {
-  const [open, setOpen] = useState(false);
+function ToolCall({
+  entry,
+  projectPath,
+  expandAll,
+}: {
+  entry: TimelineEntry;
+  projectPath: string;
+  expandAll: boolean;
+}) {
+  const [open, setOpen] = useState(expandAll);
+  // The rail toggle overrides local state in both directions; a later manual
+  // click takes over again until the toggle next changes.
+  useEffect(() => {
+    setOpen(expandAll);
+  }, [expandAll]);
+
   const target = entry.paths[0] ?? entry.toolTitle ?? "";
   const failed = entry.toolStatus === "failed";
 
   return (
-    <div className="px-3">
+    <div>
       <button
         type="button"
         onClick={() => setOpen((v) => !v)}
-        className="flex w-full items-center gap-3 rounded px-1 py-0.5 text-left hover:bg-[var(--bg-hover)]"
+        className="flex w-full items-center gap-3 rounded px-1 py-0.5 text-left transition-colors duration-150 hover:bg-[var(--bg-hover)] focus-visible:ring-1 focus-visible:ring-[var(--border-focus)] active:bg-[var(--bg-active)]"
       >
         <span
           className={cn(
@@ -240,6 +396,11 @@ function ToolCall({ entry }: { entry: TimelineEntry }) {
         <span className="min-w-0 flex-1 truncate font-mono text-[11px] text-[var(--text-secondary)]">
           {target}
         </span>
+        {failed && (
+          <span className="shrink-0 rounded bg-[var(--status-error-muted)] px-1.5 py-px text-[10px] text-[var(--status-error)]">
+            failed
+          </span>
+        )}
         {entry.paths.length > 1 && (
           <span className="shrink-0 text-[10px] text-[var(--text-tertiary)]">
             +{entry.paths.length - 1}
@@ -254,16 +415,28 @@ function ToolCall({ entry }: { entry: TimelineEntry }) {
 
       {open && (
         <div className="mt-1 space-y-1.5 border-l border-[var(--border-default)] pl-3">
-          {entry.paths.length > 1 && (
-            <Block label="Files" text={entry.paths.join("\n")} />
+          {entry.paths.length > 1 && <Block label="Files" text={entry.paths.join("\n")} />}
+          {entry.arguments && (
+            <Block
+              label="Arguments"
+              text={entry.arguments}
+              projectPath={projectPath}
+              blobRef={spilledRef(entry.argumentsRef, entry.arguments)}
+            />
           )}
-          {entry.arguments && <Block label="Arguments" text={entry.arguments} />}
           {entry.resultBinary ? (
             <p className="text-[11px] text-[var(--text-tertiary)]">
               The result was binary and is not shown.
             </p>
           ) : (
-            entry.result && <Block label="Result" text={entry.result} />
+            entry.result && (
+              <Block
+                label="Result"
+                text={entry.result}
+                projectPath={projectPath}
+                blobRef={spilledRef(entry.resultRef, entry.result)}
+              />
+            )
           )}
         </div>
       )}
@@ -271,13 +444,38 @@ function ToolCall({ entry }: { entry: TimelineEntry }) {
   );
 }
 
-function Block({ label, text }: { label: string; text: string }) {
+/**
+ * Is this field's inline text a preview with the real payload spilled to a
+ * blob? A spilled-but-small payload is already inlined in full, so the ref
+ * alone is not enough — a full inline is ~64 KB where a preview is ~2 KB.
+ */
+function spilledRef(ref: string | null, inline: string | null): string | null {
+  if (!ref) return null;
+  return (inline?.length ?? 0) <= 4096 ? ref : null;
+}
+
+function Block({
+  label,
+  text,
+  projectPath,
+  blobRef,
+}: {
+  label: string;
+  text: string;
+  projectPath?: string;
+  /** When set, the text is a preview and the full payload is on disk. */
+  blobRef?: string | null;
+}) {
+  const [full, setFull] = useState<string | null>(null);
   return (
     <div>
       <p className="text-[10px] uppercase tracking-wide text-[var(--text-tertiary)]">{label}</p>
       <pre className="mt-0.5 max-h-[280px] overflow-auto whitespace-pre-wrap break-words rounded bg-[var(--bg-raised)] px-2 py-1.5 font-mono text-[11px] text-[var(--text-secondary)]">
-        {text}
+        {full ?? text}
       </pre>
+      {blobRef && projectPath && full === null && (
+        <ShowFull projectPath={projectPath} blobRef={blobRef} onLoaded={setFull} />
+      )}
     </div>
   );
 }
@@ -294,12 +492,6 @@ function Checkpoint({ entry }: { entry: TimelineEntry }) {
           : "border-[var(--border-default)] bg-[var(--bg-raised)]",
       )}
     >
-      {orphaned ? (
-        <Unlink size={13} className="shrink-0 text-[var(--text-tertiary)]" />
-      ) : (
-        <GitCommitHorizontal size={13} className="shrink-0 text-[var(--text-tertiary)]" />
-      )}
-
       <span className="shrink-0 font-mono text-[11px] text-[var(--text-tertiary)]">
         {entry.commitSha?.slice(0, 7)}
       </span>
@@ -314,6 +506,12 @@ function Checkpoint({ entry }: { entry: TimelineEntry }) {
         )}
       </span>
 
+      {entry.branch && (
+        <span className="hidden shrink-0 font-mono text-[10px] text-[var(--text-tertiary)] md:block">
+          {entry.branch}
+        </span>
+      )}
+
       {(entry.insertions > 0 || entry.deletions > 0) && (
         <span className="shrink-0 font-mono text-[11px]">
           <span className="text-[var(--status-success)]">+{entry.insertions}</span>
@@ -325,31 +523,106 @@ function Checkpoint({ entry }: { entry: TimelineEntry }) {
   );
 }
 
-/** Message text, with the truncation stated rather than hidden. */
-function Body({ entry, className }: { entry: TimelineEntry; className?: string }) {
+/** Message text, with the truncation stated rather than hidden — and the rest
+ *  fetchable, now that the store hands out the blob key. */
+function Body({
+  entry,
+  projectPath,
+  className,
+}: {
+  entry: TimelineEntry;
+  projectPath: string;
+  className?: string;
+}) {
+  const [full, setFull] = useState<string | null>(null);
+  const truncated = entry.truncated && full === null;
   return (
     <div className={cn("whitespace-pre-wrap break-words", className)}>
-      {entry.text}
-      {entry.truncated && (
+      {full ?? entry.text}
+      {truncated && (
         <span className="ml-1 text-[11px] text-[var(--text-tertiary)]">
           … {compact(entry.bodyBytes)} bytes not shown
         </span>
+      )}
+      {truncated && entry.bodyRef && (
+        <ShowFull projectPath={projectPath} blobRef={entry.bodyRef} onLoaded={setFull} />
       )}
     </div>
   );
 }
 
-/** Jump-to and filters. */
+/**
+ * Fetch a spilled payload on demand.
+ *
+ * The failure copy matters: a pruned blob store is a real state (the Session
+ * still renders from previews) and "could not load" must not read as a crash.
+ */
+function ShowFull({
+  projectPath,
+  blobRef,
+  onLoaded,
+}: {
+  projectPath: string;
+  blobRef: string;
+  onLoaded: (text: string) => void;
+}) {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const fetchFull = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      const payload = await invoke<ArtifactPayload>("artifacts_payload", {
+        projectPath,
+        blobRef,
+      });
+      if (payload.text !== null) onLoaded(payload.text);
+      else setError("The full payload is binary and cannot be shown.");
+    } catch {
+      setError("The full payload is no longer on disk.");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  if (error) {
+    return <span className="ml-1.5 text-[11px] text-[var(--text-tertiary)]">{error}</span>;
+  }
+  return (
+    <button
+      type="button"
+      disabled={busy}
+      onClick={() => void fetchFull()}
+      className="ml-1.5 inline-flex items-center gap-1 rounded text-[11px] text-[var(--text-secondary)] underline underline-offset-2 transition-colors duration-150 hover:text-[var(--text-primary)] focus-visible:ring-1 focus-visible:ring-[var(--border-focus)] active:scale-[0.98] disabled:opacity-60"
+    >
+      {busy && <Loader2 size={10} className="animate-spin" />}
+      Show full
+    </button>
+  );
+}
+
+/** Jump-to, filters, and view options. */
 function Rail({
   detail,
   filters,
   onFiltersChange,
+  failedCount,
+  failedOnly,
+  onFailedOnlyChange,
+  expandAllTools,
+  onExpandAllToolsChange,
   checkpoints,
   onJump,
 }: {
   detail: Detail;
   filters: TimelineFilters;
   onFiltersChange: (next: TimelineFilters) => void;
+  failedCount: number;
+  failedOnly: boolean;
+  onFailedOnlyChange: (value: boolean) => void;
+  expandAllTools: boolean;
+  onExpandAllToolsChange: (value: boolean) => void;
   checkpoints: TimelineEntry[];
   onJump: (id: string) => void;
 }) {
@@ -369,7 +642,7 @@ function Rail({
                 <button
                   type="button"
                   onClick={() => onJump(checkpoint.id)}
-                  className="flex w-full items-baseline gap-2 rounded px-1.5 py-1 text-left hover:bg-[var(--bg-hover)]"
+                  className="flex w-full items-baseline gap-2 rounded px-1.5 py-1 text-left transition-colors duration-150 hover:bg-[var(--bg-hover)] focus-visible:ring-1 focus-visible:ring-[var(--border-focus)] active:bg-[var(--bg-active)]"
                 >
                   <span className="shrink-0 font-mono text-[10px] text-[var(--text-tertiary)]">
                     {checkpoint.commitSha?.slice(0, 7)}
@@ -417,6 +690,27 @@ function Rail({
           onChange={set("toolCalls")}
         />
 
+        {/* Failed is a facet of tool calls, in the error tone because it is the
+         *  one row here that reports a problem rather than a kind. */}
+        {failedCount > 0 && (
+          <label
+            className={cn(
+              "ml-6 flex cursor-pointer items-center gap-2 rounded px-1.5 py-1 transition-colors duration-150 hover:bg-[var(--bg-hover)]",
+              !filters.toolCalls && "opacity-45",
+            )}
+          >
+            <input
+              type="checkbox"
+              checked={failedOnly}
+              disabled={!filters.toolCalls}
+              onChange={(e) => onFailedOnlyChange(e.target.checked)}
+              className="size-3 accent-[var(--status-error)]"
+            />
+            <span className="flex-1 text-[12px] text-[var(--status-error)]">Failed</span>
+            <span className="text-[11px] text-[var(--status-error)]">{failedCount}</span>
+          </label>
+        )}
+
         {/* Per-tool totals, indented under the toggle they belong to. Read-only:
          *  filtering to a single tool is a narrower question than this surface
          *  is for, and a row of eleven checkboxes would bury the five above. */}
@@ -433,6 +727,21 @@ function Rail({
             ))}
           </ul>
         )}
+      </section>
+
+      <section className="mt-5">
+        <h3 className="pb-1.5 text-[11px] font-medium text-[var(--text-primary)]">View</h3>
+        <label className="flex cursor-pointer items-center gap-2 rounded px-1.5 py-1 transition-colors duration-150 hover:bg-[var(--bg-hover)]">
+          <input
+            type="checkbox"
+            checked={expandAllTools}
+            onChange={(e) => onExpandAllToolsChange(e.target.checked)}
+            className="size-3 accent-[var(--accent-primary)]"
+          />
+          <span className="flex-1 text-[12px] text-[var(--text-secondary)]">
+            Expand all tool calls
+          </span>
+        </label>
       </section>
     </aside>
   );
@@ -452,7 +761,7 @@ function Toggle({
   return (
     <label
       className={cn(
-        "flex cursor-pointer items-center gap-2 rounded px-1.5 py-1 hover:bg-[var(--bg-hover)]",
+        "flex cursor-pointer items-center gap-2 rounded px-1.5 py-1 transition-colors duration-150 hover:bg-[var(--bg-hover)]",
         count === 0 && "opacity-45",
       )}
     >
@@ -468,7 +777,7 @@ function Toggle({
   );
 }
 
-function passes(entry: TimelineEntry, filters: TimelineFilters): boolean {
+function passes(entry: TimelineEntry, filters: TimelineFilters, failedOnly: boolean): boolean {
   switch (entry.kind) {
     case "prompt":
       return filters.prompts;
@@ -477,7 +786,7 @@ function passes(entry: TimelineEntry, filters: TimelineFilters): boolean {
     case "thinking":
       return filters.thinking;
     case "tool_call":
-      return filters.toolCalls;
+      return filters.toolCalls && (!failedOnly || entry.toolStatus === "failed");
     case "checkpoint":
       return filters.checkpoints;
   }

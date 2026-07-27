@@ -48,13 +48,18 @@ export interface TimelineEntry {
   /** `text` is the 2 KB preview; the body was too large to send. */
   truncated: boolean;
   bodyBytes: number;
+  /** Blob key of the spilled full body — fetch via `artifacts_payload`. */
+  bodyRef: string | null;
 
   toolName: string | null;
   toolTitle: string | null;
   toolStatus: ToolStatus | null;
   paths: string[];
   arguments: string | null;
+  argumentsRef: string | null;
   result: string | null;
+  /** Blob key of the spilled full result — fetch via `artifacts_payload`. */
+  resultRef: string | null;
   resultBinary: boolean;
 
   commitSha: string | null;
@@ -84,6 +89,14 @@ export interface SessionDetail {
   entries: TimelineEntry[];
   counts: EntryCounts;
   tools: ToolTally[];
+}
+
+/** One spilled payload, fetched on demand — mirrors `ArtifactPayload`. */
+export interface ArtifactPayload {
+  /** The payload as text, or `null` when it is not valid UTF-8. */
+  text: string | null;
+  binary: boolean;
+  bytes: number;
 }
 
 /** Which entry kinds the timeline is currently showing. */

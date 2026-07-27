@@ -4,6 +4,7 @@ import { Layers, TriangleAlert } from "lucide-react";
 
 import { useLayoutStore } from "@/features/layout/stores/layout-store";
 import { useProjectStore } from "@/features/project/stores/project-store";
+import { activeWorkspaceId } from "@/features/workspaces/lib/active-workspace";
 import { cn } from "@/lib/utils";
 
 import type { Binding, CaptureHealth } from "../types";
@@ -45,18 +46,33 @@ export function CaptureControl() {
         // A Workspace whose store cannot be opened reports that through the
         // health signal below, not by breaking this row.
         .catch(() => !cancelled && setBinding(null));
-      void invoke<CaptureHealth>("capture_health", { projectPath })
+      // The watcher registry is keyed by the workspace UUID the frontend
+      // started it under — without it, liveness looks a path up in a UUID map
+      // and reports a dead watcher forever.
+      void invoke<CaptureHealth>("capture_health", {
+        projectPath,
+        workspaceId: activeWorkspaceId(),
+      })
         .then((result) => !cancelled && setHealth(result))
         .catch(() => !cancelled && setHealth(null));
     };
     read();
     // Capture state changes from inside the Artifacts tab, from the git watcher
     // and from the drain — none of which this row hears about. A slow poll is
-    // the honest cost of not inventing an event channel for one status line.
-    const timer = setInterval(read, 15_000);
+    // the honest cost of not inventing an event channel for one status line —
+    // paused while the window is hidden, because each poll opens a fresh
+    // read-only store connection.
+    const timer = setInterval(() => {
+      if (document.visibilityState === "visible") read();
+    }, 15_000);
+    const onVisibility = () => {
+      if (document.visibilityState === "visible") read();
+    };
+    document.addEventListener("visibilitychange", onVisibility);
     return () => {
       cancelled = true;
       clearInterval(timer);
+      document.removeEventListener("visibilitychange", onVisibility);
     };
   }, [projectPath]);
 
@@ -79,21 +95,36 @@ export function CaptureControl() {
             data: {},
           })
         }
-        className="flex w-full items-center gap-2 rounded px-2 py-1 text-left text-[12px] text-[var(--text-secondary)] outline-none hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
+        className="flex w-full items-center gap-2 rounded px-2 py-1 text-left text-[12px] text-[var(--text-secondary)] outline-none transition-colors duration-150 hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)] focus-visible:ring-1 focus-visible:ring-[var(--border-focus)] active:bg-[var(--bg-active)]"
         title={health?.summary ?? "Sessions captured in this Workspace"}
       >
         <Layers size={13} className="shrink-0" />
         <span className="truncate">Artifacts</span>
         <span className="ml-auto flex items-center gap-1.5">
+          {/* Stopped and degraded are different words, not different triangle
+           *  colours — "you are losing data now" and "something to review at
+           *  leisure" must be tellable apart without opening anything. */}
           {attention ? (
-            <TriangleAlert
-              size={11}
-              className={
-                health?.state === "stopped"
-                  ? "text-[var(--status-error)]"
-                  : "text-[var(--status-warning)]"
-              }
-            />
+            <>
+              <span
+                className={cn(
+                  "text-[10px]",
+                  health?.state === "stopped"
+                    ? "text-[var(--status-error)]"
+                    : "text-[var(--status-warning)]",
+                )}
+              >
+                {health?.state === "stopped" ? "stopped" : "review"}
+              </span>
+              <TriangleAlert
+                size={11}
+                className={
+                  health?.state === "stopped"
+                    ? "text-[var(--status-error)]"
+                    : "text-[var(--status-warning)]"
+                }
+              />
+            </>
           ) : null}
           {/* A dot rather than a word: the row already says what it is, and
            *  "Capturing · Local" in a 244px sidebar is mostly truncation. */}

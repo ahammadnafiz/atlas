@@ -1068,6 +1068,44 @@ pub async fn artifacts_session(
     .map_err(|e| e.to_string())?
 }
 
+/// One spilled payload — a message body, a tool call's arguments or its
+/// result — fetched on demand by "Show full" in the timeline.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ArtifactPayload {
+    /// The payload as text, or `None` when it is not valid UTF-8.
+    pub text: Option<String>,
+    /// The payload was binary and `text` is absent.
+    pub binary: bool,
+    /// Size on disk, so the viewer can say what it is about to render.
+    pub bytes: usize,
+}
+
+/// Fetch a spilled blob by its content key.
+///
+/// The timeline inlines bodies up to 64 KB and sends a preview plus a blob ref
+/// for anything larger. This is the other half of that trade: the full payload,
+/// fetched only when a developer actually asks for it, over its own reader
+/// connection so it never waits behind the writer.
+#[tauri::command]
+pub async fn artifacts_payload(
+    project_path: String,
+    blob_ref: String,
+) -> Result<ArtifactPayload, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let store = open_reader(&project_path)?
+            .ok_or("this Workspace has no session store")?;
+        let bytes = store.blobs().get(&blob_ref).map_err(|e| e.to_string())?;
+        let len = bytes.len();
+        Ok(match String::from_utf8(bytes) {
+            Ok(text) => ArtifactPayload { text: Some(text), binary: false, bytes: len },
+            Err(_) => ArtifactPayload { text: None, binary: true, bytes: len },
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 /// Is this Slug free within the Organisation?
 ///
 /// Debounced by the caller so the answer arrives while the developer is still

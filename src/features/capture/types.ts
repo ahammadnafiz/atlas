@@ -33,6 +33,12 @@ export interface CaptureHealth {
 
 export type WorkspaceMode = "local" | "cloud";
 
+/**
+ * `ok`, or `not_authorized` once the server rejected this identity. Terminal
+ * until re-registration — mirrors `atlas_checkpoint::model::DrainGate`.
+ */
+export type DrainGate = "ok" | "not_authorized";
+
 export interface Binding {
   workspaceId: string;
   root: string;
@@ -43,6 +49,14 @@ export interface Binding {
   fingerprintIsShallow: boolean;
   gitUrl: string | null;
   enabled: boolean;
+  /**
+   * Has the developer approved the bulk transcript import? Always true for
+   * Local; for Cloud only the disclosure confirmation sets it.
+   */
+  importApproved: boolean;
+  drainState: DrainGate;
+  /** Server-assigned Workspace id; `null` until registered. */
+  remoteWorkspaceId: string | null;
   createdAt: string;
 }
 
@@ -55,3 +69,46 @@ export interface Detection {
   gitUrl: string | null;
   suggestedSlug: string;
 }
+
+/**
+ * What a bulk transcript import would disclose — mirrors
+ * `atlas_checkpoint::ImportPreview`.
+ */
+export interface ImportPreview {
+  /** Every transcript on disk, including ones an import would skip. */
+  sessionCount: number;
+  /** How many an import would actually take. Lead with this number. */
+  newSessionCount: number;
+  earliest: string | null;
+  latest: string | null;
+  totalBytes: number;
+  isBulkDisclosure: boolean;
+}
+
+/** A Workspace as the Organisation knows it — mirrors `RemoteWorkspace`. */
+export interface RemoteWorkspace {
+  id: string;
+  slug: string;
+  rootCommitSha: string | null;
+  gitUrl: string | null;
+}
+
+/** What Connect offers — mirrors `commands::capture::ConnectOptions`. */
+export interface ConnectOptions {
+  workspaces: RemoteWorkspace[];
+  /** `null` when nothing matched, or when several did. */
+  preselected: string | null;
+  /** Shown, never blocking. */
+  warning: string | null;
+}
+
+/** What a promotion is about to publish — mirrors `PromotionPreview`. */
+export interface PromotionPreview {
+  sessionCount: number;
+  earliest: string | null;
+  latest: string | null;
+  secretsRedacted: number;
+}
+
+/** The `capture_slug_available` answer. `unknown` means the network blinked. */
+export type SlugAvailability = "available" | "taken" | "unknown";

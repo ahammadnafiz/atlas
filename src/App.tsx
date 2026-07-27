@@ -963,6 +963,12 @@ export function App() {
       projectPath: currentProject.path,
       workspaceId,
     }).catch((e) => console.warn("git watch start failed:", e));
+    // Capture: a bound Workspace just became active — open its store (which
+    // also heals a folder rename) and kick its transcript import and drain.
+    // A no-op for Workspaces that never enabled capture.
+    void invoke("capture_activate", { projectPath: currentProject.path }).catch((e) =>
+      console.warn("capture activate failed:", e),
+    );
     // Clear the global recents mirror SYNCHRONOUSLY before the async reload so
     // there's no window where it still shows the previous project's files
     // (the picker also filters by project as a belt-and-suspenders guard).
