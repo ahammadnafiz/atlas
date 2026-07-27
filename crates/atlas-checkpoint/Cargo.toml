@@ -21,6 +21,15 @@ chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4"] }
 sha2 = "0.10"
 tracing = "0.1"
+# The drain is the only networked part of this crate. `blocking` because it runs
+# on the capture worker's own thread, and rustls rather than native-tls for the
+# same reason the app does: the macOS Security.framework path fails silently in
+# sandboxed release builds.
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "blocking",
+    "rustls-tls",
+] }
 
 [dev-dependencies]
 tempfile = "3"

@@ -485,6 +485,7 @@ version = "0.1.0"
 dependencies = [
  "atlas-redact",
  "chrono",
+ "reqwest 0.12.28",
  "rusqlite",
  "serde",
  "serde_json",
@@ -6302,6 +6303,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "encoding_rs",
+ "futures-channel",
  "futures-core",
  "futures-util",
  "h2",

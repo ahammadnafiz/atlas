@@ -183,6 +183,17 @@ pub fn run() {
                     .unwrap_or_else(|_| std::path::PathBuf::from("."));
                 app.manage(commands::auth::AuthState::new(config_dir));
                 commands::auth::restore_on_launch(&app.handle());
+
+                // Session capture's drain needs a credential, and the auth core
+                // only exists from here on. Installed rather than passed in at
+                // construction because `CaptureState` is registered earlier in
+                // the builder chain; until this runs the drain simply parks,
+                // which is exactly Local-mode behaviour.
+                let core = app.state::<commands::auth::AuthState>().core();
+                app.state::<commands::capture::CaptureState>()
+                    .install_token_provider(Box::new(move || {
+                        tauri::async_runtime::block_on(core.mint_access_token()).ok()
+                    }));
             }
 
             commands::updater::init_on_startup(&app.handle());
@@ -363,6 +374,12 @@ pub fn run() {
             commands::capture::capture_health,
             commands::capture::capture_import_preview,
             commands::capture::capture_import_confirm,
+            commands::capture::capture_slug_available,
+            commands::capture::capture_register_cloud,
+            commands::capture::capture_promotion_preview,
+            commands::capture::capture_promote,
+            commands::capture::capture_connect_options,
+            commands::capture::capture_connect,
             commands::git_watcher::git_watch_status,
             commands::mention_search::mention_search,
             commands::mention_search::mention_cache_set_knowledge,

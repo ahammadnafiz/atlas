@@ -816,6 +816,253 @@ impl Store {
         Ok(())
     }
 
+    // ── The outbox ──────────────────────────────────────────────────────────
+
+    /// The next batch of pending rows, in sequence order.
+    ///
+    /// Ordered by `seq` so a Session's own rows arrive in the order they
+    /// happened, and bounded by **both** a count and a byte ceiling — a hundred
+    /// artifacts can be enormous, and a request the server refuses on size would
+    /// otherwise be retried forever.
+    ///
+    /// Rows already marked `failed` are excluded, which is what lets one poison
+    /// row be skipped while everything behind it keeps draining.
+    pub fn pending_artifacts(
+        &self,
+        workspace_id: &str,
+        org_id: &str,
+        max_count: usize,
+        max_bytes: usize,
+    ) -> Result<Vec<crate::artifacts::AtlasArtifact>> {
+        use crate::artifacts::*;
+
+        let mut out: Vec<AtlasArtifact> = Vec::new();
+        let mut bytes = 0usize;
+
+        // Sessions first: a Message referencing a Session the server has not
+        // seen is a dangling reference of a different kind.
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {SESSION_COLUMNS} FROM agent_session
+              WHERE workspace_id = ?1 AND sync_state = 'pending'
+              ORDER BY started_at LIMIT ?2"
+        ))?;
+        let sessions = stmt
+            .query_map(rusqlite::params![workspace_id, max_count as i64], row_to_session)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for session in sessions {
+            let artifact = AtlasArtifact::AgentSession(SessionArtifact {
+                base: ArtifactBase {
+                    row_id: session.id.clone(),
+                    org_id: org_id.to_string(),
+                    workspace_id: workspace_id.to_string(),
+                    seq: 0,
+                    content_hash: blobs::key_for(session.id.as_bytes()),
+                    created_at: session.started_at.to_rfc3339(),
+                },
+                session_id: session.id.clone(),
+                source: session.source.as_str().to_string(),
+                native_session_id: session.native_session_id.clone(),
+                title: session.title.clone(),
+                agent: session.agent.clone(),
+                model: session.model.clone(),
+                token_totals: serde_json::to_value(session.token_totals)
+                    .unwrap_or(serde_json::Value::Null),
+                started_at: session.started_at.to_rfc3339(),
+            });
+            bytes += artifact.approx_bytes();
+            out.push(artifact);
+            if out.len() >= max_count || bytes >= max_bytes {
+                return Ok(out);
+            }
+        }
+
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {MESSAGE_COLUMNS} FROM agent_message
+              WHERE sync_state = 'pending'
+                AND session_id IN (SELECT id FROM agent_session WHERE workspace_id = ?1)
+              ORDER BY seq LIMIT ?2"
+        ))?;
+        let messages = stmt
+            .query_map(rusqlite::params![workspace_id, max_count as i64], row_to_message)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for message in messages {
+            let artifact = AtlasArtifact::AgentMessage(MessageArtifact {
+                base: ArtifactBase {
+                    row_id: message.id.clone(),
+                    org_id: org_id.to_string(),
+                    workspace_id: workspace_id.to_string(),
+                    seq: message.seq,
+                    content_hash: message.content_hash.clone(),
+                    created_at: message.created_at.to_rfc3339(),
+                },
+                session_id: message.session_id.clone(),
+                turn_seq: message.turn_seq,
+                role: message.role.as_str().to_string(),
+                mode: message.mode.as_str().to_string(),
+                preview: message.preview.clone(),
+                body: message.body.clone(),
+                body_ref: message.body_ref.clone(),
+            });
+            bytes += artifact.approx_bytes();
+            out.push(artifact);
+            if out.len() >= max_count || bytes >= max_bytes {
+                return Ok(out);
+            }
+        }
+
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {TOOL_CALL_COLUMNS} FROM tool_call
+              WHERE sync_state = 'pending'
+                AND session_id IN (SELECT id FROM agent_session WHERE workspace_id = ?1)
+              ORDER BY seq LIMIT ?2"
+        ))?;
+        let calls = stmt
+            .query_map(rusqlite::params![workspace_id, max_count as i64], row_to_tool_call)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for call in calls {
+            let artifact = AtlasArtifact::ToolCall(ToolCallArtifact {
+                base: ArtifactBase {
+                    row_id: call.id.clone(),
+                    org_id: org_id.to_string(),
+                    workspace_id: workspace_id.to_string(),
+                    seq: call.seq,
+                    content_hash: blobs::key_for(call.id.as_bytes()),
+                    created_at: call.created_at.to_rfc3339(),
+                },
+                session_id: call.session_id.clone(),
+                turn_seq: call.turn_seq,
+                tool_name: call.tool_name.as_str().to_string(),
+                title: call.title.clone(),
+                kind: call.kind.clone(),
+                status: call.status.as_str().to_string(),
+                locations: call.locations.clone(),
+                arguments: call.arguments.clone(),
+                arguments_ref: call.arguments_ref.clone(),
+                result: call.result.clone(),
+                result_ref: call.result_ref.clone(),
+                result_binary: call.result_binary,
+            });
+            bytes += artifact.approx_bytes();
+            out.push(artifact);
+            if out.len() >= max_count || bytes >= max_bytes {
+                return Ok(out);
+            }
+        }
+
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {CHECKPOINT_COLUMNS} FROM checkpoint
+              WHERE sync_state = 'pending'
+                AND session_id IN (SELECT id FROM agent_session WHERE workspace_id = ?1)
+              ORDER BY created_at LIMIT ?2"
+        ))?;
+        let checkpoints = stmt
+            .query_map(rusqlite::params![workspace_id, max_count as i64], row_to_checkpoint)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for checkpoint in checkpoints {
+            let artifact = AtlasArtifact::Checkpoint(CheckpointArtifact {
+                base: ArtifactBase {
+                    row_id: checkpoint.id.clone(),
+                    org_id: org_id.to_string(),
+                    workspace_id: workspace_id.to_string(),
+                    seq: 0,
+                    // (session, commit) is the Checkpoint's natural key, so the
+                    // dedupe hash is derived from it rather than from content.
+                    content_hash: blobs::key_for(
+                        format!("{}:{}", checkpoint.session_id, checkpoint.commit_sha).as_bytes(),
+                    ),
+                    created_at: checkpoint.created_at.to_rfc3339(),
+                },
+                session_id: checkpoint.session_id.clone(),
+                commit_sha: checkpoint.commit_sha.clone(),
+                patch_id: checkpoint.patch_id.clone(),
+                link_state: checkpoint.link_state.as_str().to_string(),
+                branch: checkpoint.branch.clone(),
+                git_author_name: checkpoint.git_author_name.clone(),
+                git_author_email: checkpoint.git_author_email.clone(),
+                files_touched: checkpoint.files_touched.clone(),
+                insertions: checkpoint.insertions,
+                deletions: checkpoint.deletions,
+            });
+            bytes += artifact.approx_bytes();
+            out.push(artifact);
+            if out.len() >= max_count || bytes >= max_bytes {
+                return Ok(out);
+            }
+        }
+
+        Ok(out)
+    }
+
+    /// Mark a row as durably accepted by the server.
+    ///
+    /// The row id identifies its table by prefix, so one call handles every
+    /// artifact kind without the caller tracking which is which.
+    pub fn mark_sent(&self, row_id: &str) -> Result<()> {
+        self.set_row_sync_state(row_id, SyncState::Sent)
+    }
+
+    /// Mark a row as permanently rejected — skipped, never retried at the head
+    /// of the queue, so one poison row cannot stall everything behind it.
+    pub fn mark_failed(&self, row_id: &str) -> Result<()> {
+        self.set_row_sync_state(row_id, SyncState::Failed)
+    }
+
+    /// Count one more attempt against a row.
+    pub fn record_attempt(&self, row_id: &str) -> Result<()> {
+        self.require_writer()?;
+        let Some(table) = table_for(row_id) else { return Ok(()) };
+        self.conn.execute(
+            &format!("UPDATE {table} SET sync_attempts = sync_attempts + 1 WHERE id = ?1"),
+            [row_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn attempts(&self, row_id: &str) -> Result<i64> {
+        let Some(table) = table_for(row_id) else { return Ok(0) };
+        Ok(self.conn.query_row(
+            &format!("SELECT sync_attempts FROM {table} WHERE id = ?1"),
+            [row_id],
+            |row| row.get(0),
+        )?)
+    }
+
+    fn set_row_sync_state(&self, row_id: &str, state: SyncState) -> Result<()> {
+        self.require_writer()?;
+        let Some(table) = table_for(row_id) else { return Ok(()) };
+        self.conn.execute(
+            &format!("UPDATE {table} SET sync_state = ?2 WHERE id = ?1"),
+            rusqlite::params![row_id, state.as_str()],
+        )?;
+        Ok(())
+    }
+
+    /// Flip every `local` row to `pending`.
+    ///
+    /// Promotion's whole mechanism. There is deliberately **no separate backfill
+    /// path**: the accumulated history joins the same queue as everything else,
+    /// so there is one drain to keep correct rather than two.
+    pub fn promote_local_rows(&self, workspace_id: &str) -> Result<i64> {
+        self.require_writer()?;
+        let mut moved = 0i64;
+        moved += self.conn.execute(
+            "UPDATE agent_session SET sync_state = 'pending'
+              WHERE workspace_id = ?1 AND sync_state = 'local'",
+            [workspace_id],
+        )? as i64;
+        for table in ["agent_message", "tool_call", "checkpoint"] {
+            moved += self.conn.execute(
+                &format!(
+                    "UPDATE {table} SET sync_state = 'pending'
+                      WHERE sync_state = 'local'
+                        AND session_id IN (SELECT id FROM agent_session WHERE workspace_id = ?1)"
+                ),
+                [workspace_id],
+            )? as i64;
+        }
+        Ok(moved)
+    }
+
     // ── Import progress ─────────────────────────────────────────────────────
 
     /// How many bytes of this transcript have already been imported.
@@ -1216,6 +1463,21 @@ fn row_to_file_touch(row: &rusqlite::Row<'_>) -> rusqlite::Result<FileTouch> {
         out_of_repo: row.get::<_, i64>(9)? != 0,
         created_at: parse_time(row.get::<_, String>(10)?),
     })
+}
+
+/// Which table a row id belongs to.
+///
+/// Ids are prefixed at creation (`as-`, `am-`, `tc-`, `cp-`) precisely so the
+/// drain can mark a row without also tracking which kind it was — the server's
+/// per-artifact result carries only the id.
+fn table_for(row_id: &str) -> Option<&'static str> {
+    match row_id.split('-').next()? {
+        "as" => Some("agent_session"),
+        "am" => Some("agent_message"),
+        "tc" => Some("tool_call"),
+        "cp" => Some("checkpoint"),
+        _ => None,
+    }
 }
 
 /// Make `.atlas/` ignore itself.

@@ -50,6 +50,7 @@
 //! what ends up in the store.
 
 pub mod blobs;
+pub mod artifacts;
 pub mod binding;
 pub mod capture;
 pub mod checkpoint;
@@ -61,6 +62,7 @@ mod lock;
 pub mod model;
 mod schema;
 mod store;
+pub mod sync;
 pub mod title;
 pub mod tools;
 
@@ -79,6 +81,10 @@ pub use model::{
 };
 pub use schema::{REQUIRED_INDEXES, SCHEMA_VERSION};
 pub use store::{CheckpointInput, MessageInput, Store};
+pub use sync::{
+    drain, list_workspaces, preselect, register_workspace, DrainOutcome, DrainStatus,
+    MatchReason, Preselection, RemoteWorkspace, SlugAvailability, SyncConfig,
+};
 pub use tools::{canonical_name, ResolvedPath, ToolName};
 
 /// The per-project state directory Atlas already uses, under a Workspace root.
