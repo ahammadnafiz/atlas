@@ -770,6 +770,7 @@ export function ChatPanel({ tabId }: ChatPanelProps) {
               messages={session.messages}
               roleFilter={roleFilter}
               isStreaming={session.status === "running"}
+              agentType={session.agentType}
               onShowJumpChange={onShowJumpChange}
             />
           </Suspense>

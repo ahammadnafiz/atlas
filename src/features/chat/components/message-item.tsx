@@ -1,11 +1,11 @@
-import { useState, memo } from "react";
+import { useState, memo, type ReactNode } from "react";
 import * as Dialog from "@radix-ui/react-dialog";
 import { cn } from "@/lib/utils";
 import type { ChatMessage } from "@/types/agent";
-import { AGENT_LABEL } from "@/types/agent";
 import { isBashToolCall } from "../lib/tool-calls";
 import {
   User,
+  Sparkles,
   CheckCircle2,
   XCircle,
   Loader2,
@@ -25,11 +25,18 @@ import { invoke } from "@tauri-apps/api/core";
 import { toast } from "sonner";
 import { useLayoutStore } from "@/features/layout/stores/layout-store";
 import { useProjectStore } from "@/features/project/stores/project-store";
-import { useChatStore } from "@/features/chat/stores/chat-store";
-import { AgentIcons } from "@/components/agent-icons";
-import { AtlasIcon } from "@/components/atlas-icon";
 import { CachedMarkdown } from "@/lib/markdown-cache";
 import { StreamingMarkdown } from "./streaming-markdown";
+
+/** Avatar glyphs that never vary per message, hoisted to module scope so a
+ *  thread of N rows allocates ZERO extra elements for them. The agent-side
+ *  glyph is supplied by the parent (see `agentAvatar`); this generic mark is
+ *  only the fallback for surfaces with no agent identity (memory chat, BYOK
+ *  model chat), which is also what they rendered before the agent-icon work. */
+const USER_AVATAR = <User size={14} className="text-[var(--accent-primary)]" />;
+const GENERIC_AGENT_AVATAR = (
+  <Sparkles size={14} className="text-[var(--text-secondary)]" />
+);
 
 import {
   getFilePathFromInput,
@@ -84,6 +91,8 @@ export const MessageItem = memo(function MessageItem({
   model,
   timeGapAbove,
   tabId,
+  agentAvatar,
+  agentLabel,
 }: {
   message: ChatMessage;
   streaming?: boolean;
@@ -113,14 +122,15 @@ export const MessageItem = memo(function MessageItem({
    * fixes the "orange line" inter-block gaps the user flagged.
    */
   isLastInGroup?: boolean;
+  /** Pre-built agent avatar glyph, hoisted to MessagesList so the session's
+   *  agent identity is resolved ONCE per thread instead of per row. Both this
+   *  and `agentLabel` are referentially stable across renders (memoized on
+   *  agentType upstream), so they never defeat this component's memo. */
+  agentAvatar?: ReactNode;
+  agentLabel?: string;
 }) {
   const isUser = message.role === "user";
   const isAssistant = message.role === "assistant";
-  const agentType = useChatStore((s) =>
-    tabId ? (s.sessions[tabId]?.agentType ?? "claude-code") : "claude-code",
-  );
-  const agentLabel =
-    AGENT_LABEL[agentType === "codex" ? "codex" : agentType === "cersei" ? "cersei" : "claude-code"];
 
   // Only user messages carry the @-mention "Atlas context" suffix.
   // `getAtlasSplit` reads from precomputed fields when present (set by
@@ -171,16 +181,15 @@ export const MessageItem = memo(function MessageItem({
             <div className="w-px h-full bg-[var(--border-subtle)]" />
           </div>
         ) : (
-          <div className="w-8 flex items-start justify-center shrink-0">
-            {isUser ? (
-              <User size={20} className="text-[var(--accent-primary)]" />
-            ) : agentType === "codex" ? (
-              <AgentIcons.Codex className="size-5" />
-            ) : agentType === "cersei" ? (
-              <AtlasIcon size={20} />
-            ) : (
-              <AgentIcons.Claude className="size-5" />
+          <div
+            className={cn(
+              "w-8 h-8 rounded-full flex items-center justify-center shrink-0 mt-0.5",
+              isUser
+                ? "bg-[var(--accent-primary-muted)]"
+                : "bg-[var(--bg-elevated)] border border-[var(--border-default)]",
             )}
+          >
+            {isUser ? USER_AVATAR : (agentAvatar ?? GENERIC_AGENT_AVATAR)}
           </div>
         )}
 
@@ -200,7 +209,7 @@ export const MessageItem = memo(function MessageItem({
             {!compact && (
               <div className="flex items-center gap-2">
                 <span className="text-[11px] font-semibold text-[var(--text-secondary)] uppercase tracking-wide">
-                  {isUser ? "You" : isAssistant ? agentLabel : message.role}
+                  {isUser ? "You" : isAssistant ? (agentLabel ?? "Assistant") : message.role}
                 </span>
                 <span className="text-[10px] text-[var(--text-tertiary)] font-mono">
                   {new Date(message.timestamp).toLocaleTimeString([], {

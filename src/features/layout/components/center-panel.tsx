@@ -104,6 +104,20 @@ const PERSISTENT_TYPES: ReadonlySet<TabType> = new Set([
   "settings",
 ]);
 
+// Of the persistent types, these are the ones that keep BURNING CPU/GPU while
+// hidden — a PTY draining output, a live web embed, a Pixi/WebGL graph ticking,
+// a PDF worker. Those get unmounted for background workspaces (idle heat is the
+// bigger cost than their rebuild). The rest are inert-but-expensive-to-rebuild
+// (chat's virtualizer + transcript load, knowledge's tree walk, settings' form
+// drafts) and stay mounted everywhere: hiding them saves nothing per frame and
+// costs a full remount on switch-back.
+const IDLE_EXPENSIVE_TYPES: ReadonlySet<TabType> = new Set([
+  "terminal",
+  "browser",
+  "knowledge-graph",
+  "pdf",
+]);
+
 /**
  * The center panel is one or more side-by-side **split columns**
  * (`layout-store.groupOrder`, max 3, resizable). Each column hosts an
@@ -151,11 +165,12 @@ export function CenterPanel() {
   if (!currentProject) return <WelcomeScreen />;
 
   // Render every mounted workspace's shell in a stable container (key=ws.id),
-  // but only the ACTIVE workspace keeps heavyweight tab contents mounted. The
-  // old "display:none but still mounted" model left terminals, browser embeds,
-  // Pixi graphs, PDFs, and chat virtualizers alive across background
-  // workspaces, which could keep CPU/GPU busy even when those workspaces were
-  // completely hidden.
+  // only the active one visible. Background workspaces keep the INERT expensive
+  // subtrees mounted (editor/chat/knowledge/settings) so switching back is
+  // instant, but drop the ones that keep working while hidden — terminals,
+  // browser embeds, Pixi graphs, PDFs — which were burning CPU/GPU in
+  // workspaces the user couldn't even see. A workspace with no view yet (never
+  // visited this session) renders nothing until its first cold load.
   return (
     <div className="h-full w-full bg-bg-surface relative">
       {workspaces.map((ws) => {
@@ -466,13 +481,18 @@ const TabContentContainer = memo(function TabContentContainer({
     return <div ref={ref} style={{ flex: "1 1 0%", minHeight: 0, overflow: "hidden" }} />;
   }
 
-  // Keep expensive tabs mounted only for the ACTIVE workspace. Persisting them
-  // across tab switches is still valuable, but persisting them across hidden
-  // workspaces lets off-screen terminals/browser embeds/graphs keep running and
-  // is a major source of idle heat.
-  const persistentTabs = isActive
-    ? tabs.filter((t) => PERSISTENT_TYPES.has(t.type))
-    : [];
+  // Persist expensive tabs across tab switches within this column. For a
+  // BACKGROUND workspace we additionally drop the types that keep working while
+  // hidden (see IDLE_EXPENSIVE_TYPES) — off-screen terminals/browser embeds/
+  // graphs were a major source of idle heat. Chat/knowledge/settings stay
+  // mounted even in background workspaces: they cost nothing per frame when
+  // hidden, and unmounting chat threw away the virtualizer's live state and
+  // re-ran the transcript-load path on every switch back.
+  const persistentTabs = tabs.filter(
+    (t) =>
+      PERSISTENT_TYPES.has(t.type) &&
+      (isActive || !IDLE_EXPENSIVE_TYPES.has(t.type)),
+  );
   const activeIsNonPersistent = !persistentTabs.find((t) => t.id === activeTab.id);
 
   return (
