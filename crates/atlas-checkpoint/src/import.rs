@@ -562,6 +562,7 @@ fn is_envelope(turn: &ImportedTurn) -> bool {
         "<bash-stdout>",
         "<bash-stderr>",
         "<system-reminder>",
+        "<task-notification>",
         "[Request interrupted",
     ];
     ENVELOPE_PREFIXES.iter().any(|prefix| body.starts_with(prefix))

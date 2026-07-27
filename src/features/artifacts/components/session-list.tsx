@@ -1,5 +1,5 @@
 import { useMemo, useState } from "react";
-import { GitBranch, Search, TriangleAlert } from "lucide-react";
+import { ChevronDown, ChevronRight, GitBranch, Search, TriangleAlert } from "lucide-react";
 
 import { cn } from "@/lib/utils";
 
@@ -27,6 +27,15 @@ interface Props {
 export function SessionList({ sessions, loading, onOpen }: Props) {
   const [query, setQuery] = useState("");
   const [branch, setBranch] = useState<string>("");
+  const [expanded, setExpanded] = useState<Set<string>>(new Set());
+
+  const toggleCluster = (key: string) =>
+    setExpanded((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
 
   const branches = useMemo(() => {
     const all = new Set<string>();
@@ -105,15 +114,117 @@ export function SessionList({ sessions, loading, onOpen }: Props) {
                 </span>
               </header>
               <ul>
-                {rows.map((session) => (
-                  <SessionRow key={session.id} session={session} onOpen={onOpen} />
-                ))}
+                {clusterRows(rows).map((item) =>
+                  item.kind === "single" ? (
+                    <SessionRow key={item.session.id} session={item.session} onOpen={onOpen} />
+                  ) : (
+                    <ClusterRow
+                      key={`${day}:${item.title}`}
+                      item={item}
+                      expanded={expanded.has(`${day}:${item.title}`)}
+                      onToggle={() => toggleCluster(`${day}:${item.title}`)}
+                      onOpen={onOpen}
+                    />
+                  ),
+                )}
               </ul>
             </section>
           ))
         )}
       </div>
     </div>
+  );
+}
+
+/** A day's rows, with runs of identical automated imports folded together. */
+type ListItem =
+  | { kind: "single"; session: SessionSummary }
+  | { kind: "cluster"; title: string; sessions: SessionSummary[] };
+
+/**
+ * Fold imported sessions that share an identical title into one row.
+ *
+ * Hook-driven automation — a security-review run per edit batch, a scheduled
+ * job — produces dozens of transcripts a day with the same first prompt, and a
+ * list where forty rows say the same thing drowns the four the developer
+ * actually ran. Three is the threshold: two identical titles is coincidence, a
+ * run of them is a machine. Only imported sessions fold — live captures are
+ * something the developer did here, however repetitive.
+ */
+function clusterRows(rows: SessionSummary[]): ListItem[] {
+  const byTitle = new Map<string, number>();
+  for (const session of rows) {
+    if (session.source === "external_jsonl" && session.title) {
+      byTitle.set(session.title, (byTitle.get(session.title) ?? 0) + 1);
+    }
+  }
+
+  const items: ListItem[] = [];
+  const folded = new Map<string, SessionSummary[]>();
+  for (const session of rows) {
+    const foldable =
+      session.source === "external_jsonl" &&
+      session.title !== null &&
+      (byTitle.get(session.title) ?? 0) >= 3;
+    if (!foldable) {
+      items.push({ kind: "single", session });
+      continue;
+    }
+    const bucket = folded.get(session.title!);
+    if (bucket) {
+      bucket.push(session);
+    } else {
+      const sessions: SessionSummary[] = [session];
+      folded.set(session.title!, sessions);
+      // Placed where its first member sat, so folding never reorders the day.
+      items.push({ kind: "cluster", title: session.title!, sessions });
+    }
+  }
+  return items;
+}
+
+function ClusterRow({
+  item,
+  expanded,
+  onToggle,
+  onOpen,
+}: {
+  item: Extract<ListItem, { kind: "cluster" }>;
+  expanded: boolean;
+  onToggle: () => void;
+  onOpen: (id: string) => void;
+}) {
+  return (
+    <li>
+      <button
+        type="button"
+        onClick={onToggle}
+        aria-expanded={expanded}
+        className="group flex w-full items-center gap-2 rounded px-2 py-2 text-left transition-colors duration-150 hover:bg-[var(--bg-hover)] focus-visible:ring-1 focus-visible:ring-[var(--border-focus)] active:bg-[var(--bg-active)]"
+      >
+        {expanded ? (
+          <ChevronDown size={12} className="shrink-0 text-[var(--text-tertiary)]" />
+        ) : (
+          <ChevronRight size={12} className="shrink-0 text-[var(--text-tertiary)]" />
+        )}
+        <span className="min-w-0 flex-1 truncate text-[13px] text-[var(--text-secondary)]">
+          {item.title}
+        </span>
+        <span className="shrink-0 rounded bg-[var(--bg-selected)] px-1.5 py-0.5 text-[10px] tabular-nums text-[var(--text-tertiary)]">
+          ×{item.sessions.length}
+        </span>
+        <span className="hidden shrink-0 text-[10px] text-[var(--text-muted)] sm:block">
+          automated runs
+        </span>
+      </button>
+      {expanded && (
+        <ul className="ml-5 border-l border-[var(--border-subtle)] pl-1">
+          {item.sessions.map((session) => (
+            <SessionRow key={session.id} session={session} onOpen={onOpen} />
+          ))}
+        </ul>
+      )}
+    </li>
   );
 }
 
