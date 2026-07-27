@@ -16,6 +16,11 @@
   --bg-hover: rgba(255, 255, 255, 0.04);
   --bg-selected: rgba(255, 255, 255, 0.06);
   --bg-active: rgba(255, 255, 255, 0.08);
+  /* Text-selection highlight (::selection). Kept separate from --bg-selected
+     (list/row "selected" UI state) even though both started at 6% white —
+     they're unrelated concepts that happened to share a value, and text
+     selection needs more contrast to stay legible on near-black surfaces. */
+  --selection-bg: rgba(255, 255, 255, 0.18);
 
   /* Knowledge / editor surfaces from the Claude Design handoff
      (atlas-knowledge.jsx). Distinct from --bg-base so we get the
