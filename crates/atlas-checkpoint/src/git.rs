@@ -518,6 +518,26 @@ pub fn blob_at(repo: &Path, sha: &str, path: &str) -> Option<Vec<u8>> {
     output.status.success().then_some(output.stdout)
 }
 
+/// Whether `HEAD` already tracks this workspace-relative path.
+///
+/// The fallback answer for `existed_before` when the write-sampling probe
+/// cannot run before the agent's write. A filesystem `exists()` is only
+/// truthful when asked *before* the write — afterwards a file the agent just
+/// created answers `true`, which is why the sampler records the strict arm
+/// rather than re-probing. Git's index does not have that problem: a file the
+/// agent created this turn is untracked in `HEAD` whenever we ask, and a file
+/// that predates the turn is tracked whenever we ask. Order-independent, so a
+/// late-locations agent gets the same answer an early-locations one does.
+///
+/// Deliberately `HEAD` and not the worktree: an untracked file the agent did
+/// not create still takes the strict arm, which is the conservative direction
+/// and costs nothing — such a path is new in whatever commit first carries it,
+/// so the strict arm is where the link rule would send it anyway.
+pub fn tracked_in_head(repo: &Path, path: &str) -> bool {
+    run_status(repo, &["cat-file", "-e", &format!("HEAD:{path}")])
+        .is_ok_and(|status| status.success)
+}
+
 /// The content of a path as it would appear in the **worktree** — the committed
 /// blob with git's content filters (CRLF conversion, `text=auto`) applied on
 /// the way out.
@@ -970,6 +990,54 @@ mod tests {
             blob_at_filtered(repo.path(), &sha, "notes.txt").as_deref(),
             Some(b"one\r\ntwo\r\n".as_slice())
         );
+    }
+
+    #[test]
+    fn head_tracking_answers_the_same_before_and_after_a_write() {
+        // The whole point of preferring git over a filesystem probe: the
+        // sampler often only learns a path *after* the agent wrote it, and
+        // `exists()` cannot tell "edited what was here" from "created this".
+        let repo = TestRepo::new();
+        repo.write("README.md", "one\n");
+        repo.commit_all("initial");
+
+        assert!(tracked_in_head(repo.path(), "README.md"));
+        repo.write("README.md", "one\ntwo\n");
+        assert!(
+            tracked_in_head(repo.path(), "README.md"),
+            "a pre-existing file stays tracked after the agent edits it"
+        );
+
+        // A file the agent creates this turn is untracked whenever we ask, so
+        // it keeps taking the strict arm.
+        repo.write("brand_new.rs", "fn main() {}\n");
+        assert!(!tracked_in_head(repo.path(), "brand_new.rs"));
+        repo.git(&["add", "brand_new.rs"]);
+        assert!(
+            !tracked_in_head(repo.path(), "brand_new.rs"),
+            "staging is not committing — HEAD still does not carry it"
+        );
+    }
+
+    #[test]
+    fn head_tracking_is_false_rather_than_fatal_outside_a_repository() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!tracked_in_head(dir.path(), "README.md"));
+
+        // An unborn branch has no HEAD to resolve, and must not panic.
+        let repo = TestRepo::new();
+        repo.write("README.md", "one\n");
+        assert!(!tracked_in_head(repo.path(), "README.md"));
+    }
+
+    #[test]
+    fn head_tracking_does_not_confuse_a_directory_for_a_file() {
+        let repo = TestRepo::new();
+        repo.write("src/main.rs", "fn main() {}\n");
+        repo.commit_all("initial");
+
+        assert!(tracked_in_head(repo.path(), "src/main.rs"));
+        assert!(!tracked_in_head(repo.path(), "src/other.rs"));
     }
 
     #[test]

@@ -201,6 +201,66 @@ fn committing_a_file_the_agent_created_unchanged_produces_a_checkpoint() {
 }
 
 #[test]
+fn a_human_tweak_to_agent_output_still_produces_a_checkpoint() {
+    // The workflow the asymmetric rule exists for: the agent edits a file that
+    // was already there, the developer adjusts a word while reviewing, and only
+    // then commits. Everything downstream depends on `existed_before` being
+    // *true* for a pre-existing file — record it as false and this Checkpoint
+    // silently never forms, which is precisely what a filesystem probe asked
+    // after the write used to do.
+    let fixture = Fixture::new();
+    fixture.write("README.md", "intro\n");
+    fixture.commit_all("initial");
+
+    let mut store = fixture.store();
+    fixture.walk(&store);
+
+    fixture.write("README.md", "intro\nagent sentence\n");
+    let session =
+        session_wrote(&fixture, &mut store, "s1", "README.md", "intro\nagent sentence\n", true);
+
+    // The developer changes one word before committing.
+    fixture.write("README.md", "intro\nagent SENTENCE\n");
+    let commit = fixture.commit_all("README: agent sentence, reworded");
+
+    fixture.walk(&store);
+    let checkpoints = store.checkpoints_for_session(&session).unwrap();
+    assert_eq!(
+        checkpoints.len(),
+        1,
+        "a reviewed-and-tweaked edit to a pre-existing file is still agent-derived work"
+    );
+    assert_eq!(checkpoints[0].commit_sha, commit);
+}
+
+#[test]
+fn the_same_tweak_is_dropped_when_the_touch_claims_the_agent_created_the_file() {
+    // The other side of the same coin, and why the fix belongs in the sampler
+    // rather than in the rule: when `existed_before` is false the strict arm
+    // demands a byte-identical blob, so one reworded word costs the link. The
+    // rule is right; feeding it a wrong answer is what broke.
+    let fixture = Fixture::new();
+    fixture.write("README.md", "intro\n");
+    fixture.commit_all("initial");
+
+    let mut store = fixture.store();
+    fixture.walk(&store);
+
+    fixture.write("README.md", "intro\nagent sentence\n");
+    let session =
+        session_wrote(&fixture, &mut store, "s1", "README.md", "intro\nagent sentence\n", false);
+
+    fixture.write("README.md", "intro\nagent SENTENCE\n");
+    fixture.commit_all("README: agent sentence, reworded");
+
+    fixture.walk(&store);
+    assert!(
+        store.checkpoints_for_session(&session).unwrap().is_empty(),
+        "the strict arm cannot forgive a content change — hence sampling must be accurate"
+    );
+}
+
+#[test]
 fn a_new_file_the_human_replaced_produces_no_checkpoint() {
     // The strict arm. Without it, work the developer did themselves would be
     // credited to the agent.

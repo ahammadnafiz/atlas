@@ -554,11 +554,17 @@ impl CaptureState {
     ///
     /// The sampling *event* is cached per call id — even when the extracted
     /// path set is empty — because many agents attach locations only on the
-    /// completion update, and re-sampling `existed_before` after the write
-    /// would always answer `true` for a file the agent just created. A path
-    /// first seen on a later (post-write) sighting is recorded with
-    /// `existed_before = false`: the strict arm may miss a link, but the
-    /// permissive arm must never credit the agent falsely.
+    /// completion update, and re-probing the *filesystem* after the write
+    /// would always answer `true` for a file the agent just created.
+    ///
+    /// A path first seen on a later (post-write) sighting therefore falls back
+    /// to git rather than to a flat `false`. Recording the strict arm there was
+    /// conservative in the right direction but far too blunt in practice: the
+    /// agents we host attach locations at completion, so *every* touch took it,
+    /// the permissive arm never fired, and a developer who tweaked one word of
+    /// agent output before committing silently lost the Checkpoint — the exact
+    /// workflow the asymmetric rule exists to support. `tracked_in_head` is
+    /// order-independent, so it answers the same before and after the write.
     ///
     /// Returns the writes and whether a terminal sighting has already recorded
     /// them (so repeated terminal upserts cannot duplicate rows).
@@ -588,14 +594,16 @@ impl CaptureState {
             if sample.writes.iter().any(|w| w.path.path == path.path) {
                 continue;
             }
-            // Knowable only when this sighting precedes the write: the first
-            // sighting of a call that is not yet terminal. Anything later —
-            // including a call whose *first* sighting is already terminal — is
-            // post-write, and unknown is recorded as the strict arm.
+            // The filesystem answers truthfully only when this sighting
+            // precedes the write: the first sighting of a call that is not yet
+            // terminal. Anything later — including a call whose *first*
+            // sighting is already terminal — is post-write, where git's index
+            // is the only source that still distinguishes "the agent created
+            // this" from "the agent edited what was already here".
             let existed_before = if first_sighting && !terminal {
                 workspace_root.join(&path.path).exists()
             } else {
-                false
+                atlas_checkpoint::git::tracked_in_head(workspace_root, &path.path)
             };
             sample.writes.push(PendingWrite { path, existed_before });
         }
