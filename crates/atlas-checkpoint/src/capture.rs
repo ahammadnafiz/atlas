@@ -361,6 +361,15 @@ impl<'a> Capture<'a> {
     }
 
     fn record_content(&mut self, session_id: &str, content: TurnContent) -> Result<Option<String>> {
+        let content = TurnContent {
+            body: strip_host_machinery(content.role, &content.body),
+            ..content
+        };
+        // A reply that was nothing but machinery strips to nothing; an empty
+        // assistant row would render as a blank bubble in the timeline.
+        if content.body.trim().is_empty() && content.role == Role::Assistant {
+            return Ok(None);
+        }
         // Shape-aware for the rare body that *is* a JSON document (an agent
         // replying with pure JSON): the walk keeps its ids and paths intact
         // where the flat pass would shred them. Prose takes the flat pass.
@@ -413,6 +422,45 @@ impl<'a> Capture<'a> {
 /// instead of only on paper — the alternative is an unwind through the capture
 /// path that either kills the caller or, worse, is caught somewhere upstream
 /// that then stores the raw body.
+/// The host's prompt machinery, which must never read as conversation.
+///
+/// Atlas appends a hidden next-steps directive to the wire prompt (the user
+/// never typed it) and the agent answers with a hidden `<next_steps>` block the
+/// chat UI strips from display. The record must match what the developer and
+/// the agent actually said to each other — a timeline full of harness
+/// scaffolding is noise at best and, for the directive, misattributes Atlas's
+/// words to the developer. Mirrors `NEXT_STEPS_MARKER` in
+/// `src/features/chat/lib/next-steps.ts`; the two must change together.
+const NEXT_STEPS_MARKER: &str = "═══ Atlas next-steps ═══";
+
+fn strip_host_machinery(role: Role, body: &str) -> String {
+    match role {
+        Role::User => match body.find(NEXT_STEPS_MARKER) {
+            Some(at) => body[..at].trim_end().to_string(),
+            None => body.to_string(),
+        },
+        Role::Assistant | Role::System => {
+            let Some(open) = body.find("<next_steps>") else {
+                return body.to_string();
+            };
+            let close = body[open..]
+                .find("</next_steps>")
+                .map(|rel| open + rel + "</next_steps>".len());
+            match close {
+                Some(end) => {
+                    let mut out = String::with_capacity(body.len());
+                    out.push_str(body[..open].trim_end());
+                    out.push_str(&body[end..]);
+                    out.trim_end().to_string()
+                }
+                // An unclosed block is a truncated reply; keep it verbatim
+                // rather than guessing where machinery ends and speech begins.
+                None => body.to_string(),
+            }
+        }
+    }
+}
+
 fn scrub(body: &str) -> Result<atlas_redact::Redacted> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| atlas_redact::redact(body)))
         .map_err(|_| Error::RedactionFailed("redactor panicked on this content".into()))
@@ -476,5 +524,37 @@ mod tests {
     fn the_shape_aware_scrub_treats_prose_as_prose() {
         let out = scrub_auto("API_KEY=supersecretvalue123").expect("scrub");
         assert!(out.text.contains("[REDACTED]"));
+    }
+}
+
+#[cfg(test)]
+mod machinery_tests {
+    use super::*;
+
+    #[test]
+    fn the_injected_directive_is_stripped_from_user_prompts() {
+        let body = format!("Fix the login bug\n\n{NEXT_STEPS_MARKER}\nWhen you have finished…");
+        assert_eq!(strip_host_machinery(Role::User, &body), "Fix the login bug");
+    }
+
+    #[test]
+    fn the_hidden_next_steps_block_is_stripped_from_replies() {
+        let body = "Done, committed.\n\n<next_steps>\n- push the branch\n</next_steps>";
+        assert_eq!(
+            strip_host_machinery(Role::Assistant, body),
+            "Done, committed."
+        );
+    }
+
+    #[test]
+    fn an_unclosed_block_is_kept_verbatim() {
+        let body = "Done.\n<next_steps>\n- push";
+        assert_eq!(strip_host_machinery(Role::Assistant, body), body);
+    }
+
+    #[test]
+    fn ordinary_content_passes_untouched() {
+        assert_eq!(strip_host_machinery(Role::User, "hello"), "hello");
+        assert_eq!(strip_host_machinery(Role::Assistant, "hi"), "hi");
     }
 }
