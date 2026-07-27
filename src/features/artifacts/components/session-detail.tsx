@@ -24,7 +24,7 @@ import {
   type TimelineEntry,
   type TimelineFilters,
 } from "../types";
-import { AgentBadge } from "./session-list";
+import { AgentBadge, prettyModel } from "./session-list";
 
 /**
  * One Session, as the ordered record of what happened.
@@ -263,7 +263,7 @@ function GutterNode({ entry }: { entry: TimelineEntry }) {
 function Header({ detail }: { detail: Detail }) {
   const s = detail.summary;
   const facts = [
-    s.model,
+    prettyModel(s.model),
     relative(s.updatedAt),
     duration(s.durationSeconds),
     count(s.checkpointCount, "Checkpoint"),
@@ -277,8 +277,13 @@ function Header({ detail }: { detail: Detail }) {
         {s.title ?? "Untitled session"}
       </h1>
 
-      <div className="mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-1 text-[11px] text-[var(--text-tertiary)]">
-        {s.agent && <AgentBadge agent={s.agent} />}
+      <div className="mt-2 flex flex-wrap items-center gap-x-2 gap-y-1 text-[12px] text-[var(--text-tertiary)]">
+        {s.agent && (
+          <AgentBadge
+            agent={s.agent}
+            className="block border border-[color-mix(in_srgb,currentColor_25%,transparent)] px-2 text-[11px]"
+          />
+        )}
         {s.source === "external_jsonl" && (
           <span className="rounded border border-[var(--border-default)] px-1.5 py-0.5 text-[10px] text-[var(--text-tertiary)]">
             imported

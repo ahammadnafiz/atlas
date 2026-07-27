@@ -268,7 +268,7 @@ function SessionRow({
         {session.agent && <AgentBadge agent={session.agent} />}
 
         <span className="hidden w-[92px] shrink-0 truncate text-right font-mono text-[11px] text-[var(--text-tertiary)] sm:block">
-          {session.model ?? ""}
+          {prettyModel(session.model) ?? ""}
         </span>
 
         {/* Zero renders as silence, not as "no checkpoints" filler — a list
@@ -292,7 +292,30 @@ function SessionRow({
  * row read as a problem. An unrecognised agent gets the neutral tone, not
  * Claude's.
  */
-export function AgentBadge({ agent }: { agent: string }) {
+/**
+ * Turn a raw model id into the name a person says.
+ *
+ * The wire carries ids like `claude-fable-5[1m]` or `gpt-5.5-codex`; the
+ * reference surfaces show "Fable 5" and "GPT-5.5". Derived, best-effort, and
+ * falling back to the raw id — a name we cannot prettify is still a name.
+ */
+export function prettyModel(model: string | null): string | null {
+  if (!model) return null;
+  const raw = model.replace(/\[.*?\]/g, "").trim();
+  const m = raw.toLowerCase();
+  const versioned = (family: string) => {
+    const version = raw.match(/(\d+(?:\.\d+)?)/)?.[1];
+    return version ? `${family} ${version}` : family;
+  };
+  if (m.includes("fable")) return versioned("Fable");
+  if (m.includes("opus")) return versioned("Opus");
+  if (m.includes("sonnet")) return versioned("Sonnet");
+  if (m.includes("haiku")) return versioned("Haiku");
+  if (m.startsWith("gpt")) return raw.toUpperCase().replace("-CODEX", " Codex");
+  return raw;
+}
+
+export function AgentBadge({ agent, className }: { agent: string; className?: string }) {
   const tone = agent.includes("claude")
     ? "text-[var(--agent-claude-chip)] bg-[var(--agent-claude-chip-bg)]"
     : agent.includes("codex")
@@ -304,7 +327,8 @@ export function AgentBadge({ agent }: { agent: string }) {
   return (
     <span
       className={cn(
-        "hidden shrink-0 rounded px-1.5 py-0.5 font-mono text-[10px] md:block",
+        "shrink-0 rounded px-1.5 py-0.5 font-mono text-[10px]",
+        className ?? "hidden md:block",
         tone,
       )}
     >
