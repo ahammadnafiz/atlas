@@ -57,9 +57,11 @@ interface Props {
   detail: Detail;
   /** Needed to fetch spilled payloads via `artifacts_payload`. */
   projectPath: string;
+  /** Opened from a commit: land on that Checkpoint rather than at the top. */
+  focusCommitSha?: string;
 }
 
-export function SessionDetail({ detail, projectPath }: Props) {
+export function SessionDetail({ detail, projectPath, focusCommitSha }: Props) {
   const [filters, setFilters] = useState<TimelineFilters>(DEFAULT_FILTERS);
   /** Narrow tool calls to failed ones — the "which calls failed" question. */
   const [failedOnly, setFailedOnly] = useState(false);
@@ -69,6 +71,10 @@ export function SessionDetail({ detail, projectPath }: Props) {
   const scrollRef = useRef<HTMLDivElement | null>(null);
   /** A jump target waiting for its entry to be rendered. */
   const [pendingJump, setPendingJump] = useState<string | null>(null);
+  /** The entry a jump just landed on, highlighted briefly. */
+  const [landed, setLanded] = useState<string | null>(null);
+  /** The Checkpoint currently being read, so the rail can say which of N. */
+  const [activeCheckpoint, setActiveCheckpoint] = useState<string | null>(null);
 
   const visible = useMemo(
     () => detail.entries.filter((entry) => passes(entry, filters, failedOnly)),
@@ -138,9 +144,41 @@ export function SessionDetail({ detail, projectPath }: Props) {
     const node = entryRefs.current.get(pendingJump);
     if (node) {
       node.scrollIntoView({ behavior: "smooth", block: "center" });
+      // A smooth scroll into the middle of a long conversation leaves no clue
+      // which row was the destination. The ring says "this one", then gets out
+      // of the way.
+      setLanded(pendingJump);
+      if (visible[index]?.kind === "checkpoint") setActiveCheckpoint(pendingJump);
       setPendingJump(null);
     }
   }, [pendingJump, visible, renderCount]);
+
+  useEffect(() => {
+    if (!landed) return;
+    const timer = setTimeout(() => setLanded(null), 2000);
+    return () => clearTimeout(timer);
+  }, [landed]);
+
+  // Arrived from a commit in the git panel. That commit is the only part of the
+  // Session the developer asked about, and a Session can produce several — so
+  // opening at the top would land them in the wrong conversation.
+  //
+  // Honoured once per arrival. A live Session re-reads its entries every poll,
+  // and without the guard each one would yank the reader back to the Checkpoint
+  // they had already scrolled away from.
+  const honouredFocus = useRef<string | null>(null);
+  useEffect(() => {
+    if (!focusCommitSha) return;
+    const arrival = `${detail.summary.id}:${focusCommitSha}`;
+    if (honouredFocus.current === arrival) return;
+    const target = detail.entries.find(
+      (entry) => entry.kind === "checkpoint" && entry.commitSha === focusCommitSha,
+    );
+    if (target) {
+      honouredFocus.current = arrival;
+      setPendingJump(target.id);
+    }
+  }, [focusCommitSha, detail.summary.id, detail.entries]);
 
   return (
     <div className="flex h-full min-h-0">
@@ -172,9 +210,11 @@ export function SessionDetail({ detail, projectPath }: Props) {
                   <li
                     key={entry.id}
                     className={cn(
-                      "relative",
+                      "relative rounded transition-shadow duration-500",
                       entry.kind === "tool_call" ? "pl-12" : "pl-9",
                       index > 0 && (inCluster ? "mt-1" : "mt-3"),
+                      landed === entry.id &&
+                        "ring-1 ring-[var(--border-focus)] ring-offset-2 ring-offset-[var(--bg-surface)]",
                     )}
                     ref={(node) => {
                       if (node) entryRefs.current.set(entry.id, node);
@@ -217,6 +257,7 @@ export function SessionDetail({ detail, projectPath }: Props) {
         expandAllTools={expandAllTools}
         onExpandAllToolsChange={setExpandAllTools}
         checkpoints={checkpoints}
+        activeCheckpoint={activeCheckpoint}
         onJump={setPendingJump}
       />
     </div>
@@ -614,18 +655,33 @@ function Block({
   );
 }
 
-/** A commit this Session produced. */
+/**
+ * A commit this Session produced.
+ *
+ * Rendered as a *boundary*, not as another row in the stream. A Checkpoint is
+ * literally the slice of a Session whose work landed in one commit, so in a
+ * Session that produced several it is the only thing marking where one piece of
+ * work ends and the next begins. As a peer row it read as an aside; the rule and
+ * the caption make the timeline chunk into "work → landed in X → work".
+ */
 function Checkpoint({ entry }: { entry: TimelineEntry }) {
   const orphaned = entry.linkState === "orphaned";
   return (
-    <div
-      className={cn(
-        "flex items-center gap-3 rounded-lg border px-3 py-2",
-        orphaned
-          ? "border-dashed border-[var(--border-strong)]"
-          : "border-[var(--border-default)] bg-[var(--bg-raised)]",
-      )}
-    >
+    <>
+      <div className="mb-2 flex items-center gap-2">
+        <span className="text-[9px] uppercase tracking-wider text-[var(--text-ghost)]">
+          {orphaned ? "Landed in — since rewritten" : "Landed in"}
+        </span>
+        <span className="h-px flex-1 bg-[var(--border-subtle)]" />
+      </div>
+      <div
+        className={cn(
+          "flex items-center gap-3 rounded-lg border px-3 py-2",
+          orphaned
+            ? "border-dashed border-[var(--border-strong)]"
+            : "border-[var(--border-default)] bg-[var(--bg-raised)]",
+        )}
+      >
       <span className="shrink-0 font-mono text-[11px] text-[var(--text-tertiary)]">
         {entry.commitSha?.slice(0, 7)}
       </span>
@@ -677,9 +733,10 @@ function Checkpoint({ entry }: { entry: TimelineEntry }) {
           {entry.deletions > 0 && (
             <span className="text-[var(--stat-removed)]">-{entry.deletions}</span>
           )}
-        </span>
-      )}
-    </div>
+          </span>
+        )}
+      </div>
+    </>
   );
 }
 
@@ -791,6 +848,7 @@ function Rail({
   expandAllTools,
   onExpandAllToolsChange,
   checkpoints,
+  activeCheckpoint,
   onJump,
 }: {
   detail: Detail;
@@ -802,6 +860,7 @@ function Rail({
   expandAllTools: boolean;
   onExpandAllToolsChange: (value: boolean) => void;
   checkpoints: TimelineEntry[];
+  activeCheckpoint: string | null;
   onJump: (id: string) => void;
 }) {
   const set = (key: keyof TimelineFilters) => (value: boolean) =>
@@ -810,7 +869,7 @@ function Rail({
   return (
     <aside className="w-[240px] shrink-0 overflow-y-auto border-l border-[var(--border-default)] px-4 py-4">
       {checkpoints.length > 0 ? (
-        <JumpTo checkpoints={checkpoints} onJump={onJump} />
+        <JumpTo checkpoints={checkpoints} activeId={activeCheckpoint} onJump={onJump} />
       ) : (
         /* Zero is a fact worth one quiet sentence, not an empty rail — the
          * difference between "imported, so never linked" and "nothing was
@@ -913,21 +972,29 @@ function Rail({
 }
 
 /**
- * The rail's Checkpoints, as a "Jump to" dropdown.
+ * The rail's Checkpoints, as an ordered "Jump to" list.
  *
- * A dropdown rather than a permanent list because the list competes with the
- * filters for the rail's small width, and jumping is a one-shot act: open,
- * pick, land. The jump itself goes through the same pending-jump mechanism the
- * timeline already settles over renders (filter reveal, window growth, scroll).
+ * Collapsed at one Checkpoint, where the list would just restate what the
+ * timeline already shows. Open by default past that: a Session that produced
+ * several commits is the case where the timeline stops being self-evident, and
+ * the ordered list is the only place that says how many there were, in what
+ * order, and which one is being read. Numbering matters for the same reason —
+ * "2 of 3" is the orienting fact, and a bare list of subjects does not carry it.
+ *
+ * The jump goes through the same pending-jump mechanism the timeline settles
+ * over renders (filter reveal, window growth, scroll).
  */
 function JumpTo({
   checkpoints,
+  activeId,
   onJump,
 }: {
   checkpoints: TimelineEntry[];
+  activeId: string | null;
   onJump: (id: string) => void;
 }) {
-  const [open, setOpen] = useState(false);
+  const [open, setOpen] = useState(checkpoints.length > 1);
+  const activeIndex = checkpoints.findIndex((c) => c.id === activeId);
 
   return (
     <section className="mb-5">
@@ -939,7 +1006,9 @@ function JumpTo({
       >
         <span className="text-[11px] font-medium text-[var(--text-primary)]">Jump to</span>
         <span className="flex items-center gap-1.5 text-[11px] text-[var(--text-tertiary)]">
-          {checkpoints.length} checkpoint{checkpoints.length === 1 ? "" : "s"}
+          {activeIndex >= 0 && checkpoints.length > 1
+            ? `${activeIndex + 1} of ${checkpoints.length}`
+            : `${checkpoints.length} checkpoint${checkpoints.length === 1 ? "" : "s"}`}
           <ChevronDown
             size={11}
             className={cn("transition-transform duration-150 ease-out", open && "rotate-180")}
@@ -949,7 +1018,7 @@ function JumpTo({
 
       {open && (
         <ul className="mt-1 max-h-[240px] overflow-y-auto rounded border border-[var(--border-default)] bg-[var(--bg-raised)] p-0.5">
-          {checkpoints.map((checkpoint) => {
+          {checkpoints.map((checkpoint, index) => {
             const meta = [
               checkpoint.commitSha?.slice(0, 7) ?? null,
               checkpoint.files.length > 0
@@ -962,27 +1031,42 @@ function JumpTo({
             ]
               .filter((part): part is string => part !== null)
               .join(" · ");
+            const active = checkpoint.id === activeId;
             return (
               <li key={checkpoint.id}>
                 <button
                   type="button"
-                  onClick={() => {
-                    onJump(checkpoint.id);
-                    setOpen(false);
-                  }}
-                  className="w-full rounded px-1.5 py-1.5 text-left transition-colors duration-150 hover:bg-[var(--bg-hover)] focus-visible:ring-1 focus-visible:ring-[var(--border-focus)] active:bg-[var(--bg-active)]"
-                >
-                  <span className="block truncate text-[11px] text-[var(--text-primary)]">
-                    {checkpoint.commitSubject ??
-                      (checkpoint.linkState === "orphaned"
-                        ? "Commit no longer reachable"
-                        : "Subject unavailable")}
-                  </span>
-                  {meta && (
-                    <span className="mt-0.5 block font-mono text-[10px] text-[var(--text-tertiary)]">
-                      {meta}
-                    </span>
+                  // Deliberately does not close the list: stepping through a
+                  // Session's commits in order is the whole point, and a list
+                  // that closes on every pick makes that four clicks per step.
+                  onClick={() => onJump(checkpoint.id)}
+                  aria-current={active ? "true" : undefined}
+                  className={cn(
+                    "flex w-full items-start gap-1.5 rounded px-1.5 py-1.5 text-left transition-colors duration-150 hover:bg-[var(--bg-hover)] focus-visible:ring-1 focus-visible:ring-[var(--border-focus)] active:bg-[var(--bg-active)]",
+                    active && "bg-[var(--bg-active)]",
                   )}
+                >
+                  <span
+                    className={cn(
+                      "mt-px w-3 shrink-0 text-right font-mono text-[10px] tabular-nums",
+                      active ? "text-[var(--text-secondary)]" : "text-[var(--text-ghost)]",
+                    )}
+                  >
+                    {index + 1}
+                  </span>
+                  <span className="min-w-0 flex-1">
+                    <span className="block truncate text-[11px] text-[var(--text-primary)]">
+                      {checkpoint.commitSubject ??
+                        (checkpoint.linkState === "orphaned"
+                          ? "Commit no longer reachable"
+                          : "Subject unavailable")}
+                    </span>
+                    {meta && (
+                      <span className="mt-0.5 block font-mono text-[10px] text-[var(--text-tertiary)]">
+                        {meta}
+                      </span>
+                    )}
+                  </span>
                 </button>
               </li>
             );

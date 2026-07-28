@@ -254,7 +254,10 @@ function CommitSessions({ sha }: { sha: string }) {
 
   const open = (sessionId: string) => {
     if (!repoPath) return;
-    useArtifactsStore.getState().actions.openSession({ sessionId, projectPath: repoPath });
+    // The sha travels with the request so the Session lands on this commit's
+    // Checkpoint rather than at the top of a conversation that may have
+    // produced several.
+    useArtifactsStore.getState().actions.openSession({ sessionId, projectPath: repoPath, commitSha: sha });
     addTab({ id: "artifacts", type: "artifacts", title: "Timeline", closable: true, dirty: false, data: {} });
   };
 

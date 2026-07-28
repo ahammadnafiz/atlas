@@ -9,12 +9,12 @@ import { useWorkspaceStore } from "@/features/workspaces/stores/workspace-store"
 import { cn } from "@/lib/utils";
 
 import { useArtifactsStore } from "../stores/artifacts-store";
-
-/** Mirrors `BOARD_LIMIT` in `capture.rs` — how many rows one board read returns. */
-const BOARD_LIMIT = 500;
 import type { BoardSession, SessionDetail as Detail } from "../types";
 import { SessionDetail } from "./session-detail";
 import { SessionList } from "./session-list";
+
+/** Mirrors `BOARD_LIMIT` in `capture.rs` — how many rows one board read returns. */
+const BOARD_LIMIT = 500;
 
 /**
  * Atlas Timeline — the Sessions every project in the Organisation has recorded,
@@ -243,7 +243,11 @@ export function ArtifactsPanel() {
           ) : detail === null ? (
             <NotFound onBack={() => openSession(null)} />
           ) : (
-            <SessionDetail detail={detail} projectPath={open.projectPath} />
+            <SessionDetail
+              detail={detail}
+              projectPath={open.projectPath}
+              focusCommitSha={open.commitSha}
+            />
           )
         ) : loaded && sessions.length === 0 ? (
           <NotEnabled />

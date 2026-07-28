@@ -11,13 +11,23 @@
 import { create } from "zustand";
 import { createSelectors } from "@/lib/create-selectors";
 
+/** Which Session the board is showing, and where inside it to land. */
+export interface OpenSession {
+  sessionId: string;
+  projectPath: string;
+  /** Arrived from a commit: scroll to that Checkpoint instead of the top. A
+   *  Session can produce many commits, and the one you clicked is the only part
+   *  of it you asked about. */
+  commitSha?: string;
+}
+
 interface ArtifactsState {
   /** The open Session, with the project whose store holds it. */
-  open: { sessionId: string; projectPath: string } | null;
+  open: OpenSession | null;
   /** Project path the board is narrowed to, or `null` for every project. */
   projectFilter: string | null;
   actions: {
-    openSession: (open: { sessionId: string; projectPath: string } | null) => void;
+    openSession: (open: OpenSession | null) => void;
     setProjectFilter: (projectPath: string | null) => void;
   };
 }
