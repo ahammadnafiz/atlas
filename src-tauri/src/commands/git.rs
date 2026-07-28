@@ -319,7 +319,14 @@ pub async fn git_log(
     all: Option<bool>,
 ) -> Result<Vec<GitLogEntry>, String> {
     let lim = limit.unwrap_or(50);
-    let all_flag = all.unwrap_or(true);
+    // Defaults to the checked-out branch, like `git log` itself. Every consumer
+    // of THIS command is branch-scoped: the Source-Control History list sits
+    // under a toolbar naming the current branch and offers reset/revert against
+    // what it shows, and the Review panel pre-selects its newest entry. Under
+    // `--all` both silently reach commits that are not on HEAD. The commit graph
+    // genuinely wants every ref, and asks for it explicitly via
+    // `git_graph_build(all: true)`.
+    let all_flag = all.unwrap_or(false);
     tokio::task::spawn_blocking(move || git_log_compute(&path, lim, all_flag))
         .await
         .map_err(|e| e.to_string())?
@@ -696,4 +703,66 @@ fn parse_line_porcelain(out: &str) -> Vec<BlameLine> {
         }
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::path::Path;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn git(repo: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@example.com")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@example.com")
+            .status()
+            .expect("git is on PATH");
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    /// `git_log` is branch-scoped unless a caller opts in. The Source-Control
+    /// History list and the Review panel both act on what this returns —
+    /// reset/revert/cherry-pick and the pre-selected review target — so a
+    /// commit that is not on HEAD must not appear by default.
+    #[tokio::test]
+    async fn git_log_defaults_to_the_checked_out_branch() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("atlas-gitlog-{nanos}"));
+        fs::create_dir_all(&root).unwrap();
+
+        git(&root, &["init", "-q", "-b", "main"]);
+        fs::write(root.join("f"), "a").unwrap();
+        git(&root, &["add", "-A"]);
+        git(&root, &["commit", "-qm", "on main"]);
+        git(&root, &["checkout", "-qb", "feature"]);
+        fs::write(root.join("f"), "b").unwrap();
+        git(&root, &["commit", "-qam", "only on feature"]);
+        git(&root, &["checkout", "-q", "main"]);
+
+        let path = root.to_string_lossy().into_owned();
+
+        let default = git_log(path.clone(), Some(50), None).await.unwrap();
+        assert!(
+            !default.iter().any(|c| c.message == "only on feature"),
+            "default log leaked a commit that is not on HEAD: {:?}",
+            default.iter().map(|c| &c.message).collect::<Vec<_>>()
+        );
+        assert!(default.iter().any(|c| c.message == "on main"));
+
+        let all = git_log(path, Some(50), Some(true)).await.unwrap();
+        assert!(
+            all.iter().any(|c| c.message == "only on feature"),
+            "all: true must still reach every ref"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
 }
