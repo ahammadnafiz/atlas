@@ -385,6 +385,8 @@ pub fn run() {
             commands::capture::artifacts_sessions,
             commands::capture::artifacts_session,
             commands::capture::artifacts_payload,
+            commands::capture::capture_commit_sessions,
+            commands::capture::artifacts_board,
             commands::git_watcher::git_watch_status,
             commands::mention_search::mention_search,
             commands::mention_search::mention_cache_set_knowledge,

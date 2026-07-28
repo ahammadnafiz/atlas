@@ -3,10 +3,10 @@ import { ChevronDown, ChevronRight, GitBranch, Search, TriangleAlert } from "luc
 
 import { cn } from "@/lib/utils";
 
-import type { SessionSummary } from "../types";
+import type { BoardSession } from "../types";
 
 /**
- * Every Session captured in this Workspace.
+ * Every Session captured across the Organisation's projects.
  *
  * Grouped by day rather than listed flat, because the question a developer
  * actually asks is "what did I do on Tuesday" — a scroll of 200 undifferentiated
@@ -18,10 +18,11 @@ import type { SessionSummary } from "../types";
  */
 
 interface Props {
-  sessions: SessionSummary[];
+  sessions: BoardSession[];
   /** True while the first read for this Workspace is in flight. */
   loading: boolean;
-  onOpen: (id: string) => void;
+  /** The project is passed back because each one has its own store. */
+  onOpen: (id: string, projectPath: string) => void;
 }
 
 export function SessionList({ sessions, loading, onOpen }: Props) {
@@ -138,8 +139,8 @@ export function SessionList({ sessions, loading, onOpen }: Props) {
 
 /** A day's rows, with runs of identical automated imports folded together. */
 type ListItem =
-  | { kind: "single"; session: SessionSummary }
-  | { kind: "cluster"; title: string; sessions: SessionSummary[] };
+  | { kind: "single"; session: BoardSession }
+  | { kind: "cluster"; title: string; sessions: BoardSession[] };
 
 /**
  * Fold imported sessions that share an identical title into one row.
@@ -151,7 +152,7 @@ type ListItem =
  * run of them is a machine. Only imported sessions fold — live captures are
  * something the developer did here, however repetitive.
  */
-function clusterRows(rows: SessionSummary[]): ListItem[] {
+function clusterRows(rows: BoardSession[]): ListItem[] {
   const byTitle = new Map<string, number>();
   for (const session of rows) {
     if (session.source === "external_jsonl" && session.title) {
@@ -160,7 +161,7 @@ function clusterRows(rows: SessionSummary[]): ListItem[] {
   }
 
   const items: ListItem[] = [];
-  const folded = new Map<string, SessionSummary[]>();
+  const folded = new Map<string, BoardSession[]>();
   for (const session of rows) {
     const foldable =
       session.source === "external_jsonl" &&
@@ -174,7 +175,7 @@ function clusterRows(rows: SessionSummary[]): ListItem[] {
     if (bucket) {
       bucket.push(session);
     } else {
-      const sessions: SessionSummary[] = [session];
+      const sessions: BoardSession[] = [session];
       folded.set(session.title!, sessions);
       // Placed where its first member sat, so folding never reorders the day.
       items.push({ kind: "cluster", title: session.title!, sessions });
@@ -192,7 +193,7 @@ function ClusterRow({
   item: Extract<ListItem, { kind: "cluster" }>;
   expanded: boolean;
   onToggle: () => void;
-  onOpen: (id: string) => void;
+  onOpen: (id: string, projectPath: string) => void;
 }) {
   return (
     <li>
@@ -232,18 +233,25 @@ function SessionRow({
   session,
   onOpen,
 }: {
-  session: SessionSummary;
-  onOpen: (id: string) => void;
+  session: BoardSession;
+  onOpen: (id: string, projectPath: string) => void;
 }) {
   return (
     <li>
       <button
         type="button"
-        onClick={() => onOpen(session.id)}
+        onClick={() => onOpen(session.id, session.projectPath)}
         className="group flex w-full items-center gap-3 rounded px-2 py-2 text-left transition-colors duration-150 hover:bg-[var(--bg-hover)] focus-visible:ring-1 focus-visible:ring-[var(--border-focus)] active:bg-[var(--bg-active)]"
       >
         <span className="min-w-0 flex-1 truncate text-[13px] text-[var(--text-primary)]">
           {session.title ?? <span className="text-[var(--text-tertiary)]">Untitled session</span>}
+        </span>
+
+        {/* The board spans every project, so a row that does not name its own
+         *  is unreadable the moment two projects are captured. Shown even when
+         *  filtered to one — the filter is a header control, not a row label. */}
+        <span className="hidden shrink-0 rounded bg-[var(--bg-raised)] px-1.5 py-0.5 font-mono text-[10px] text-[var(--text-tertiary)] md:block">
+          {session.projectName}
         </span>
 
         {/* A Session that could not be fully recorded says so where it is read.
@@ -365,8 +373,8 @@ function Empty({ filtered }: { filtered: boolean }) {
  * The input is already newest-first from the store, so insertion order into the
  * Map preserves the grouping order and no second sort is needed.
  */
-function groupByDay(sessions: SessionSummary[]): Array<[string, SessionSummary[]]> {
-  const groups = new Map<string, SessionSummary[]>();
+function groupByDay(sessions: BoardSession[]): Array<[string, BoardSession[]]> {
+  const groups = new Map<string, BoardSession[]>();
   for (const session of sessions) {
     const day = dayLabel(new Date(session.updatedAt));
     const bucket = groups.get(day);

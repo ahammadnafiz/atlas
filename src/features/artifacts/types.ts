@@ -121,3 +121,14 @@ export const DEFAULT_FILTERS: TimelineFilters = {
   toolCalls: true,
   checkpoints: true,
 };
+
+/**
+ * A board row: a Session plus the project it came from.
+ *
+ * The board spans every project in the Organisation, so a row can no longer
+ * assume the open Workspace — reading the Session back needs its own store.
+ */
+export interface BoardSession extends SessionSummary {
+  projectPath: string;
+  projectName: string;
+}

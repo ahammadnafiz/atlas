@@ -1094,6 +1094,142 @@ pub async fn artifacts_session(
     .map_err(|e| e.to_string())?
 }
 
+/// One row on the Timeline board, tagged with the project it came from.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BoardSession {
+    #[serde(flatten)]
+    pub session: atlas_checkpoint::SessionSummary,
+    /// Needed to read the Session back: each project has its own store, so the
+    /// board has to remember which one a row came from.
+    pub project_path: String,
+    pub project_name: String,
+}
+
+/// Every Session across the Organisation's projects, newest first.
+///
+/// The board is Organisation-scoped rather than project-scoped: the question it
+/// answers — what has been happening in our code — does not stop at the folder
+/// that happens to be open. Filtering back down to one project is a display
+/// concern, done client-side over this list.
+///
+/// A project with capture off contributes nothing and is not an error; most
+/// projects in the list will be in that state until they are turned on.
+/// Most rows the board will return in one read.
+///
+/// Not a storage limit — every Session stays queryable, and narrowing to one
+/// project reads that project unbounded. It caps what crosses the IPC boundary
+/// and reaches the list, which renders every row it is given: an Organisation
+/// with forty captured projects would otherwise ship tens of thousands of rows
+/// every refresh to render a screenful.
+const BOARD_LIMIT: usize = 500;
+
+#[tauri::command]
+pub async fn artifacts_board(projects: Vec<String>) -> Result<Vec<BoardSession>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        // One project means the board is filtered, and the caller wants that
+        // project's history rather than a slice of the newest across all of
+        // them — so the cap does not apply.
+        let limit = if projects.len() == 1 { usize::MAX } else { BOARD_LIMIT };
+        let mut out: Vec<BoardSession> = Vec::new();
+        for project_path in projects {
+            // One unreadable store must not blank the whole board — the other
+            // projects' history is still good.
+            let Ok(Some(store)) = open_reader(&project_path) else {
+                continue;
+            };
+            let Ok(summaries) = atlas_checkpoint::session_summaries(&store, &project_path) else {
+                continue;
+            };
+            let project_name = Path::new(&project_path)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| project_path.clone());
+            out.extend(summaries.into_iter().map(|session| BoardSession {
+                session,
+                project_path: project_path.clone(),
+                project_name: project_name.clone(),
+            }));
+        }
+        // One ordering across every project, so the board reads as a timeline
+        // rather than as concatenated per-project lists. Sorting before the cap
+        // is what makes the cap mean "newest" rather than "whichever projects
+        // happened to be read first".
+        out.sort_by(|a, b| b.session.started_at.cmp(&a.session.started_at));
+        out.truncate(limit);
+        Ok(out)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// One Session that produced a commit.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommitSession {
+    pub session_id: String,
+    /// The first prompt, redacted — what was asked of the agent.
+    pub title: Option<String>,
+    pub message_count: i64,
+    pub tool_call_count: i64,
+    /// The files this Session contributed to *this* commit — which is what
+    /// separates the two when a commit combines the work of two agents.
+    pub files: Vec<String>,
+}
+
+/// The Sessions behind one commit, for the git panel's "why is this like this".
+///
+/// The board is not where this question gets asked — a developer asks it while
+/// looking at a commit, which is why the record has to be reachable from there
+/// rather than only from the Artifacts tab.
+///
+/// Reads only, so it is safe from a second window, same as the other artifact
+/// readers. A Workspace with capture off returns nothing rather than erroring:
+/// the git panel renders for every repository, most of which are not recorded.
+#[tauri::command]
+pub async fn capture_commit_sessions(
+    project_path: String,
+    commit_sha: String,
+) -> Result<Vec<CommitSession>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let Some(store) = open_reader(&project_path)? else {
+            return Ok(Vec::new());
+        };
+        let checkpoints =
+            store.checkpoints_for_commit(&commit_sha).map_err(|e| e.to_string())?;
+
+        let mut out = Vec::with_capacity(checkpoints.len());
+        for checkpoint in checkpoints {
+            // An orphaned Checkpoint has had its claim on a commit withdrawn by
+            // reconciliation — it keeps the old sha as a record, not as an
+            // assertion. Answering "what produced this commit" with one would
+            // re-assert exactly the link that was deliberately given up.
+            if checkpoint.link_state != atlas_checkpoint::LinkState::Linked {
+                continue;
+            }
+            // A Checkpoint whose Session has been pruned is skipped rather than
+            // rendered blank — the row exists to open the conversation.
+            let Some(session) =
+                store.session(&checkpoint.session_id).map_err(|e| e.to_string())?
+            else {
+                continue;
+            };
+            out.push(CommitSession {
+                message_count: store.message_count(&session.id).map_err(|e| e.to_string())?,
+                tool_call_count: store
+                    .tool_call_count(&session.id)
+                    .map_err(|e| e.to_string())?,
+                session_id: session.id,
+                title: session.title,
+                files: checkpoint.files_touched,
+            });
+        }
+        Ok(out)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 /// One spilled payload — a message body, a tool call's arguments or its
 /// result — fetched on demand by "Show full" in the timeline.
 #[derive(serde::Serialize)]

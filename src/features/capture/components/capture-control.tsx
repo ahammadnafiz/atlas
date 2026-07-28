@@ -11,7 +11,7 @@ import type { Binding, CaptureHealth } from "../types";
 
 /**
  * The Artifacts entry point: one row in the Workspace switcher panel header,
- * carrying the recording state and opening the Artifacts tab.
+ * carrying the recording state and opening the Timeline tab.
  *
  * The first version of this opened a settings popover instead, which was wrong
  * twice over. It rendered a Radix portal at `z-50` underneath the sidebar
@@ -57,7 +57,7 @@ export function CaptureControl() {
         .catch(() => !cancelled && setHealth(null));
     };
     read();
-    // Capture state changes from inside the Artifacts tab, from the git watcher
+    // Capture state changes from the titlebar pill, from the git watcher
     // and from the drain — none of which this row hears about. A slow poll is
     // the honest cost of not inventing an event channel for one status line —
     // paused while the window is hidden, because each poll opens a fresh
@@ -89,7 +89,7 @@ export function CaptureControl() {
           addTab({
             id: "artifacts",
             type: "artifacts",
-            title: "Artifacts",
+            title: "Timeline",
             closable: true,
             dirty: false,
             data: {},
@@ -99,7 +99,7 @@ export function CaptureControl() {
         title={health?.summary ?? "Sessions captured in this Workspace"}
       >
         <Layers size={13} className="shrink-0" />
-        <span className="truncate">Artifacts</span>
+        <span className="truncate">Timeline</span>
         <span className="ml-auto flex items-center gap-1.5">
           {/* Stopped and degraded are different words, not different triangle
            *  colours — "you are losing data now" and "something to review at

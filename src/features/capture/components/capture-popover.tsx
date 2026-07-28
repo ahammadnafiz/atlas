@@ -28,7 +28,7 @@ import type {
 } from "../types";
 
 /**
- * Session capture setup and status, opened from the Artifacts tab header.
+ * Session capture setup and status, opened from the titlebar project pill.
  *
  * The load-bearing decision is that **Local is a real mode, not a waiting room
  * for Cloud**: one click, no account, no network, and it produces the complete

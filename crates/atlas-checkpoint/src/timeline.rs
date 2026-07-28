@@ -25,6 +25,8 @@
 //! [`TimelineEntry::truncated`] set — the viewer shows what it has and says the
 //! rest is on disk. This is the same trade the store makes when it spills.
 
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
@@ -213,10 +215,31 @@ pub struct ToolTally {
 ///
 /// Ordered by `updated_at` rather than `started_at`: a Session resumed today is
 /// today's work, whatever day it began on.
+/// Every Session in a Workspace, newest first.
+///
+/// Four queries regardless of how many Sessions there are. It used to be
+/// `3n + 1` — three per row — which was invisible for one Workspace and became
+/// the whole cost once the board started spanning every project in an
+/// Organisation. The totals and the Checkpoints are fetched in one pass each
+/// and matched up in memory.
 pub fn sessions(store: &Store, workspace_id: &str) -> Result<Vec<SessionSummary>> {
+    let message_counts = store.message_counts(workspace_id)?;
+    let tool_call_counts = store.tool_call_counts_by_session(workspace_id)?;
+
+    let mut by_session: HashMap<String, Vec<Checkpoint>> = HashMap::new();
+    for checkpoint in store.checkpoints_for_workspace(workspace_id)? {
+        by_session.entry(checkpoint.session_id.clone()).or_default().push(checkpoint);
+    }
+
     let mut out = Vec::new();
     for session in store.sessions_for_workspace(workspace_id)? {
-        out.push(summarize(store, &session)?);
+        let checkpoints = by_session.get(&session.id).map(Vec::as_slice).unwrap_or(&[]);
+        out.push(summarize(
+            &session,
+            checkpoints,
+            message_counts.get(&session.id).copied().unwrap_or(0),
+            tool_call_counts.get(&session.id).copied().unwrap_or(0),
+        ));
     }
     out.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
     Ok(out)
@@ -228,9 +251,12 @@ pub fn sessions(store: &Store, workspace_id: &str) -> Result<Vec<SessionSummary>
 /// indexes — the list view must never materialise a body just to `.len()` it.
 /// Checkpoint rows *are* fetched: a Session has a handful at most, and the
 /// branch list, line counts and file set live on them.
-fn summarize(store: &Store, session: &Session) -> Result<SessionSummary> {
-    let checkpoints = store.checkpoints_for_session(&session.id)?;
-
+fn summarize(
+    session: &Session,
+    checkpoints: &[Checkpoint],
+    message_count: i64,
+    tool_call_count: i64,
+) -> SessionSummary {
     let mut branches: Vec<String> =
         checkpoints.iter().filter_map(|c| c.branch.clone()).collect();
     branches.sort();
@@ -243,7 +269,7 @@ fn summarize(store: &Store, session: &Session) -> Result<SessionSummary> {
     files.dedup();
 
     let totals = &session.token_totals;
-    Ok(SessionSummary {
+    SessionSummary {
         id: session.id.clone(),
         title: session.title.clone(),
         agent: session.agent.clone(),
@@ -252,8 +278,8 @@ fn summarize(store: &Store, session: &Session) -> Result<SessionSummary> {
         started_at: session.started_at.to_rfc3339(),
         updated_at: session.updated_at.to_rfc3339(),
         duration_seconds: (session.updated_at - session.started_at).num_seconds().max(0),
-        message_count: store.message_count(&session.id)?,
-        tool_call_count: store.tool_call_count(&session.id)?,
+        message_count,
+        tool_call_count,
         checkpoint_count: checkpoints.len() as i64,
         branches,
         insertions: checkpoints.iter().map(|c| c.insertions).sum(),
@@ -262,7 +288,7 @@ fn summarize(store: &Store, session: &Session) -> Result<SessionSummary> {
         total_tokens: (totals.input_tokens + totals.output_tokens) as i64,
         needs_attention: session.needs_attention,
         attention_reason: session.attention_reason.clone(),
-    })
+    }
 }
 
 /// One Session as an ordered timeline.
@@ -303,7 +329,8 @@ pub fn detail(
     // A Checkpoint carries no turn of its own. Attributing it to the last turn
     // that touched one of its files is what puts a commit *after* the work that
     // produced it rather than at the bottom of the Session.
-    for checkpoint in store.checkpoints_for_session(session_id)? {
+    let checkpoints = store.checkpoints_for_session(session_id)?;
+    for checkpoint in &checkpoints {
         counts.checkpoints += 1;
         let turn = touches
             .iter()
@@ -311,7 +338,7 @@ pub fn detail(
             .map(|t| t.turn_seq)
             .max()
             .unwrap_or(-1);
-        entries.push(checkpoint_entry(&checkpoint, turn, &subject_for));
+        entries.push(checkpoint_entry(checkpoint, turn, &subject_for));
     }
 
     entries.sort_by(order);
@@ -322,7 +349,15 @@ pub fn detail(
         .map(|(name, count)| ToolTally { tool_name: name.as_str().to_string(), count })
         .collect();
 
-    Ok(Some(SessionDetail { summary: summarize(store, &session)?, entries, counts, tools }))
+    // One Session, so the per-Session counts are two queries rather than the
+    // list view's `3n`.
+    let summary = summarize(
+        &session,
+        &checkpoints,
+        store.message_count(session_id)?,
+        store.tool_call_count(session_id)?,
+    );
+    Ok(Some(SessionDetail { summary, entries, counts, tools }))
 }
 
 /// Timeline order: by turn, then by when it happened.

@@ -1,4 +1,5 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
+import * as Popover from "@radix-ui/react-popover";
 import { useProjectStore } from "@/features/project/stores/project-store";
 import { useLayoutStore } from "@/features/layout/stores/layout-store";
 import { useWorkspaceStore } from "@/features/workspaces/stores/workspace-store";
@@ -12,6 +13,10 @@ import { useUpdaterStore } from "@/features/updater/stores/updater-store";
 import { updater } from "@/features/updater/lib/updater-api";
 import { AccountButton } from "@/features/auth/components/account-button";
 import { useOrgStore } from "@/features/organisations/stores/org-store";
+import { CapturePopover } from "@/features/capture/components/capture-popover";
+import { StatusDot } from "@/features/capture/components/capture-status";
+import type { Binding, CaptureHealth } from "@/features/capture/types";
+import { activeWorkspaceId } from "@/features/workspaces/lib/active-workspace";
 
 function useTauriWindow() {
   const windowRef = useRef<TauriWindow | null>(null);
@@ -160,24 +165,31 @@ function ProjectLabel({
   path?: string;
 }) {
   const [hovered, setHovered] = useState(false);
-  const [copied, setCopied] = useState(false);
-  const timer = useRef<number | null>(null);
+  const [captureOpen, setCaptureOpen] = useState(false);
+  const [binding, setBinding] = useState<Binding | null>(null);
+  const [health, setHealth] = useState<CaptureHealth | null>(null);
 
-  useEffect(() => () => { if (timer.current) clearTimeout(timer.current); }, []);
+  // Capture state for the dot, re-read when the popover changes something.
+  const readCapture = useCallback(() => {
+    if (!path) {
+      setBinding(null);
+      setHealth(null);
+      return;
+    }
+    void invoke<Binding | null>("capture_binding", { projectPath: path })
+      .then(setBinding)
+      .catch(() => setBinding(null));
+    void invoke<CaptureHealth>("capture_health", {
+      projectPath: path,
+      workspaceId: activeWorkspaceId(),
+    })
+      .then(setHealth)
+      .catch(() => setHealth(null));
+  }, [path]);
 
-  const copy = () => {
-    if (!path) return;
-    void navigator.clipboard
-      ?.writeText(path)
-      .then(() => {
-        setCopied(true);
-        if (timer.current) clearTimeout(timer.current);
-        timer.current = window.setTimeout(() => setCopied(false), 1500);
-      })
-      .catch(() => {});
-  };
+  useEffect(() => readCapture(), [readCapture]);
 
-  const showTip = !!path && (hovered || copied);
+  const showTip = !!path && !captureOpen && hovered;
 
   return (
     <div
@@ -186,40 +198,59 @@ function ProjectLabel({
       onMouseLeave={() => setHovered(false)}
     >
       {/* Pill: `org / project`. The org segment is de-emphasised so the project
-          — the thing that changes most — still reads as the primary label. */}
-      <button
-        onClick={copy}
-        className="group flex h-[19px] max-w-[320px] min-w-0 cursor-pointer items-center gap-1 rounded-full border border-[#303030] bg-[#0C0C0C] px-2 text-[11px] font-medium transition-colors hover:bg-[#1f1f1f]"
-      >
-        {orgName && (
-          <>
-            <span className="min-w-0 shrink truncate text-[var(--text-tertiary)]">
-              {orgName}
+          — the thing that changes most — still reads as the primary label.
+
+          Clicking it opens capture setup. Capture is per project, and this is
+          the one control in the app that always names the project it would
+          apply to — which the Timeline board, spanning every project, cannot. */}
+      <Popover.Root open={captureOpen} onOpenChange={setCaptureOpen}>
+        <Popover.Trigger asChild>
+          <button
+            className="group flex h-[19px] max-w-[320px] min-w-0 cursor-pointer items-center gap-1 rounded-full border border-[#303030] bg-[#0C0C0C] px-2 text-[11px] font-medium transition-colors hover:bg-[#1f1f1f]"
+            title={health?.summary ?? "Session capture"}
+          >
+            {orgName && (
+              <>
+                <span className="min-w-0 shrink truncate text-[var(--text-tertiary)]">
+                  {orgName}
+                </span>
+                <span className="shrink-0 text-[var(--text-tertiary)] opacity-50">/</span>
+              </>
+            )}
+            <span className="min-w-0 truncate text-[var(--text-secondary)] transition-colors group-hover:text-[var(--text-primary)]">
+              {name}
             </span>
-            <span className="shrink-0 text-[var(--text-tertiary)] opacity-50">/</span>
-          </>
+            {/* Only once capture is on. An always-present grey dot on every
+                project reads as a defect indicator rather than a state. */}
+            {binding?.enabled && <StatusDot binding={binding} health={health} />}
+          </button>
+        </Popover.Trigger>
+        {path && (
+          <Popover.Portal>
+            <Popover.Content
+              side="bottom"
+              align="start"
+              sideOffset={6}
+              className="z-[var(--z-max)] origin-[var(--radix-popover-content-transform-origin)] data-[state=closed]:animate-scale-out data-[state=open]:animate-scale-in"
+            >
+              <CapturePopover
+                projectPath={path}
+                health={health}
+                onChanged={readCapture}
+                onClose={() => setCaptureOpen(false)}
+              />
+            </Popover.Content>
+          </Popover.Portal>
         )}
-        <span className="min-w-0 truncate text-[var(--text-secondary)] transition-colors group-hover:text-[var(--text-primary)]">
-          {name}
-        </span>
-      </button>
+      </Popover.Root>
       {showTip && (
         <div className="pointer-events-none absolute left-1 top-full z-[var(--z-max)] mt-1.5 origin-top-left animate-scale-in">
           {/* `w-max` sizes the box to the path's intrinsic width (capped by
               max-w) — without it the absolutely-positioned box has no width to
               resolve against and `break-all` collapses it to one char per line. */}
           <div className="w-max max-w-[70vw] rounded-md border border-black/10 bg-white px-2 py-1 shadow-[var(--shadow-overlay)]">
-            {/* Re-keying on `copied` remounts the span, re-triggering the
-                fade-in so the text visibly animates over on copy. White-on-
-                black titlebar made the old black tooltip nearly invisible. */}
-            <span
-              key={copied ? "copied" : "path"}
-              className={cn(
-                "block animate-fade-in whitespace-nowrap font-mono text-[10px] leading-snug",
-                copied ? "text-[var(--status-success)]" : "text-black/80",
-              )}
-            >
-              {copied ? `Copied · ${path}` : path}
+            <span className="block animate-fade-in whitespace-nowrap font-mono text-[10px] leading-snug text-black/80">
+              {path}
             </span>
           </div>
         </div>

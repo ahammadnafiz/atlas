@@ -1,22 +1,24 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import * as Popover from "@radix-ui/react-popover";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { ChevronLeft, RefreshCw, Settings2 } from "lucide-react";
+import { Check, ChevronDown, ChevronLeft, RefreshCw } from "lucide-react";
 
-import { CapturePopover } from "@/features/capture/components/capture-popover";
-import type { Binding, CaptureHealth } from "@/features/capture/types";
-import { useProjectStore } from "@/features/project/stores/project-store";
-import { activeWorkspaceId } from "@/features/workspaces/lib/active-workspace";
+import { useOrgStore } from "@/features/organisations/stores/org-store";
+import { useWorkspaceStore } from "@/features/workspaces/stores/workspace-store";
 import { cn } from "@/lib/utils";
 
-import type { SessionDetail as Detail, SessionSummary } from "../types";
+import { useArtifactsStore } from "../stores/artifacts-store";
+
+/** Mirrors `BOARD_LIMIT` in `capture.rs` — how many rows one board read returns. */
+const BOARD_LIMIT = 500;
+import type { BoardSession, SessionDetail as Detail } from "../types";
 import { SessionDetail } from "./session-detail";
 import { SessionList } from "./session-list";
 
 /**
- * Atlas Artifacts — the Sessions a Workspace has recorded, and the timeline of
- * any one of them.
+ * Atlas Timeline — the Sessions every project in the Organisation has recorded,
+ * and the timeline of any one of them.
  *
  * List and detail live in one tab rather than two, because they are one task:
  * find the Session, read the Session.
@@ -39,62 +41,65 @@ import { SessionList } from "./session-list";
  */
 
 export function ArtifactsPanel() {
-  const currentProject = useProjectStore.use.currentProject();
-  const projectPath = currentProject?.path ?? null;
+  // Every project in the active Organisation, not just the open one: the board
+  // answers "what has been happening in our code", which does not stop at the
+  // folder that happens to be focused. Workspaces with no `orgId` are legacy
+  // entries and belong to the active org during the migration window.
+  const allWorkspaces = useWorkspaceStore.use.workspaces();
+  const activeOrganisationId = useOrgStore.use.activeOrganisationId();
+  const projects = useMemo(
+    () =>
+      allWorkspaces.filter((w) => w.orgId === activeOrganisationId || w.orgId == null),
+    [allWorkspaces, activeOrganisationId],
+  );
+  // A stable key, so the read effect does not re-fire on unrelated workspace
+  // mutations (a rename, a pin) that leave the set of paths unchanged.
+  const projectPaths = useMemo(
+    () => projects.map((w) => w.path).sort(),
+    [projects],
+  );
+  // Joined only for a cheap dependency comparison — never split back
+  // apart. `projectPaths` is already the array every caller wants, and a
+  // separator that can occur in a path would corrupt the round trip.
+  const projectsKey = projectPaths.join("\n");
 
-  const [sessions, setSessions] = useState<SessionSummary[]>([]);
+  const [sessions, setSessions] = useState<BoardSession[]>([]);
   /** `undefined` while a detail read is in flight; `null` when not found. */
   const [detail, setDetail] = useState<Detail | null | undefined>(undefined);
-  const [openId, setOpenId] = useState<string | null>(null);
-  const [binding, setBinding] = useState<Binding | null>(null);
-  const [health, setHealth] = useState<CaptureHealth | null>(null);
-  /** True once the first list read for the current Workspace has landed. */
+  // Held in the store, not here: this panel unmounts on every tab switch, and
+  // neither the open Session nor the filter may be lost to that.
+  const open = useArtifactsStore.use.open();
+  const projectFilter = useArtifactsStore.use.projectFilter();
+  const { openSession, setProjectFilter } = useArtifactsStore.use.actions();
+  /** True once the first board read has landed. */
   const [loaded, setLoaded] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [settingsOpen, setSettingsOpen] = useState(false);
 
   /** Monotonic read sequence — only the newest read may write list state. */
   const listSeq = useRef(0);
   /** Same, for the detail read. */
   const detailSeq = useRef(0);
 
-  // A Workspace switch invalidates everything read for the previous one,
-  // including the open Session — its id means nothing in the new store.
-  // Declared before the read effects so the bump lands first.
+  // A filter naming a project that is no longer open would hide everything with
+  // no way back, so it is dropped rather than left dangling.
   useEffect(() => {
-    listSeq.current += 1;
-    detailSeq.current += 1;
-    setSessions([]);
-    setBinding(null);
-    setHealth(null);
-    setOpenId(null);
-    setDetail(undefined);
-    setLoaded(false);
-    setRefreshing(false);
-    setError(null);
-  }, [projectPath]);
+    if (projectFilter && !projectPaths.includes(projectFilter)) setProjectFilter(null);
+  }, [projectFilter, projectPaths, setProjectFilter]);
 
   const refresh = useCallback(async () => {
-    if (!projectPath) return;
     const seq = ++listSeq.current;
     setRefreshing(true);
     try {
-      const [rows, current, state] = await Promise.all([
-        invoke<SessionSummary[]>("artifacts_sessions", { projectPath }),
-        invoke<Binding | null>("capture_binding", { projectPath }),
-        // The watcher registry is keyed by the workspace UUID the frontend
-        // started it under; omitting it made liveness look up a path in a
-        // UUID map and report a dead watcher forever.
-        invoke<CaptureHealth>("capture_health", {
-          projectPath,
-          workspaceId: activeWorkspaceId(),
-        }),
-      ]);
+      // Filtering narrows the *query*, not the result. The board caps how many
+      // rows it returns, so filtering afterwards would show only this project's
+      // share of the newest few hundred; asking for one project reads its
+      // history whole.
+      const rows = await invoke<BoardSession[]>("artifacts_board", {
+        projects: projectFilter ? [projectFilter] : projectPaths,
+      });
       if (seq !== listSeq.current) return; // a newer read owns the state now
       setSessions(rows);
-      setBinding(current);
-      setHealth(state);
       setError(null);
       setLoaded(true);
     } catch (e) {
@@ -102,7 +107,9 @@ export function ArtifactsPanel() {
     } finally {
       if (seq === listSeq.current) setRefreshing(false);
     }
-  }, [projectPath]);
+    // `projectsKey` stands in for `projectPaths`: same content, stable identity.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [projectsKey, projectFilter]);
 
   useEffect(() => {
     void refresh();
@@ -112,11 +119,10 @@ export function ArtifactsPanel() {
   // capture writes (turn finished, import progressed, drain sent rows) that
   // move no git ref and therefore emit no event.
   useEffect(() => {
-    if (!projectPath) return;
-    const unlisten = listen<{ project?: string }>("atlas:git-changed", (event) => {
-      if (!event.payload.project || event.payload.project === projectPath) {
-        void refresh();
-      }
+    // Any project's commit can add a Checkpoint to this board, so unlike the
+    // project-scoped view this no longer filters the event by path.
+    const unlisten = listen("atlas:git-changed", () => {
+      void refresh();
     });
     const timer = setInterval(() => {
       if (document.visibilityState === "visible") void refresh();
@@ -130,15 +136,20 @@ export function ArtifactsPanel() {
       clearInterval(timer);
       document.removeEventListener("visibilitychange", onVisibility);
     };
-  }, [projectPath, refresh]);
+  }, [refresh]);
 
   // Opening a Session reads its full timeline; the list row does not carry it.
+  // The read goes to the store of the project the row came from, which is not
+  // necessarily the Workspace currently open.
   const readDetail = useCallback(
     (showLoading: boolean) => {
-      if (!projectPath || !openId) return;
+      if (!open) return;
       const seq = ++detailSeq.current;
       if (showLoading) setDetail(undefined);
-      invoke<Detail | null>("artifacts_session", { projectPath, sessionId: openId })
+      invoke<Detail | null>("artifacts_session", {
+        projectPath: open.projectPath,
+        sessionId: open.sessionId,
+      })
         .then((result) => {
           if (seq === detailSeq.current) setDetail(result);
         })
@@ -149,50 +160,60 @@ export function ArtifactsPanel() {
           }
         });
     },
-    [projectPath, openId],
+    [open],
   );
 
   useEffect(() => {
-    if (!openId) {
+    if (!open) {
       detailSeq.current += 1;
       setDetail(undefined);
       return;
     }
     readDetail(true);
-  }, [openId, readDetail]);
+  }, [open, readDetail]);
 
   // A live Session keeps growing while it is open — piggyback the detail
   // re-read on the same signals that refresh the list, without flashing the
   // loading state over content that is already on screen.
   useEffect(() => {
-    if (openId && loaded) readDetail(false);
+    if (open && loaded) readDetail(false);
     // `sessions` is the freshest signal that a background refresh landed.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessions]);
 
-  if (!projectPath) {
-    return <Centered>Open a Workspace to see the sessions captured in it.</Centered>;
-  }
+  // Every project in the Organisation, not only those with rows on screen: the
+  // board is capped, so a quiet project can be missing from the current page
+  // and still be the one worth narrowing to.
+  const filterable = useMemo(
+    () => projects.map((w) => ({ path: w.path, name: w.name })),
+    [projects],
+  );
+
+  /** The cap was reached, so there is older history the board is not showing. */
+  const capped = !projectFilter && sessions.length >= BOARD_LIMIT;
 
   return (
     <div className="flex h-full min-h-0 flex-col bg-[var(--bg-surface)]">
       <header className="flex h-[38px] shrink-0 items-center gap-2 border-b border-[var(--border-default)] px-4">
-        {openId ? (
+        {open ? (
           <button
             type="button"
-            onClick={() => setOpenId(null)}
+            onClick={() => openSession(null)}
             className="-ml-1 flex items-center gap-1 rounded px-1.5 py-1 text-[12px] text-[var(--text-secondary)] transition-colors duration-150 hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)] focus-visible:ring-1 focus-visible:ring-[var(--border-focus)] active:scale-[0.97]"
           >
             <ChevronLeft size={13} />
-            Sessions
+            Timeline
           </button>
         ) : (
           <>
-            <span className="truncate text-[12px] text-[var(--text-secondary)]">
-              {currentProject?.name ?? projectPath.split("/").pop()}
-            </span>
-            <span className="text-[var(--text-ghost)]">/</span>
-            <span className="text-[12px] font-medium text-[var(--text-primary)]">Sessions</span>
+            <span className="text-[12px] font-medium text-[var(--text-primary)]">Timeline</span>
+            {filterable.length > 0 && (
+              <ProjectFilter
+                projects={filterable}
+                value={projectFilter}
+                onChange={setProjectFilter}
+              />
+            )}
           </>
         )}
 
@@ -200,45 +221,12 @@ export function ArtifactsPanel() {
           <button
             type="button"
             onClick={() => void refresh()}
-            aria-label="Reload sessions"
-            title="Reload sessions"
+            aria-label="Reload timeline"
+            title="Reload timeline"
             className="rounded p-1.5 text-[var(--text-tertiary)] transition-colors duration-150 hover:bg-[var(--bg-hover)] hover:text-[var(--text-secondary)] focus-visible:ring-1 focus-visible:ring-[var(--border-focus)] active:scale-[0.94]"
           >
             <RefreshCw size={12} className={cn(refreshing && "animate-spin")} />
           </button>
-
-          <Popover.Root open={settingsOpen} onOpenChange={setSettingsOpen}>
-            <Popover.Trigger asChild>
-              <button
-                type="button"
-                title={health?.summary ?? "Session capture"}
-                className="flex max-w-[280px] items-center gap-1.5 rounded px-2 py-1 text-[11px] text-[var(--text-secondary)] transition-colors duration-150 hover:bg-[var(--bg-hover)] focus-visible:ring-1 focus-visible:ring-[var(--border-focus)] active:scale-[0.97]"
-              >
-                <StatusDot binding={binding} health={health} />
-                <span className="truncate">{statusLabel(binding, health)}</span>
-                <Settings2 size={12} className="shrink-0 text-[var(--text-tertiary)]" />
-              </button>
-            </Popover.Trigger>
-            <Popover.Portal>
-              {/* `--z-max`, matching every other portal in the app — `z-50`
-               *  rendered beneath the sidebar's `z-[60]` once already. The
-               *  scale-in is anchored to the trigger via Radix's transform
-               *  origin, and the global reduced-motion rule neutralises it. */}
-              <Popover.Content
-                side="bottom"
-                align="end"
-                sideOffset={6}
-                className="z-[var(--z-max)] origin-[var(--radix-popover-content-transform-origin)] data-[state=closed]:animate-scale-out data-[state=open]:animate-scale-in"
-              >
-                <CapturePopover
-                  projectPath={projectPath}
-                  health={health}
-                  onChanged={() => void refresh()}
-                  onClose={() => setSettingsOpen(false)}
-                />
-              </Popover.Content>
-            </Popover.Portal>
-          </Popover.Root>
         </div>
       </header>
 
@@ -249,21 +237,91 @@ export function ArtifactsPanel() {
       )}
 
       <div className="min-h-0 flex-1">
-        {openId ? (
+        {open ? (
           detail === undefined ? (
             <Centered>Reading the session…</Centered>
           ) : detail === null ? (
-            <NotFound onBack={() => setOpenId(null)} />
+            <NotFound onBack={() => openSession(null)} />
           ) : (
-            <SessionDetail detail={detail} projectPath={projectPath} />
+            <SessionDetail detail={detail} projectPath={open.projectPath} />
           )
-        ) : loaded && !binding && sessions.length === 0 ? (
-          <NotEnabled onOpenSettings={() => setSettingsOpen(true)} />
+        ) : loaded && sessions.length === 0 ? (
+          <NotEnabled />
         ) : (
-          <SessionList sessions={sessions} loading={!loaded} onOpen={setOpenId} />
+          <div className="flex h-full min-h-0 flex-col">
+            <div className="min-h-0 flex-1">
+              <SessionList
+                sessions={sessions}
+                loading={!loaded}
+                onOpen={(sessionId, projectPath) => openSession({ sessionId, projectPath })}
+              />
+            </div>
+            {/* Say what is being left out. A board that silently stops at the
+             *  newest few hundred reads as "this is everything". */}
+            {capped && (
+              <p className="shrink-0 border-t border-[var(--border-subtle)] px-4 py-1.5 text-[11px] text-[var(--text-tertiary)]">
+                Showing the newest {BOARD_LIMIT} sessions — filter by project to see a
+                project&apos;s full history.
+              </p>
+            )}
+          </div>
         )}
       </div>
     </div>
+  );
+}
+
+/** Narrow the board to one project. Absent until something has been captured. */
+function ProjectFilter({
+  projects,
+  value,
+  onChange,
+}: {
+  projects: { path: string; name: string }[];
+  value: string | null;
+  onChange: (path: string | null) => void;
+}) {
+  const active = projects.find((p) => p.path === value);
+  return (
+    <Popover.Root>
+      <Popover.Trigger asChild>
+        <button
+          type="button"
+          title="Filter by project"
+          className="flex items-center gap-1 rounded px-1.5 py-1 text-[11px] text-[var(--text-secondary)] transition-colors duration-150 hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)] focus-visible:ring-1 focus-visible:ring-[var(--border-focus)]"
+        >
+          <span className="text-[var(--text-ghost)]">/</span>
+          {active?.name ?? "All projects"}
+          <ChevronDown size={11} className="text-[var(--text-tertiary)]" />
+        </button>
+      </Popover.Trigger>
+      <Popover.Portal>
+        <Popover.Content
+          side="bottom"
+          align="start"
+          sideOffset={6}
+          className="z-[var(--z-max)] min-w-[180px] origin-[var(--radix-popover-content-transform-origin)] rounded-lg border border-[var(--border-default)] bg-[var(--bg-elevated)] p-1 shadow-[var(--shadow-overlay)] data-[state=closed]:animate-scale-out data-[state=open]:animate-scale-in"
+        >
+          {[{ path: null, name: "All projects" }, ...projects].map((p) => (
+            <Popover.Close asChild key={p.path ?? "all"}>
+              <button
+                type="button"
+                onClick={() => onChange(p.path)}
+                className={cn(
+                  "flex w-full items-center justify-between rounded px-2 py-1 text-left text-[11px] transition-colors duration-150 hover:bg-[var(--bg-hover)]",
+                  (p.path ?? null) === value
+                    ? "text-[var(--text-primary)]"
+                    : "text-[var(--text-secondary)]",
+                )}
+              >
+                {p.name}
+                {(p.path ?? null) === value && <Check size={11} />}
+              </button>
+            </Popover.Close>
+          ))}
+        </Popover.Content>
+      </Popover.Portal>
+    </Popover.Root>
   );
 }
 
@@ -274,23 +332,23 @@ export function ArtifactsPanel() {
  * every Workspace, and the only useful thing to say about it is what turning it
  * on would give you.
  */
-function NotEnabled({ onOpenSettings }: { onOpenSettings: () => void }) {
+function NotEnabled() {
   return (
     <div className="flex h-full flex-col items-center justify-center px-8 text-center">
       <h2 className="text-[14px] font-medium text-[var(--text-primary)]">
-        Session capture is off for this Workspace
+        Nothing captured yet
       </h2>
       <p className="mt-1.5 max-w-[420px] text-[12px] leading-relaxed text-[var(--text-tertiary)]">
-        Turn it on and Atlas records what you asked, what the agent did, and which commits came
-        out of it — stored on this machine, with secrets scrubbed before anything is written.
+        Turn capture on for a project and Atlas records what you asked, what the agent did, and
+        which commits came out of it — stored on this machine, with secrets scrubbed before
+        anything is written.
       </p>
-      <button
-        type="button"
-        onClick={onOpenSettings}
-        className="mt-4 rounded bg-[var(--accent-primary)] px-3 py-1.5 text-[12px] font-medium text-[var(--text-inverse)] transition-transform duration-150 hover:bg-[var(--accent-primary-hover)] focus-visible:ring-1 focus-visible:ring-[var(--border-focus)] active:scale-[0.97]"
-      >
-        Turn on session capture
-      </button>
+      {/* The control is deliberately not repeated here. Capture is per project
+       *  and this board spans all of them, so the honest place to switch it on
+       *  is the project pill in the titlebar, which names the one it applies to. */}
+      <p className="mt-3 max-w-[420px] text-[11px] text-[var(--text-ghost)]">
+        Click the project name in the titlebar to turn it on.
+      </p>
     </div>
   );
 }
@@ -310,44 +368,6 @@ function NotFound({ onBack }: { onBack: () => void }) {
       </button>
     </div>
   );
-}
-
-function StatusDot({
-  binding,
-  health,
-}: {
-  binding: Binding | null;
-  health: CaptureHealth | null;
-}) {
-  const tone =
-    health?.state === "stopped"
-      ? "bg-[var(--status-error)]"
-      : health?.state === "degraded"
-        ? "bg-[var(--status-warning)]"
-        : binding?.enabled
-          ? "bg-[var(--status-info)]"
-          : "bg-[var(--text-ghost)]";
-  return <span className={cn("size-1.5 shrink-0 rounded-full", tone)} />;
-}
-
-/**
- * The header's one line of capture truth.
- *
- * Stopped and degraded are different sentences, not different dot colours:
- * "capture stopped" means data is being lost now, "needs review" means work
- * continues. The degraded label is `health.summary` because the backend already
- * formats the count and reason better than a recomputation here would.
- */
-function statusLabel(binding: Binding | null, health: CaptureHealth | null): string {
-  if (health?.state === "stopped") return "Capture stopped";
-  if (health?.state === "degraded") return health.summary || "Needs review";
-  if (!binding) return "Off";
-  if (!binding.enabled) return "Paused";
-  if (binding.mode === "cloud" && !binding.importApproved) return "Cloud · import waiting";
-  const mode = binding.mode === "cloud" ? "Cloud" : "Local";
-  const pending = health?.pendingRows ?? 0;
-  if (pending > 0) return `${mode} · ${pending} pending`;
-  return `Capturing · ${mode}`;
 }
 
 function Centered({ children }: { children: React.ReactNode }) {

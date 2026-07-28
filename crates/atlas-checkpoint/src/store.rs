@@ -13,6 +13,7 @@
 //! * **One turn is one transaction.** A crash mid-write rolls back to the last
 //!   completed turn rather than leaving a torn record that reads as finished.
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -569,6 +570,40 @@ impl Store {
             [session_id],
             |row| row.get(0),
         )?)
+    }
+
+    /// Message totals for every Session in a Workspace, as `session_id -> n`.
+    ///
+    /// The list view needs one of these per row. Asking per Session made the
+    /// read cost `3n + 1` queries, which is invisible at one Workspace and the
+    /// dominant cost once the board spans every project in an Organisation.
+    /// One `GROUP BY` over the same covering index answers all of them.
+    pub fn message_counts(&self, workspace_id: &str) -> Result<HashMap<String, i64>> {
+        self.counts_by_session("agent_message", workspace_id)
+    }
+
+    /// Tool-call totals for every Session in a Workspace. See [`Self::message_counts`].
+    pub fn tool_call_counts_by_session(
+        &self,
+        workspace_id: &str,
+    ) -> Result<HashMap<String, i64>> {
+        self.counts_by_session("tool_call", workspace_id)
+    }
+
+    /// `session_id -> COUNT(*)` for one child table, scoped to a Workspace.
+    ///
+    /// `table` is a hardcoded literal at both call sites, never user input.
+    fn counts_by_session(&self, table: &str, workspace_id: &str) -> Result<HashMap<String, i64>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT c.session_id, COUNT(*) FROM {table} c
+               JOIN agent_session s ON s.id = c.session_id
+              WHERE s.workspace_id = ?1
+              GROUP BY c.session_id"
+        ))?;
+        let rows = stmt.query_map([workspace_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<HashMap<_, _>>>()?)
     }
 
     /// How many tool calls a Session holds. Index-only.
