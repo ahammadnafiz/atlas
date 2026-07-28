@@ -74,7 +74,19 @@ export function AppLayout() {
        * place from an in-RAM snapshot (see workspace-snapshot.ts), so the shell
        * stays mounted and switching is near-instant.
        */}
-      <div className="flex flex-col flex-1 min-h-0">
+      {/* `min-w-0` is load-bearing, not decoration. This column is a flex item
+          of the row above, so without it its automatic minimum size is its
+          MIN-CONTENT width — and min-content propagates up from the deepest
+          `whitespace-nowrap` text in any panel (e.g. a 400-char commit subject
+          in the git History list). The column then grows PAST the window,
+          `PanelGroup`'s `width: 100%` resolves against that inflated width, and
+          every panel scales with it: the left panel balloons and the right
+          panel is pushed off-screen entirely. `overflow: hidden` on the panels
+          does NOT prevent this — it stops a panel's USED size being overridden
+          by its content, but the content still contributes to the group's
+          intrinsic width. Capping the column here is what keeps the shell
+          inside the window no matter what any panel renders. */}
+      <div className="flex flex-col flex-1 min-h-0 min-w-0">
         <Titlebar />
 
         <div className="flex-1 min-h-0">
