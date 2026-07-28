@@ -108,8 +108,9 @@ function ensureGitStatusFreshListener(): void {
 
   // Live updates from the git watcher — commit / checkout / branch / fetch /
   // stage / push all fire `atlas:git-changed`. Refresh status, the rich
-  // branch list, diff and in-progress state. Stashes/remotes/tags change
-  // rarely and are loaded on demand (mount + the action that mutates them).
+  // branch list, the log, diff and in-progress state. Stashes/remotes/tags
+  // change rarely and are loaded on demand (mount + the action that mutates
+  // them).
   void listen<{ project: string }>("atlas:git-changed", (e) => {
     const current = useGitStore.getState().repoPath;
     if (!current || current !== e.payload.project) return;
@@ -119,6 +120,14 @@ function ensureGitStatusFreshListener(): void {
     void actions.refreshStatusNow(current).catch(() => {});
     void actions.listBranches().catch(() => {});
     void actions.loadBranchesFull().catch(() => {});
+    // The log MUST refresh here. Every action that rewrites history —
+    // commit, reset, revert, cherry-pick, merge, pull — mutates `.git/refs`
+    // and so lands on this event, and none of them reload the log
+    // themselves. Without this the History list only ever loads on mount,
+    // so a commit made while the user is watching it (by an agent, the
+    // terminal, or History's own revert/reset buttons) leaves a list that
+    // silently describes a repo state that no longer exists.
+    void actions.loadLog(current).catch(() => {});
     void actions.loadDiff().catch(() => {});
     void actions.loadInProgress().catch(() => {});
   });
