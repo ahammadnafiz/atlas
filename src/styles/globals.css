@@ -309,7 +309,7 @@
   }
 
   ::selection {
-    background: var(--accent-primary-muted);
+    background: var(--selection-bg);
     color: var(--text-primary);
   }
 
@@ -544,6 +544,23 @@
   animation: fade-in 200ms ease-out both;
 }
 
+/* Feedback panel enter — grows out of its bottom-right anchor (the status-bar
+   button) rather than dropping in from nowhere.
+
+   Deliberately NO fill-mode: the end state is the untransformed box, so once
+   this finishes no transform lingers. That matters because the same element
+   carries `backdrop-filter` — a persistent transform (or `will-change`) would
+   isolate its compositing layer and flatten the blur to plain transparency.
+   See the note in app-layout.tsx. */
+@keyframes atlas-panel-in-br {
+  from { opacity: 0; transform: translate3d(6px, 10px, 0) scale(0.965); }
+  to   { opacity: 1; transform: translate3d(0, 0, 0) scale(1); }
+}
+.atlas-panel-in-br {
+  transform-origin: 100% 100%;
+  animation: atlas-panel-in-br 200ms cubic-bezier(0.32, 0.72, 0, 1);
+}
+
 /* Brief highlight when jumping to a message (Cmd+F / links panel). */
 @keyframes atlas-jump-flash-kf {
   0%   { background-color: var(--accent-primary); opacity: 0.14; }
@@ -583,6 +600,7 @@
 @media (prefers-reduced-motion: reduce) {
   .atlas-stream-caret { animation: none; }
   .atlas-pill-in,
+  .atlas-panel-in-br,
   .atlas-fade-in { animation: none; }
   .animate-scale-in,
   .animate-fade-in,

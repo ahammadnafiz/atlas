@@ -12,6 +12,37 @@
 import { create } from "zustand";
 import { createSelectors } from "@/lib/create-selectors";
 import { auth, type AuthSnapshot } from "../lib/auth-api";
+import {
+  identify as identifyTelemetry,
+  resetIdentity as resetTelemetryIdentity,
+} from "@/features/telemetry/posthog-client";
+
+/**
+ * Keep the renderer's crash-reporting identity in step with the account.
+ *
+ * Rust does the same for product events off its own auth funnel; posthog-js
+ * holds a separate distinct id in localStorage, so it has to be told here. Done
+ * inside `setSnapshot` because that is the store's single write path — every
+ * transition, including the launch restore, passes through it exactly once.
+ *
+ * `connecting`, and `signed-in` before the profile lands, are deliberately left
+ * alone: the next snapshot carries the user, and resetting in that gap would
+ * bounce attribution back to the device for no reason.
+ */
+function syncTelemetryIdentity(snapshot: AuthSnapshot): void {
+  if (snapshot.status === "signed-out") {
+    resetTelemetryIdentity();
+    return;
+  }
+  if (snapshot.status === "signed-in" && snapshot.user) {
+    identifyTelemetry({
+      distinctId: snapshot.user.id,
+      email: snapshot.user.email,
+      name: snapshot.user.name,
+      orgId: snapshot.activeOrgId ?? null,
+    });
+  }
+}
 
 interface AuthStoreState {
   snapshot: AuthSnapshot;
@@ -49,14 +80,16 @@ const useAuthStoreBase = create<AuthStoreState>()((set, get) => ({
   starting: false,
 
   actions: {
-    setSnapshot: (snapshot) =>
+    setSnapshot: (snapshot) => {
+      syncTelemetryIdentity(snapshot);
       set((s) => ({
         snapshot,
         starting: false,
         // Signing in is the end of the flow — close the dialog for them.
         dialogOpen: snapshot.status === "connecting" ? s.dialogOpen : false,
         error: snapshot.status === "signed-in" ? null : s.error,
-      })),
+      }));
+    },
 
     setError: (message) => set({ error: message, starting: false }),
 

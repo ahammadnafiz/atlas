@@ -213,7 +213,7 @@ App layer: `src-tauri/src/commands/memory_indexer.rs` (registry + indexer + watc
   gates, consolidation, global promotion). Model-dependent tests skip cleanly unless
   `ATLAS_MINILM_DIR` is set.
 - **Live 3-agent validation** (needs the running app + a BYOK key + the MiniLM model):
-  launch `ATLAS_NATIVE_EXTRACTION=1 npm run dev:app`, drive a tool-heavy session
+  launch `ATLAS_NATIVE_EXTRACTION=1 bun run dev:app`, drive a tool-heavy session
   (to clear the extraction gates), then confirm `extracted/*.md` appears and a fresh
   session recalls the planted facts. Full steps in [`MIGRATION.md`](./MIGRATION.md).
 

@@ -16,7 +16,7 @@ import {
 import { invoke } from "@tauri-apps/api/core";
 import { useChatStore } from "../stores/chat-store";
 import { agents } from "../lib/agents-api";
-import { CLAUDE_PERMISSION_MODE_LABEL, AGENT_LABEL, type SwitchableAgent } from "@/types/agent";
+import { CLAUDE_PERMISSION_MODE_LABEL, AGENT_LABEL, agentTypeFromPluginId, type SwitchableAgent } from "@/types/agent";
 import { AgentMark } from "@/components/agent-mark";
 import { ProviderModelPills } from "./provider-model-pills";
 import { loadCerseiEffort, loadCerseiCompress } from "../lib/cersei-model-pref";
@@ -53,6 +53,7 @@ import type { ImageAttachment } from "@/types/agents";
 import type {
   MentionFile,
   MentionSkill,
+  MentionWorkspace,
   MentionRepo,
   MentionPastSession,
   PastSessionRef,
@@ -560,7 +561,12 @@ export function MessageInput({
       try {
         const snap = await agents.snapshot({ agent_id, session_id });
         if (!cancelled && snap.available_modes.length > 0) {
-          setAcpModes(tabId, snap.current_mode, snap.available_modes);
+          setAcpModes(
+            tabId,
+            snap.current_mode,
+            snap.available_modes,
+            agentTypeFromPluginId(snap.plugin_id)
+          );
         }
       } catch (err) {
         console.warn("seed ACP modes (composer self-heal) failed:", err);
@@ -895,6 +901,11 @@ export function MessageInput({
 
   const handlePickSkill = useCallback((skill: MentionSkill) => {
     inputRef.current?.insertMention(skill);
+    requestAnimationFrame(() => inputRef.current?.focus());
+  }, []);
+
+  const handlePickWorkspace = useCallback((workspace: MentionWorkspace) => {
+    inputRef.current?.insertMention(workspace);
     requestAnimationFrame(() => inputRef.current?.focus());
   }, []);
 
@@ -1467,6 +1478,7 @@ export function MessageInput({
                 onPickSkill={handlePickSkill}
                 onCloneRepo={(repo) => void handleCloneRepo(repo)}
                 onPickSession={handlePickSession}
+                onPickWorkspace={handlePickWorkspace}
                 currentAgent={switchableAgent}
                 onSwitchAgent={handleSwitchAgent}
               />

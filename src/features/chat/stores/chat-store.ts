@@ -9,6 +9,7 @@ import type {
   MessageRole,
   ClaudePermissionMode,
   SwitchableAgent,
+  AgentType,
 } from "@/types/agent";
 import { CLAUDE_PERMISSION_MODES } from "@/types/agent";
 import type { PendingPermission } from "@/types/acp";
@@ -140,6 +141,11 @@ function pushPermissionModeToAgent(state: ChatState, sessionId: string): void {
 function pushAcpModeToAgent(state: ChatState, sessionId: string): void {
   const session = state.sessions[sessionId];
   if (!session?.acpAgentId || !session.acpSessionId || !session.acpCurrentMode) return;
+  // Only push ids this session's agent actually advertised. A mode carried over
+  // from another agent is rejected (`invalidParams`), and the actor rolls its
+  // optimistic flip back — which reads as a picker that silently does nothing.
+  const modes = session.acpAvailableModes ?? [];
+  if (modes.length > 0 && !modes.some((m) => m.id === session.acpCurrentMode)) return;
   void invoke("agents_set_mode", {
     key: { agent_id: session.acpAgentId, session_id: session.acpSessionId },
     modeId: session.acpCurrentMode,
@@ -275,6 +281,9 @@ interface ChatActions {
     setDisconnected: (sessionId: string, on: boolean) => void;
     setSessionTitle: (sessionId: string, title: string) => void;
     setTranscriptLoading: (sessionId: string, loading: boolean) => void;
+    /** Mark a resumed session as bound-but-not-yet-loaded. See
+     *  `ChatSession.resumePending` — gates sending, not reading. */
+    setResumePending: (sessionId: string, pending: boolean) => void;
     clearSession: (sessionId: string) => void;
     removeSession: (sessionId: string) => void;
     /** Drop several sessions at once (used when a workspace is DISCARDED from
@@ -294,7 +303,11 @@ interface ChatActions {
     setAcpModes: (
       sessionId: string,
       currentMode: string | null,
-      availableModes: SessionModeInfo[]
+      availableModes: SessionModeInfo[],
+      /** Agent the snapshot came from (`agentTypeFromPluginId(snap.plugin_id)`).
+       *  When it disagrees with the tab's current agent the seed is stale and is
+       *  dropped — see the action for the cross-agent bug that motivated it. */
+      sourceAgentType?: AgentType
     ) => void;
     /** Pick a generic ACP session mode and push it to the bound agent.
      *  The Codex equivalent of `setClaudePermissionMode`. */
@@ -769,6 +782,11 @@ export const useChatStore = createSelectors(
             const session = s.sessions[sessionId];
             if (session) session.transcriptLoading = loading;
           }),
+        setResumePending: (sessionId, pending) =>
+          set((s) => {
+            const session = s.sessions[sessionId];
+            if (session) session.resumePending = pending;
+          }),
         clearSession: (sessionId) =>
           set((s) => {
             const session = s.sessions[sessionId];
@@ -787,6 +805,14 @@ export const useChatStore = createSelectors(
               session.currentTurnSeq = 0;
               session.livePlan = undefined;
               session.turnScratch = undefined;
+              // The tab no longer points at the session being resumed, so the
+              // send gate must drop with it. A resume that gets superseded
+              // (New chat / another sidebar click) bails WITHOUT clearing its own
+              // flag — deliberately, so it can't un-gate the resume that replaced
+              // it — which makes this the single place the flag is guaranteed to
+              // reset. Leaving it set would silently queue every future send in
+              // this tab forever.
+              session.resumePending = false;
             }
             delete s.queues[sessionId];
           }),
@@ -809,7 +835,18 @@ export const useChatStore = createSelectors(
           });
           pushPermissionModeToAgent(get(), sessionId);
         },
-        setAcpModes: (sessionId, currentMode, availableModes) => {
+        setAcpModes: (sessionId, currentMode, availableModes, sourceAgentType) => {
+          const at = get().sessions[sessionId]?.agentType;
+          // Modes are per-agent, and a snapshot can outlive the binding it came
+          // from: `setSessionAgentType` relabels a tab WITHOUT clearing its ACP
+          // binding, so a snapshot fetched off the previous agent's still-bound
+          // session can land after the tab already says "codex". Applying it
+          // wrote Claude's modes into the Codex picker AND its cache, leaving
+          // Codex on a mode id it doesn't have — the pill fell back to "Mode"
+          // and every pick was rejected by the agent. Callers pass the agent the
+          // snapshot actually came from (its `plugin_id`); a mismatch is stale
+          // by definition, so drop it rather than reconcile it.
+          if (sourceAgentType && at && sourceAgentType !== at) return;
           set((s) => {
             const session = s.sessions[sessionId];
             if (!session) return;
@@ -817,13 +854,22 @@ export const useChatStore = createSelectors(
             // Don't clobber a user-driven mode the store already reflects when
             // the snapshot carries no current (null) — only seed when present.
             if (currentMode) session.acpCurrentMode = currentMode;
+            // Whatever we end up with must be one of THIS list's modes. An
+            // optimistically-seeded (cached) current that the live agent doesn't
+            // advertise is exactly how the picker got stuck showing "Mode":
+            // `find` misses, the label falls back, and nothing ever clears it.
+            if (
+              availableModes.length > 0 &&
+              !availableModes.some((m) => m.id === session.acpCurrentMode)
+            ) {
+              session.acpCurrentMode = currentMode ?? availableModes[0].id;
+            }
             // The real session has now confirmed its modes — drop the loading
             // state regardless of whether they matched the optimistic cache.
             if (availableModes.length > 0) session.acpModesPending = false;
           });
           // Persist the confirmed modes so the next switch to this agent is
           // instant. Done outside the immer pass (side effect, not state).
-          const at = get().sessions[sessionId]?.agentType;
           if (availableModes.length > 0 && at && at !== "claude-code") {
             saveCachedAcpModes(at, { currentMode: currentMode ?? null, availableModes });
           }

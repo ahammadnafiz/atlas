@@ -52,6 +52,7 @@ import { logEvent } from "@/features/log/lib/log";
 import { warmMarkdownWorker } from "@/lib/markdown-cache";
 import { useNotificationsStore } from "@/features/notifications/stores/notifications-store";
 import { NotificationPanel } from "@/features/notifications/components/notification-panel";
+import { FeedbackPanel } from "@/features/feedback/components/feedback-panel";
 import { UpdateAvailableModal } from "@/features/updater/components/update-available-modal";
 import { LoadingOrganisationOverlay } from "@/features/organisations/components/loading-organisation-overlay";
 import { useOrgStore } from "@/features/organisations/stores/org-store";
@@ -1263,6 +1264,7 @@ export function App() {
       <FilePicker open={filePickerOpen} onOpenChange={setFilePickerOpen} />
       <HintOverlay />
       <NotificationPanel />
+      <FeedbackPanel />
       <UpdateAvailableModal />
       <ConnectDialog />
       <LoadingOrganisationOverlay />

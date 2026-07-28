@@ -154,6 +154,37 @@ fn default_version() -> u32 {
     SCHEMA_VERSION
 }
 
+/// The slice of [`AppState`] the **frontend** is allowed to write.
+///
+/// Deliberately a distinct type. `save_app_state` used to take a whole
+/// `AppState` and do `*guard = payload`, so every Rust-owned field was silently
+/// destroyed by any settings change: the frontend's `buildAppStatePayload()`
+/// never sent `telemetryAnonId`, it deserialized to `None`, persisted as null,
+/// and the next launch minted a fresh id. One device became a new analytics
+/// person on every settings save.
+///
+/// Listing the frontend-owned fields here — rather than special-casing the one
+/// field that got bitten — means the next Rust-owned field added to `AppState`
+/// is safe by construction instead of by remembering.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppStatePatch {
+    #[serde(default)]
+    pub recent_projects: Vec<RecentProject>,
+    #[serde(default)]
+    pub workspaces: Vec<Workspace>,
+    #[serde(default)]
+    pub groups: Vec<WorkspaceGroup>,
+    #[serde(default)]
+    pub active_workspace_id: Option<String>,
+    #[serde(default)]
+    pub organisations: Vec<Organisation>,
+    #[serde(default)]
+    pub active_organisation_id: Option<String>,
+    #[serde(default)]
+    pub settings: AppSettings,
+}
+
 impl Default for AppState {
     fn default() -> Self {
         Self {
@@ -314,6 +345,14 @@ pub struct AppSettings {
     /// See `crate::telemetry`.
     #[serde(default = "default_true")]
     pub share_telemetry: bool,
+    /// Attribute telemetry to the signed-in Atlas account (PostHog `$identify`),
+    /// rather than keeping it on the anonymous per-device person. Default **ON**,
+    /// and irrelevant while signed out or while `share_telemetry` is off — both
+    /// gate this. Turning it off calls `reset_identity`, so subsequent events go
+    /// back to the device person; it does not un-merge what PostHog has already
+    /// attributed. See `crate::telemetry`.
+    #[serde(default = "default_true")]
+    pub link_telemetry_to_account: bool,
     /// Selected on-device **embedding** model id (== its dir name under
     /// `app_data/models/`). Drives `memory_graph::model_dir` and every embedding
     /// consumer via the shared provider. Switching it wipes + rebuilds the
@@ -388,6 +427,7 @@ impl Default for AppSettings {
             show_hidden_files: true,
             ui_scale: default_ui_scale(),
             share_telemetry: true,
+            link_telemetry_to_account: true,
             embedding_model_id: default_embedding_model(),
             llm_model_id: default_llm_model(),
             code_editor_theme: default_code_editor_theme(),
@@ -403,6 +443,26 @@ impl Default for AppSettings {
 pub type AppStateHandle = Arc<Mutex<AppState>>;
 
 impl AppState {
+    /// Apply a frontend save, preserving every Rust-owned field.
+    ///
+    /// The counterpart to [`AppStatePatch`]: what is absent from the patch is
+    /// absent because Rust owns it, and stays untouched here.
+    pub fn apply_patch(&mut self, p: AppStatePatch) {
+        // Legacy v1 field — the frontend already sends `null` and derives the
+        // current project from `active_workspace_id`. Never re-adopted.
+        self.current_project = None;
+        self.recent_projects = p.recent_projects;
+        self.workspaces = p.workspaces;
+        self.groups = p.groups;
+        self.active_workspace_id = p.active_workspace_id;
+        self.organisations = p.organisations;
+        self.active_organisation_id = p.active_organisation_id;
+        self.settings = p.settings;
+        self.version = SCHEMA_VERSION;
+        // `telemetry_anon_id` (and anything Rust adds later) is deliberately
+        // NOT assigned here. See the `AppStatePatch` doc.
+    }
+
     /// `<app_data_dir>/state.json`. Returns `None` if the data dir can't be
     /// resolved (no $HOME / no `APPDATA`, etc.) — caller falls back to
     /// `AppState::default()`.
@@ -445,5 +505,61 @@ impl AppState {
         std::fs::write(&tmp, raw)?;
         std::fs::rename(tmp, path)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Exactly the payload `buildAppStatePayload()` sends — note the absence of
+    /// `telemetryAnonId`, which is the whole point.
+    fn frontend_payload() -> AppStatePatch {
+        serde_json::from_value(serde_json::json!({
+            "currentProject": null,
+            "recentProjects": [],
+            "workspaces": [],
+            "groups": [],
+            "activeWorkspaceId": null,
+            "organisations": [],
+            "activeOrganisationId": null,
+            "settings": { "shareTelemetry": false },
+            "version": 3,
+        }))
+        .expect("frontend payload deserializes as a patch")
+    }
+
+    /// The regression test for the analytics bug: a settings save must not cost
+    /// the install its telemetry identity. Before `AppStatePatch`, `save_app_state`
+    /// did `*guard = payload` and this id became `None` on every settings change,
+    /// so the next launch minted a new PostHog person.
+    #[test]
+    fn apply_patch_preserves_telemetry_anon_id() {
+        let mut state = AppState {
+            telemetry_anon_id: Some("device-uuid".into()),
+            ..AppState::default()
+        };
+
+        state.apply_patch(frontend_payload());
+
+        assert_eq!(state.telemetry_anon_id.as_deref(), Some("device-uuid"));
+        // ...while the frontend-owned half really was applied.
+        assert!(!state.settings.share_telemetry);
+    }
+
+    /// A patch with unknown/extra keys (an older or newer frontend) still parses,
+    /// and absent keys fall back to their defaults rather than failing the save.
+    #[test]
+    fn patch_tolerates_partial_payloads() {
+        let patch: AppStatePatch =
+            serde_json::from_value(serde_json::json!({ "recentProjects": [] }))
+                .expect("partial payload");
+        let mut state = AppState {
+            telemetry_anon_id: Some("keep-me".into()),
+            ..AppState::default()
+        };
+        state.apply_patch(patch);
+        assert_eq!(state.telemetry_anon_id.as_deref(), Some("keep-me"));
+        assert_eq!(state.version, SCHEMA_VERSION);
     }
 }

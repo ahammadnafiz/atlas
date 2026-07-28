@@ -2,7 +2,7 @@
 // branch in `if (isDev) { … }` is dead-code-eliminated from production
 // bundles, so checks here cost zero runtime bytes.
 //
-// `npx tauri dev`        → vite dev server, DEV=true, PROD=false
+// `bunx tauri dev`       → vite dev server, DEV=true, PROD=false
 // `bun run build:app`    → vite production build, DEV=false, PROD=true
 //
 // The Rust side has the matching constant `cfg!(debug_assertions)`. The

@@ -7,13 +7,38 @@ import {
   useMemo,
   useCallback,
   useLayoutEffect,
+  type ReactNode,
 } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { Sparkles } from "lucide-react";
-import type { ChatMessage } from "@/types/agent";
+import type { ChatMessage, SwitchableAgent } from "@/types/agent";
+import { AGENT_LABEL } from "@/types/agent";
 import { MessageItem } from "./message-item";
+import { AgentIcons } from "@/components/agent-icons";
+import { AtlasIcon } from "@/components/atlas-icon";
 import { cn } from "@/lib/utils";
 import { warmMarkdownWorker } from "@/lib/markdown-cache";
+
+// The session's agent identity is fixed for the whole thread, so its avatar
+// glyph and label are resolved ONCE here (per agentType) and handed to every
+// row as referentially-stable props. Doing it inside MessageItem meant every
+// mounted row held its own chat-store subscription and re-derived the same
+// glyph — pure per-row cost in the scroll/stream hot path.
+const AGENT_AVATAR: Record<SwitchableAgent, ReactNode> = {
+  codex: <AgentIcons.Codex className="size-3.5 text-[var(--text-secondary)]" />,
+  cersei: <AtlasIcon size={14} />,
+  "claude-code": (
+    <AgentIcons.Claude className="size-3.5 text-[var(--text-secondary)]" />
+  ),
+};
+
+/** Narrow the tab's AgentType (which includes the "custom" catch-all) to the
+ *  three Atlas ships avatars/labels for. */
+function switchable(agentType: string | undefined): SwitchableAgent {
+  return agentType === "codex" || agentType === "cersei"
+    ? agentType
+    : "claude-code";
+}
 
 // Render a faint "· Xh ago ·" divider between turns separated by more
 // than this gap, so a long thread reads in sessions.
@@ -32,6 +57,9 @@ interface MessagesListProps {
   messages: ChatMessage[];
   roleFilter: "all" | "user" | "assistant";
   isStreaming: boolean;
+  /** The session's agent, passed down from ChatPanel (which already holds the
+   *  session) so neither this list nor any row needs its own store read. */
+  agentType?: string;
   /** Bubble up the "scrolled-up" state so the parent can render a
    *  centered scroll-to-bottom button alongside the Claude-setup pill. */
   onShowJumpChange?: (visible: boolean, newCount?: number) => void;
@@ -161,10 +189,18 @@ export const MessagesList = forwardRef<MessagesListHandle, MessagesListProps>(
       messages,
       roleFilter,
       isStreaming,
+      agentType,
       onShowJumpChange,
     },
     ref,
   ) {
+  // Resolved once per agent change, not once per row. Both values are stable
+  // references (the avatars are module constants, the label a constant string)
+  // so they never invalidate MessageItem's memo.
+  const agent = switchable(agentType);
+  const agentAvatar = AGENT_AVATAR[agent];
+  const agentLabel = AGENT_LABEL[agent];
+
   const streamingId =
     isStreaming && messages.length > 0 && messages[messages.length - 1].role === "assistant"
       ? messages[messages.length - 1].id
@@ -804,6 +840,8 @@ export const MessagesList = forwardRef<MessagesListHandle, MessagesListProps>(
                   <MessageItem
                     message={message}
                     tabId={tabId}
+                    agentAvatar={agentAvatar}
+                    agentLabel={agentLabel}
                     streaming={message.id === streamingId}
                     model={message.model ?? null}
                     timeGapAbove={timeGapAbove}

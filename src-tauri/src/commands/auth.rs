@@ -54,14 +54,67 @@ impl AuthState {
     }
 }
 
+/// The one funnel every auth transition passes through — including
+/// `restore_on_launch`'s initial emit and each revalidation callback. Telemetry
+/// identity is synced here rather than at the individual call sites precisely
+/// because of that: a signed-in relaunch is covered for free, and no future
+/// transition can forget to update who events are attributed to.
 fn broadcast(app: &AppHandle, snapshot: AuthSnapshot) {
+    sync_identity(app, &snapshot);
     let _ = app.emit("atlas:auth-changed", snapshot);
 }
 
-/// The anonymous account events (ATL-52). Both are no-ops unless the user has
-/// already opted into telemetry, and neither carries a user id, email, or
-/// Organisation id — see [`TelemetryClient::capture_signed_in`] for why the
-/// payload is defined there rather than here.
+/// Map an auth snapshot onto the telemetry identity.
+///
+/// Idempotent by construction — [`TelemetryClient::identify_account`] refreshes
+/// person properties without re-merging when the account is unchanged, which it
+/// has to be, since this runs on every revalidation.
+///
+/// `Connecting`, and `SignedIn` with no profile yet, deliberately leave identity
+/// alone: the next successful validation broadcasts a snapshot that has `user`,
+/// and resetting in the gap would bounce attribution back to the device for no
+/// reason.
+fn sync_identity(app: &AppHandle, snapshot: &AuthSnapshot) {
+    let tel = telemetry(app);
+    match snapshot {
+        AuthSnapshot::SignedIn {
+            user: Some(user),
+            orgs,
+            active_org_id,
+        } => {
+            // Honour the user's choice to keep analytics off their account.
+            if !app
+                .state::<crate::state::AppStateHandle>()
+                .lock()
+                .settings
+                .link_telemetry_to_account
+            {
+                tel.reset_identity();
+                return;
+            }
+            let active = active_org_id.as_ref().and_then(|id| {
+                orgs.as_ref()
+                    .and_then(|list| list.iter().find(|o| &o.id == id))
+            });
+            tel.identify_account(&crate::telemetry::AccountIdentity {
+                user_id: user.id.clone(),
+                email: user.email.clone(),
+                name: user.name.clone(),
+                org_id: active_org_id.clone(),
+                org_name: active.map(|o| o.name.clone()),
+                org_role: active
+                    .and_then(|o| o.role)
+                    .map(|r| format!("{r:?}").to_lowercase()),
+                org_count: orgs.as_ref().map(|v| v.len()).unwrap_or(0),
+            });
+        }
+        AuthSnapshot::SignedOut => tel.reset_identity(),
+        _ => {}
+    }
+}
+
+/// The managed telemetry client. Every capture through it is a no-op unless the
+/// user has opted in, so nothing here needs its own consent check.
 fn telemetry(app: &AppHandle) -> Arc<TelemetryClient> {
     Arc::clone(&app.state::<Arc<TelemetryClient>>())
 }
@@ -105,9 +158,19 @@ pub async fn auth_sign_in(
     tauri::async_runtime::spawn(async move {
         match core.run_grant(&grant).await {
             Ok(()) => {
-                broadcast(&task_app, core.snapshot());
+                let snap = core.snapshot();
+                // Broadcast first: it identifies, so `auth_signed_in` lands on
+                // the account person rather than the device one.
+                broadcast(&task_app, snap.clone());
                 raise(&task_app);
-                telemetry(&task_app).capture_signed_in();
+                let (org_count, has_active) = match &snap {
+                    AuthSnapshot::SignedIn { orgs, active_org_id, .. } => (
+                        orgs.as_ref().map(|v| v.len()).unwrap_or(0),
+                        active_org_id.is_some(),
+                    ),
+                    _ => (0, false),
+                };
+                telemetry(&task_app).capture_signed_in(org_count, has_active);
             }
             // Cancellation is a deliberate user action; it needs no error toast.
             Err(GrantError::Cancelled) => broadcast(&task_app, core.snapshot()),
@@ -151,16 +214,20 @@ pub fn auth_cancel_sign_in(app: AppHandle, state: State<'_, AuthState>) -> AuthS
 pub async fn auth_sign_out(app: AppHandle, state: State<'_, AuthState>) -> Result<bool, String> {
     let core = state.core();
     let ticket = core.sign_out();
+    // Capture BEFORE broadcasting. `broadcast` resets the telemetry identity to
+    // the device, so the order matters: reversed, the event that describes the
+    // account leaving would be filed against the anonymous device person.
+    let had_ticket = ticket.is_some();
+    if had_ticket {
+        // Recorded on the local sign-out, not the revocation: the user has
+        // signed out either way, and whether the server could be reached is
+        // not what this event counts.
+        telemetry(&app).capture_signed_out();
+    }
     broadcast(&app, core.snapshot());
 
     Ok(match ticket {
-        Some(ticket) => {
-            // Recorded on the local sign-out, not the revocation: the user has
-            // signed out either way, and whether the server could be reached is
-            // not what this event counts.
-            telemetry(&app).capture_signed_out();
-            core.revoke(ticket).await
-        }
+        Some(ticket) => core.revoke(ticket).await,
         // Nothing was stored, so there is nothing the server could still be
         // holding — no caveat is owed, and nothing happened worth recording.
         None => true,

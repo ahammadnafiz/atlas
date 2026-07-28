@@ -6,7 +6,7 @@ import {
   ChevronsUpDown,
   Plus,
   Cloud,
-  Building2,
+  Lock,
   Pencil,
   Trash2,
   RefreshCw,
@@ -64,7 +64,38 @@ export function OrgSwitcher() {
   const activeOrganisationId = useOrgStore.use.activeOrganisationId();
   const { rename, enableSync } = useOrgStore.use.actions();
   const workspaces = useWorkspaceStore.use.workspaces();
-  const signedIn = useAuthStore.use.snapshot().status === "signed-in";
+  const snapshot = useAuthStore.use.snapshot();
+  const signedIn = snapshot.status === "signed-in";
+  /** The server orgs THIS account belongs to. `null` = signed out OR never
+   *  listed on this machine (offline). Used to gate access to synced orgs the
+   *  current account isn't a member of. */
+  const myOrgIds =
+    snapshot.status === "signed-in" && snapshot.orgs
+      ? new Set(snapshot.orgs.map((o) => o.id))
+      : null;
+
+  /**
+   * Whether the current account may open `org` — and why not, for the tooltip.
+   *
+   * A LOCAL org is always accessible: it lives only on this machine and needs
+   * no credential. A SYNCED org (`remoteId`) belongs to a server account, and
+   * signing out or switching accounts must NOT keep you in someone else's org:
+   *  - signed out → locked.
+   *  - signed in, membership KNOWN, and this org isn't in it → locked.
+   *  - membership UNKNOWN (offline, never listed) → allow; we can't prove a
+   *    negative, and locking someone out of their own org on an offline launch
+   *    is worse than the rare stale case.
+   */
+  const orgAccess = (
+    org: Organisation,
+  ): { ok: true } | { ok: false; reason: string } => {
+    if (!(org.syncEnabled && org.remoteId)) return { ok: true };
+    if (!signedIn) return { ok: false, reason: "Sign in to open this synced organisation" };
+    if (myOrgIds && !myOrgIds.has(org.remoteId)) {
+      return { ok: false, reason: "This account isn't a member of this organisation" };
+    }
+    return { ok: true };
+  };
 
   const [open, setOpen] = useState(false);
   // True while a manual list-refresh is in flight (spins the refresh icon).
@@ -148,12 +179,14 @@ export function OrgSwitcher() {
             sideOffset={4}
             className="z-[var(--z-max)] w-[280px] max-h-[460px] rounded-lg border border-[var(--border-default)] bg-[#000] shadow-xl text-[var(--text-secondary)] flex flex-col overflow-hidden"
           >
-            {/* Organisation list. */}
-            <div className="px-3 pt-2.5 pb-1.5 text-[10px] text-[var(--text-tertiary)] flex items-center gap-1.5 shrink-0">
-              <Building2 size={12} className="shrink-0" />
-              <span className="flex-1 truncate">Organisation</span>
+            {/* Header — "ORGANISATIONS" + circular refresh, then a divider. */}
+            <div className="px-3 pt-2.5 pb-1.5 flex items-center gap-1.5 shrink-0">
+              <span className="flex-1 truncate text-[10px] uppercase tracking-wider text-[var(--text-tertiary)]">
+                Organisations
+              </span>
               {/* Manual re-sync — only meaningful with a credential to pull
-                  with. Silent on failure: Rust keeps the last-known list. */}
+                  with. Circular outline button, matching the sidebar's "+".
+                  Silent on failure: Rust keeps the last-known list. */}
               {signedIn && (
                 <button
                   title="Refresh organisations"
@@ -171,12 +204,13 @@ export function OrgSwitcher() {
                       setRefreshing(false);
                     }
                   }}
-                  className="p-0.5 rounded text-[var(--text-tertiary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-active)] transition-colors shrink-0 cursor-pointer disabled:opacity-50"
+                  className="flex items-center justify-center h-5 w-5 rounded-full border border-[var(--border-default)] text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)] outline-none transition-colors shrink-0 cursor-pointer disabled:opacity-50"
                 >
-                  <RefreshCw size={11} className={refreshing ? "animate-spin" : ""} />
+                  <RefreshCw size={10} className={refreshing ? "animate-spin" : ""} />
                 </button>
               )}
             </div>
+            <DropdownMenu.Separator className="mb-1 h-px bg-[var(--border-default)]" />
             <div className="overflow-y-auto pb-1 hide-scrollbar">
               {organisations.map((org) => {
                 const isActive = org.id === active.id;
@@ -204,31 +238,44 @@ export function OrgSwitcher() {
                     </div>
                   );
                 }
+                const access = orgAccess(org);
                 return (
                   <DropdownMenu.Item
                     key={org.id}
+                    disabled={!access.ok}
+                    title={access.ok ? undefined : access.reason}
                     onSelect={() => {
+                      if (!access.ok) return;
                       if (!isActive) void switchOrg(org.id);
                     }}
-                    className="group/org w-full flex items-center gap-2 px-3 h-[28px] text-[12px] outline-none hover:bg-[var(--bg-active)] hover:text-[var(--text-primary)] cursor-pointer"
+                    className={cn(
+                      "group/org w-full flex items-center gap-2 px-3 h-[28px] text-[12px] outline-none",
+                      access.ok
+                        ? "hover:bg-[var(--bg-active)] hover:text-[var(--text-primary)] cursor-pointer"
+                        : "opacity-40 cursor-not-allowed",
+                    )}
                   >
                     <OrgAvatar org={org} size={18} />
                     <span className="flex-1 text-left truncate">{org.name}</span>
+                    {/* A locked org offers no row actions — you can't manage an
+                        org this account has no access to. */}
                     {/* Rename (pencil) — appears on hover; doesn't switch/close. */}
-                    <button
-                      title="Rename organisation"
-                      onClick={(e) => {
-                        e.preventDefault();
-                        e.stopPropagation();
-                        beginRename(org.id, org.name);
-                      }}
-                      className="opacity-0 group-hover/org:opacity-100 p-0.5 rounded text-[var(--text-tertiary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-active)] transition-opacity shrink-0 cursor-pointer"
-                    >
-                      <Pencil size={11} />
-                    </button>
+                    {access.ok && (
+                      <button
+                        title="Rename organisation"
+                        onClick={(e) => {
+                          e.preventDefault();
+                          e.stopPropagation();
+                          beginRename(org.id, org.name);
+                        }}
+                        className="opacity-0 group-hover/org:opacity-100 p-0.5 rounded text-[var(--text-tertiary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-active)] transition-opacity shrink-0 cursor-pointer"
+                      >
+                        <Pencil size={11} />
+                      </button>
+                    )}
                     {/* Delete — appears on hover; opens confirmation. Hidden when
                         this is the only org (can't delete the last one). */}
-                    {canDelete && (
+                    {access.ok && canDelete && (
                       <button
                         title="Delete organisation"
                         onClick={(e) => {
@@ -242,8 +289,12 @@ export function OrgSwitcher() {
                         <Trash2 size={11} />
                       </button>
                     )}
-                    {isActive && (
-                      <Check size={13} className="text-[var(--text-secondary)] shrink-0" />
+                    {!access.ok ? (
+                      <Lock size={11} className="text-[var(--text-tertiary)] shrink-0" />
+                    ) : (
+                      isActive && (
+                        <Check size={13} className="text-[var(--text-secondary)] shrink-0" />
+                      )
                     )}
                   </DropdownMenu.Item>
                 );

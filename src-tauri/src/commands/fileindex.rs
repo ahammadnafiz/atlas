@@ -9,8 +9,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ignore::WalkBuilder;
-use notify::{EventKind, RecursiveMode};
-use notify_debouncer_full::{new_debouncer, DebouncedEvent};
+use notify::{event::ModifyKind, EventKind, RecursiveMode};
+use notify_debouncer_full::{new_debouncer_opt, DebouncedEvent, NoCache};
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::Matcher;
 use parking_lot::RwLock;
@@ -48,10 +48,7 @@ struct ProjectIndex {
     folders: Arc<RwLock<Option<Vec<(String, PathBuf)>>>>,
     /// `notify_debouncer_full` returns the debouncer guard; keeping it alive
     /// keeps the OS-level watch active. We never read from it.
-    _debouncer: notify_debouncer_full::Debouncer<
-        notify::RecommendedWatcher,
-        notify_debouncer_full::RecommendedCache,
-    >,
+    _debouncer: notify_debouncer_full::Debouncer<notify::RecommendedWatcher, NoCache>,
 }
 
 /// Per-WINDOW index. Tauri `.manage()` state is one instance per process, so a
@@ -184,10 +181,7 @@ pub async fn fileindex_open_project(
     let (files, folders, debouncer): (
         Arc<RwLock<Vec<IndexedFile>>>,
         Arc<RwLock<Option<Vec<(String, PathBuf)>>>>,
-        notify_debouncer_full::Debouncer<
-            notify::RecommendedWatcher,
-            notify_debouncer_full::RecommendedCache,
-        >,
+        notify_debouncer_full::Debouncer<notify::RecommendedWatcher, NoCache>,
     ) = tokio::task::spawn_blocking(move || -> Result<_, String> {
         let walked = walk_project(&root_for_task);
         let files = Arc::new(RwLock::new(walked));
@@ -203,11 +197,31 @@ pub async fn fileindex_open_project(
         let key_for_watch = key_for_task.clone();
         let window_for_watch = window_for_task.clone();
 
-        let mut debouncer = new_debouncer(
+        // `NoCache`, not the platform default. On macOS `RecommendedCache` is a
+        // `FileIdMap`, which `stat`s every event path to correlate renames — on
+        // the FSEvents callback thread. We treat renames as a re-walk anyway
+        // (see `apply_events`), so that cache bought nothing and cost a syscall
+        // per event. It is what Linux already uses.
+        let mut debouncer = new_debouncer_opt::<_, notify::RecommendedWatcher, NoCache>(
             Duration::from_millis(150),
             None,
             move |result: notify_debouncer_full::DebounceEventResult| match result {
                 Ok(events) => {
+                    // Drop anything under a directory we never index BEFORE any
+                    // work happens. Without this a single `npm install` or
+                    // `cargo build` turns into a sustained event storm.
+                    let events: Vec<_> = events
+                        .into_iter()
+                        .filter(|e| {
+                            !e.event
+                                .paths
+                                .iter()
+                                .all(|p| is_ignored_event_path(&root_for_watch, p))
+                        })
+                        .collect();
+                    if events.is_empty() {
+                        return;
+                    }
                     // Compute the set of parent dirs touched BEFORE
                     // we hand `events` to `apply_events` (which
                     // consumes them). The explorer uses this to
@@ -252,12 +266,22 @@ pub async fn fileindex_open_project(
                     }
                 }
             },
+            NoCache::new(),
+            notify::Config::default(),
         )
         .map_err(|e| format!("failed to create watcher: {e}"))?;
 
-        debouncer
-            .watch(&root_for_task, RecursiveMode::Recursive)
-            .map_err(|e| format!("failed to watch {}: {e}", root_for_task.display()))?;
+        // One watch per non-ignored top-level entry rather than one recursive
+        // watch of everything. A failure on a single subtree is not fatal —
+        // losing live updates for one directory beats refusing to index at all.
+        for (path, mode) in watch_roots(&root_for_task) {
+            if let Err(e) = debouncer.watch(&path, mode) {
+                tracing::warn!(
+                    target: "atlas::fileindex",
+                    "failed to watch {}: {e}", path.display()
+                );
+            }
+        }
 
         Ok((files, folders, debouncer))
     })
@@ -474,6 +498,151 @@ pub fn fileindex_search(
 
 // ── internals ────────────────────────────────────────────────────────────
 
+/// The paths worth watching under `root`.
+///
+/// **This is the difference between watching 700 files and watching 350,000.**
+/// The initial walk has always honoured `.gitignore`; the watcher did not — it
+/// took `RecursiveMode::Recursive` on the project root, so `target/`,
+/// `node_modules/` and friends were watched despite never being indexed. On this
+/// repo that is 265k files in `src-tauri/target` plus 90k in `node_modules`, to
+/// maintain an index of ~700. Every write in those trees woke the FSEvents
+/// thread, and the debouncer's file-id cache `stat`-ed each path — which is
+/// exactly where a sampled 100%-CPU Atlas was spending its time.
+///
+/// So: watch the root **non-recursively** (to catch new top-level entries), and
+/// each non-ignored top-level directory recursively. `WalkBuilder` at depth 1
+/// applies the same ignore rules as [`walk_project`], so what is watched and
+/// what is indexed cannot drift.
+///
+/// Nested ignored directories (`packages/*/node_modules`) still fall inside a
+/// watched subtree; [`is_ignored_event_path`] drops their events on arrival.
+fn watch_roots(root: &Path) -> Vec<(PathBuf, RecursiveMode)> {
+    match plan_watches(root, 0) {
+        // Nothing ignored anywhere in reach — one recursive watch is optimal.
+        None => vec![(root.to_path_buf(), RecursiveMode::Recursive)],
+        // A tree pathological enough to need this many streams is better served
+        // by one watch plus the event filter than by hundreds of FSEvents
+        // streams; the filter is a string check, and streams are a real resource.
+        Some(plan) if plan.len() > MAX_WATCHES => {
+            vec![(root.to_path_buf(), RecursiveMode::Recursive)]
+        }
+        Some(plan) => plan,
+    }
+}
+
+/// How deep the splitting goes before giving up and taking one recursive watch.
+/// Ignored directories live near the top in practice (`node_modules`,
+/// `src-tauri/target`, `packages/*/node_modules`), so a shallow bound finds them
+/// all while keeping the watch count small.
+const MAX_SPLIT_DEPTH: usize = 4;
+/// Ceiling on FSEvents streams for one project. A tree pathological enough to
+/// hit this gets a plain recursive watch, and [`is_ignored_event_path`] absorbs
+/// the noise.
+const MAX_WATCHES: usize = 256;
+
+/// Plan the watches for `dir`, or `None` when its whole subtree is clean and the
+/// caller can cover it with a single recursive watch.
+///
+/// The decision is **post-order**: a directory splits if it prunes a child *or*
+/// if anything below it does. Deciding on the immediate level alone was not
+/// enough — in this very repo `target/` sits at `src-tauri/target`, so the
+/// project root looks perfectly clean while 265k files hide two levels down.
+fn plan_watches(dir: &Path, depth: usize) -> Option<Vec<(PathBuf, RecursiveMode)>> {
+    if depth >= MAX_SPLIT_DEPTH {
+        // Stop splitting; report clean so the caller takes one recursive watch.
+        // `is_ignored_event_path` absorbs whatever noise remains below.
+        return None;
+    }
+
+    // What the ignore rules keep. `WalkBuilder` at depth 1 applies exactly the
+    // rules `walk_project` uses, so what is watched and what is indexed cannot
+    // drift apart.
+    let kept: Vec<PathBuf> = WalkBuilder::new(dir)
+        .hidden(false)
+        .git_ignore(true)
+        .git_global(true)
+        .git_exclude(true)
+        .ignore(true)
+        .parents(true)
+        .follow_links(false)
+        .max_depth(Some(1))
+        .build()
+        .flatten()
+        .filter(|e| e.path() != dir && e.file_type().is_some_and(|t| t.is_dir()))
+        .map(|e| e.path().to_path_buf())
+        // Belt and braces over the ignore rules: `.git` is implicitly ignored by
+        // git so it never appears in a `.gitignore`, and a repo that simply
+        // forgot to ignore `node_modules` should not cost the user a core.
+        .filter(|p| {
+            !p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| NOISY_DIRS.contains(&n))
+        })
+        .collect();
+
+    // What is actually on disk. The difference is what we are avoiding.
+    let on_disk = std::fs::read_dir(dir)
+        .map(|rd| {
+            rd.flatten()
+                .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+                .count()
+        })
+        .unwrap_or(kept.len());
+    let pruned_here = on_disk != kept.len();
+
+    let child_plans: Vec<(PathBuf, Option<Vec<(PathBuf, RecursiveMode)>>)> = kept
+        .into_iter()
+        .map(|c| {
+            let plan = plan_watches(&c, depth + 1);
+            (c, plan)
+        })
+        .collect();
+
+    if !pruned_here && child_plans.iter().all(|(_, p)| p.is_none()) {
+        return None; // clean all the way down
+    }
+
+    let mut out = vec![(dir.to_path_buf(), RecursiveMode::NonRecursive)];
+    for (child, plan) in child_plans {
+        match plan {
+            None => out.push((child, RecursiveMode::Recursive)),
+            Some(sub) => out.extend(sub),
+        }
+    }
+    Some(out)
+}
+
+/// Directory names that are never indexed and never worth waking for, checked at
+/// any depth. A backstop for two cases `watch_roots` cannot cover: a nested
+/// ignored directory inside a watched subtree, and one created after the watch
+/// began.
+const NOISY_DIRS: [&str; 12] = [
+    ".git",
+    "node_modules",
+    "target",
+    "dist",
+    ".next",
+    ".turbo",
+    ".venv",
+    "__pycache__",
+    ".cache",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".svelte-kit",
+];
+
+/// True when an event path lies inside a directory we never index.
+fn is_ignored_event_path(root: &Path, path: &Path) -> bool {
+    let Ok(rel) = path.strip_prefix(root) else {
+        return false;
+    };
+    rel.components().any(|c| {
+        c.as_os_str()
+            .to_str()
+            .is_some_and(|s| NOISY_DIRS.contains(&s))
+    })
+}
+
 fn walk_project(root: &Path) -> Vec<IndexedFile> {
     let walker = WalkBuilder::new(root)
         .hidden(false) // dotfiles like .env / .gitignore are valid hits
@@ -524,6 +693,10 @@ fn summarise_events(events: &[DebouncedEvent]) -> (std::collections::HashSet<Pat
                     }
                 }
             }
+            // Same reasoning as `apply_events`: an edit to a file's contents
+            // changes nothing about the tree the explorer draws, so it must not
+            // force it to re-walk everything it has open.
+            EventKind::Modify(ModifyKind::Data(_) | ModifyKind::Metadata(_)) => {}
             EventKind::Modify(_) => {
                 full_refresh = true;
             }
@@ -562,6 +735,13 @@ fn apply_events(
                     to_remove.push(p.clone());
                 }
             }
+            // A content or metadata edit cannot change the file SET, so it is
+            // not this index's business. Only a rename can, and only that is
+            // worth a re-walk. Lumping all of `Modify` together meant every
+            // saved file — and every one of the thousands a build writes —
+            // triggered a full `walk_project`, up to once per 150ms debounce
+            // window, forever. That was the second half of the CPU burn.
+            EventKind::Modify(ModifyKind::Data(_) | ModifyKind::Metadata(_)) => {}
             EventKind::Modify(_) => {
                 // Rename or move shows up here; the cheapest correct fix is
                 // a full re-walk of the project. notify-full's rename events
@@ -595,5 +775,163 @@ fn apply_events(
         if let Some(rel) = relative(&p, root) {
             w.push(IndexedFile { path: p, rel });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct TmpDir(PathBuf);
+    impl TmpDir {
+        fn new() -> Self {
+            let p = std::env::temp_dir().join(format!("atlas-fi-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&p).unwrap();
+            Self(p)
+        }
+        fn path(&self) -> &Path {
+            &self.0
+        }
+        fn dir(&self, rel: &str) {
+            std::fs::create_dir_all(self.0.join(rel)).unwrap();
+        }
+        fn file(&self, rel: &str, body: &str) {
+            let p = self.0.join(rel);
+            if let Some(d) = p.parent() {
+                std::fs::create_dir_all(d).unwrap();
+            }
+            std::fs::write(p, body).unwrap();
+        }
+    }
+    impl Drop for TmpDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// The regression this whole change exists for: the watcher used to take one
+    /// recursive watch on the root, so it woke for every write under `target/`
+    /// and `node_modules/` — hundreds of thousands of files that are never
+    /// indexed — and pegged a core.
+    #[test]
+    fn watch_roots_skip_ignored_and_noisy_directories() {
+        let t = TmpDir::new();
+        t.file(".gitignore", "target/\ndist/\n");
+        t.dir("src");
+        t.dir("crates");
+        t.dir("target");
+        t.dir("dist");
+        t.dir("node_modules");
+        t.dir(".git");
+
+        let roots = watch_roots(t.path());
+        let watched: Vec<String> = roots
+            .iter()
+            .filter(|(_, m)| *m == RecursiveMode::Recursive)
+            .map(|(p, _)| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+
+        assert!(watched.contains(&"src".to_string()));
+        assert!(watched.contains(&"crates".to_string()));
+        for skipped in ["target", "dist", "node_modules", ".git"] {
+            assert!(
+                !watched.contains(&skipped.to_string()),
+                "{skipped} must not be watched"
+            );
+        }
+
+        // The root itself is still watched, non-recursively, so a NEW top-level
+        // directory is still noticed.
+        assert!(roots
+            .iter()
+            .any(|(p, m)| p == t.path() && *m == RecursiveMode::NonRecursive));
+    }
+
+    /// The case that actually bit this repo: `target/` is not top-level, it is
+    /// `src-tauri/target/`. Depth-1 filtering alone would still have handed
+    /// FSEvents all 265k files inside it.
+    #[test]
+    fn nested_ignored_directories_are_split_around() {
+        let t = TmpDir::new();
+        t.file(".gitignore", "target/\n");
+        t.file("src-tauri/src/lib.rs", "");
+        t.dir("src-tauri/target/debug");
+        t.dir("src-tauri/capabilities");
+        t.file("src/main.ts", "");
+
+        let roots = watch_roots(t.path());
+        let has = |rel: &str, mode: RecursiveMode| {
+            roots
+                .iter()
+                .any(|(p, m)| *p == t.path().join(rel) && *m == mode)
+        };
+
+        // `src-tauri` holds an ignored child, so it is split: watched shallowly,
+        // with its real children watched recursively...
+        assert!(has("src-tauri", RecursiveMode::NonRecursive));
+        assert!(has("src-tauri/src", RecursiveMode::Recursive));
+        assert!(has("src-tauri/capabilities", RecursiveMode::Recursive));
+        // ...and `target` is never handed to FSEvents at all.
+        assert!(
+            !roots
+                .iter()
+                .any(|(p, _)| p.starts_with(t.path().join("src-tauri/target"))),
+            "the ignored subtree must not be watched in any mode"
+        );
+        // A clean subtree still gets exactly one recursive watch.
+        assert!(has("src", RecursiveMode::Recursive));
+    }
+
+    /// `watch_roots` cannot cover a nested `node_modules`, or one created after
+    /// the watch began — those events still arrive and must be dropped on sight.
+    #[test]
+    fn nested_ignored_paths_are_filtered() {
+        let root = Path::new("/p");
+        assert!(is_ignored_event_path(
+            root,
+            Path::new("/p/packages/web/node_modules/react/index.js")
+        ));
+        assert!(is_ignored_event_path(root, Path::new("/p/a/target/debug/x")));
+        assert!(is_ignored_event_path(root, Path::new("/p/.git/index")));
+
+        assert!(!is_ignored_event_path(root, Path::new("/p/src/main.rs")));
+        // Substring matches must not trip it: `targets` is not `target`.
+        assert!(!is_ignored_event_path(root, Path::new("/p/targets/a.rs")));
+        // A path outside the root is not ours to judge.
+        assert!(!is_ignored_event_path(root, Path::new("/other/target/x")));
+    }
+
+    /// A content edit cannot change the file SET. Treating it as a rename meant
+    /// a full `walk_project` per debounce window — during a build, forever.
+    #[test]
+    fn content_edits_do_not_force_a_rewalk() {
+        let t = TmpDir::new();
+        t.file("a.rs", "fn main() {}");
+        let files = Arc::new(RwLock::new(walk_project(t.path())));
+        let before = files.read().len();
+
+        let ev = |kind: EventKind, p: PathBuf| DebouncedEvent {
+            event: notify::Event { kind, paths: vec![p], attrs: Default::default() },
+            time: std::time::Instant::now(),
+        };
+
+        let data = ev(
+            EventKind::Modify(ModifyKind::Data(notify::event::DataChange::Content)),
+            t.path().join("a.rs"),
+        );
+        let (dirs, full_refresh) = summarise_events(std::slice::from_ref(&data));
+        assert!(!full_refresh, "a content edit must not force a full refresh");
+        assert!(dirs.is_empty());
+
+        apply_events(t.path(), &files, vec![data]);
+        assert_eq!(files.read().len(), before);
+
+        // A rename still does, because it genuinely can change the set.
+        let renamed = ev(
+            EventKind::Modify(ModifyKind::Name(notify::event::RenameMode::Any)),
+            t.path().join("b.rs"),
+        );
+        let (_, full_refresh) = summarise_events(std::slice::from_ref(&renamed));
+        assert!(full_refresh, "a rename must still refresh");
     }
 }

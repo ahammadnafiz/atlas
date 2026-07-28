@@ -15,11 +15,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use atlas_agents::{
-    AgentId, AgentInfo, AgentManager, AuthMethodWire, DeltaSink, OutboundMiddleware,
+    AgentId, AgentInfo, AgentManager, AuthMethodWire, DeltaSink, Message, OutboundMiddleware,
     OutboundPipeline, PermissionDecision, PluginSpec, SessionDelta, SessionDeltaEnvelope, SessionId,
-    SessionKey, SessionSnapshot,
+    SessionKey, SessionSnapshot, SessionStatus,
 };
 
+use super::agent_analytics::AnalyticsState;
 use super::memory_chat::MemoryChatState;
 use super::memory_indexer::MemoryRegistry;
 use super::memory_inject;
@@ -51,7 +52,7 @@ impl TauriDeltaSink {
         let pipeline = OutboundPipeline::new()
             // Broadcast first so the UI updates before any heavier work.
             .with(Arc::new(BroadcastMiddleware { app: app.clone() }))
-            .with(Arc::new(TelemetryMiddleware { app: app.clone() }))
+            .with(Arc::new(AnalyticsMiddleware { app: app.clone() }))
             .with(Arc::new(MemoryIngestMiddleware { app }));
         Self { pipeline }
     }
@@ -76,44 +77,161 @@ impl OutboundMiddleware<SessionDeltaEnvelope> for BroadcastMiddleware {
     }
 }
 
-/// Opt-in telemetry (metadata only — no message text, no paths). The sink is
-/// the one place that sees every agent's turn end, so usage / finish / failure
-/// are captured here. No-op unless the user opted in.
-struct TelemetryMiddleware {
+/// Opt-in per-turn product analytics, for **both** agent families.
+///
+/// The sink is the one place that sees every delta from every agent, so a turn's
+/// whole shape — tools run, files touched, tokens spent, how it ended — is
+/// accumulated here and flushed as a single `agent_turn_completed`. See
+/// [`crate::commands::agent_analytics`] for the accumulator and for what this
+/// deliberately refuses to measure.
+///
+/// Unlike [`MemoryIngestMiddleware`] this needs no blocking pool: it is
+/// in-memory arithmetic over already-cloned data, and the one flush is
+/// `capture`, a non-blocking `try_send` that no-ops entirely when the user has
+/// not opted in.
+struct AnalyticsMiddleware {
     app: AppHandle,
 }
 
-impl OutboundMiddleware<SessionDeltaEnvelope> for TelemetryMiddleware {
+impl AnalyticsMiddleware {
+    /// The plugin this agent was spawned from (`claude-code-ts` / `codex` /
+    /// `cersei`). A single `DashMap` lookup, safe on the delta hot path.
+    ///
+    /// This replaces the old `agent_kind`, which was `agent_id.0` — a random
+    /// UUID minted per registration that identified nothing outside the process
+    /// and did not survive a restart. It made every agent-segmented query in
+    /// PostHog meaningless.
+    fn plugin_id(&self, envelope: &SessionDeltaEnvelope) -> String {
+        self.app
+            .state::<AgentManager>()
+            .plugin_id_for_agent(envelope.agent_id)
+            .unwrap_or_else(|| "unknown".to_string())
+    }
+
+    /// Coarse bucket for funnels that don't care which ACP agent it was.
+    fn family(plugin_id: &str) -> &'static str {
+        if plugin_id == "cersei" {
+            "cersei"
+        } else {
+            "acp"
+        }
+    }
+
+    /// Flush the finished turn as one event. `outcome` discriminates rather than
+    /// splitting into separate events, so a completion-rate funnel is one query.
+    fn flush(&self, envelope: &SessionDeltaEnvelope, turn_seq: u64, extra: serde_json::Value) {
+        let st = self.app.state::<Arc<AnalyticsState>>();
+        let Some(mut props) = st.finish_turn(&envelope.session_id, turn_seq) else {
+            return;
+        };
+        let plugin_id = self.plugin_id(envelope);
+        if let (Some(map), Some(more)) = (props.as_object_mut(), extra.as_object()) {
+            map.insert("agent_family".into(), serde_json::json!(Self::family(&plugin_id)));
+            map.insert("plugin_id".into(), serde_json::json!(plugin_id));
+            map.insert(
+                "session_ref".into(),
+                serde_json::json!(st.session_ref(&envelope.session_id)),
+            );
+            for (k, v) in more {
+                map.insert(k.clone(), v.clone());
+            }
+        }
+        self.app
+            .state::<Arc<crate::telemetry::TelemetryClient>>()
+            .capture("agent_turn_completed", props);
+    }
+}
+
+impl OutboundMiddleware<SessionDeltaEnvelope> for AnalyticsMiddleware {
     fn on_event(&self, envelope: &SessionDeltaEnvelope) {
-        let tel = self.app.state::<Arc<crate::telemetry::TelemetryClient>>();
+        let st = self.app.state::<Arc<AnalyticsState>>();
+        let sid = envelope.session_id.as_str();
+
         match &envelope.delta {
-            SessionDelta::UsageUpdated { usage } => {
-                // Cumulative numeric counters only; stamped onto the next
-                // `agent_turn_finished` for this session.
-                tel.note_usage(
-                    &envelope.session_id,
-                    serde_json::to_value(usage).unwrap_or(serde_json::Value::Null),
-                );
+            SessionDelta::Status { status, turn_seq } if *status == SessionStatus::Running => {
+                let is_new = !st.has_turn(sid, *turn_seq);
+                st.begin_turn(sid, *turn_seq);
+                if is_new {
+                    let plugin_id = self.plugin_id(envelope);
+                    self.app
+                        .state::<Arc<crate::telemetry::TelemetryClient>>()
+                        .capture(
+                            "agent_turn_started",
+                            serde_json::json!({
+                                "agent_family": Self::family(&plugin_id),
+                                "plugin_id": plugin_id,
+                                "session_ref": st.session_ref(sid),
+                                "turn_seq": turn_seq,
+                            }),
+                        );
+                }
             }
-            SessionDelta::TurnFinished { stop_reason, .. } => {
-                let usage = tel.take_usage(&envelope.session_id);
-                tel.capture(
-                    "agent_turn_finished",
+            SessionDelta::ToolCallUpserted { tool_call, .. } => {
+                let salt = st.salt();
+                st.with_turn(sid, |a| a.note_tool_call(salt, tool_call));
+            }
+            SessionDelta::UsageUpdated { usage } => st.with_turn(sid, |a| a.note_usage(usage)),
+            SessionDelta::ContextUsage { used, size, cost } => {
+                st.with_turn(sid, |a| a.note_context(*used, *size, *cost))
+            }
+            SessionDelta::PermissionRequest { .. } => {
+                st.with_turn(sid, |a| a.note_permission_request())
+            }
+            SessionDelta::PermissionResolved { .. } => {
+                st.with_turn(sid, |a| a.note_permission_resolved())
+            }
+            SessionDelta::RetryStatus { .. } => st.with_turn(sid, |a| a.note_retry()),
+            SessionDelta::Compaction { active } if *active => {
+                st.with_turn(sid, |a| a.note_compaction())
+            }
+            SessionDelta::CompressionSaved { saved_tokens } => {
+                st.with_turn(sid, |a| a.note_compression_saved(*saved_tokens))
+            }
+            SessionDelta::ModelChanged { model_id } => {
+                st.with_turn(sid, |a| a.note_model(model_id))
+            }
+            SessionDelta::ModeChanged { .. } => st.with_turn(sid, |a| a.note_mode_change()),
+            SessionDelta::MessageAppended { message } => {
+                if message.role == atlas_agents::session::MessageRole::Assistant {
+                    st.with_turn(sid, |a| a.note_assistant_message());
+                }
+            }
+            SessionDelta::PlanUpdated { .. } => st.with_turn(sid, |a| a.note_plan_update()),
+
+            SessionDelta::TurnFinished {
+                stop_reason,
+                turn_seq,
+            } => self.flush(
+                envelope,
+                *turn_seq,
+                serde_json::json!({ "outcome": "finished", "stop_reason": stop_reason }),
+            ),
+            SessionDelta::TurnFailed {
+                error,
+                turn_seq,
+                error_kind,
+            } => self.flush(
+                envelope,
+                *turn_seq,
+                serde_json::json!({
+                    "outcome": "failed",
+                    "error_kind": error_kind,
+                    "error_summary": crate::telemetry::redact_message(error, 160),
+                }),
+            ),
+            SessionDelta::AgentDisconnected { reason } => {
+                // The process died mid-turn. Flush what we have rather than
+                // leaking the accumulator — a disconnect rate is exactly the
+                // kind of thing this event exists to surface.
+                self.flush(
+                    envelope,
+                    0,
                     serde_json::json!({
-                        "agent_kind": envelope.agent_id.0.to_string(),
-                        "stop_reason": stop_reason,
-                        "usage": usage,
+                        "outcome": "disconnected",
+                        "error_summary": crate::telemetry::redact_message(reason, 160),
                     }),
                 );
-            }
-            SessionDelta::TurnFailed { error, .. } => {
-                tel.capture(
-                    "agent_turn_failed",
-                    serde_json::json!({
-                        "agent_kind": envelope.agent_id.0.to_string(),
-                        "error_summary": crate::telemetry::redact_message(error, 160),
-                    }),
-                );
+                st.forget_session(sid);
             }
             _ => {}
         }
@@ -217,6 +335,9 @@ fn native_extraction_enabled() -> bool {
 /// Initialise the `AgentManager` once the Tauri app is up so the sink has a
 /// real `AppHandle` to emit through. Called from `setup`.
 pub fn install_manager(app: &AppHandle) {
+    // Must exist BEFORE the sink is built — the sink's analytics middleware
+    // resolves this state on its first delta.
+    app.manage(Arc::new(AnalyticsState::new()));
     let sink: Arc<dyn DeltaSink> = Arc::new(TauriDeltaSink::new(app.clone()));
     // App config dir holds `byok-keys.json` (BYOK keys the native agent reads)
     // and `cersei-sessions/` (its persisted transcripts). Best-effort: fall
@@ -312,6 +433,25 @@ pub async fn agents_authenticate(
         .map_err(|e| e.to_string())
 }
 
+/// Read a saved session's transcript off disk for an INSTANT first paint.
+///
+/// Deliberately agent-free: no spawn, no `session/load`, no `SessionState`. The
+/// frontend paints the returned messages immediately and runs the real
+/// `agents_load_session` concurrently to make the session sendable. Empty vec
+/// means "this plugin has no on-disk transcript" (Codex) — not an error.
+#[tauri::command]
+pub async fn agents_replay_transcript(
+    plugin_id: String,
+    session_id: String,
+    cwd: String,
+    manager: State<'_, AgentManager>,
+) -> Result<Vec<Message>, String> {
+    manager
+        .replay_transcript(&plugin_id, &cwd, &session_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 pub async fn agents_load_session(
     agent_id: AgentId,
@@ -354,12 +494,11 @@ pub async fn agents_send(
     sharing: State<'_, MemorySharingState>,
     app: AppHandle,
 ) -> Result<(), String> {
-    // Telemetry: a turn was initiated (metadata only). Fires for every send,
-    // including bare sends below. No-op unless the user opted in.
-    app.state::<Arc<crate::telemetry::TelemetryClient>>().capture(
-        "agent_turn_started",
-        serde_json::json!({ "agent_kind": key.agent_id.0.to_string() }),
-    );
+    // `agent_turn_started` is NOT emitted here. It used to be, but this runs
+    // before `start_turn`, so it could not know the `turn_seq` that joins a
+    // start to its completion — and a send that supersedes a running turn
+    // counted twice. `AnalyticsMiddleware` emits it off `Status{Running}`
+    // instead, which is the actual turn boundary.
 
     // Stage image attachments up front so every send exit below (bare or
     // memory-prefixed) drains them into this turn's prompt. Best-effort: a
@@ -512,9 +651,13 @@ pub fn agents_cancel(key: SessionKey, manager: State<'_, AgentManager>) -> Resul
 #[tauri::command]
 pub fn agents_drop_session(
     manager: tauri::State<'_, AgentManager>,
+    analytics: tauri::State<'_, Arc<AnalyticsState>>,
     agent_id: AgentId,
     session_id: String,
 ) -> Result<(), String> {
+    // Release the per-turn accumulator with the session, so a tab closed
+    // mid-turn doesn't hold one for the life of the process.
+    analytics.forget_session(&session_id);
     let key = SessionKey { agent_id, session_id };
     manager.drop_session(&key).map_err(|e| e.to_string())
 }

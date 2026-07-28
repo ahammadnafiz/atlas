@@ -14,15 +14,35 @@ import { invoke } from "@tauri-apps/api/core";
 interface TelemetryConfig {
   enabled: boolean;
   host: string;
+  /** Device-stable anonymous id (Rust's `device.json`). */
   anonId: string;
+  /** Atlas account id when already signed in at boot, else null. */
+  accountId: string | null;
   usingDefaultKey: boolean;
   /** Write-only project key, or null on an inert build (→ posthog never inits). */
   key: string | null;
 }
 
+/** The account a renderer-side `identify` should attribute crashes to. */
+export interface TelemetryIdentity {
+  /** Atlas user id — becomes the posthog distinct id. */
+  distinctId: string;
+  email?: string;
+  name?: string;
+  orgId?: string | null;
+}
+
 let initialized = false; // initTelemetry ran
 let started = false; // posthog.init() called (a key resolved)
 let enabled = false; // live opt-in gate
+/**
+ * An identity that arrived before posthog was ready.
+ *
+ * `initTelemetry()` is async and fire-and-forget from `main.tsx`, while the auth
+ * restore broadcast can land first — so without this, a relaunch while signed in
+ * would file that session's crashes against the anonymous device person.
+ */
+let pendingIdentity: TelemetryIdentity | null = null;
 
 /**
  * Known-benign client errors we never report. These are common, undiagnosed,
@@ -83,8 +103,56 @@ export async function initTelemetry(): Promise<void> {
     });
     started = true;
     setEnabled(cfg.enabled);
+    // Whichever arrived first wins: an identity pushed by the auth store while
+    // we were still initialising, or the account Rust already knew about.
+    const boot =
+      pendingIdentity ?? (cfg.accountId ? { distinctId: cfg.accountId } : null);
+    if (boot) identify(boot);
   } catch {
     /* posthog init failure must never break app boot */
+  }
+}
+
+/**
+ * Attribute subsequent renderer events (crashes) to an Atlas account, merging
+ * the anonymous device person into it. Mirrors what Rust does for product
+ * events — posthog-js keeps its own distinct id in localStorage, so the two
+ * sides have to be told separately.
+ *
+ * Safe to call before init: the identity is queued and applied once ready.
+ */
+export function identify(id: TelemetryIdentity): void {
+  if (!id.distinctId) return;
+  pendingIdentity = id;
+  if (!started || !enabled) return;
+  try {
+    posthog.identify(id.distinctId, {
+      email: id.email,
+      name: id.name,
+      atlas_account: true,
+      atlas_active_org_id: id.orgId ?? null,
+    });
+    if (id.orgId) posthog.group("organisation", id.orgId);
+    pendingIdentity = null;
+  } catch {
+    /* never throw into the app */
+  }
+}
+
+/**
+ * Return to the anonymous device person on sign-out.
+ *
+ * Not optional: `persistence: "localStorage"` means the account's distinct id
+ * outlives the session, so without this the next person to use the machine
+ * would inherit it.
+ */
+export function resetIdentity(): void {
+  pendingIdentity = null;
+  if (!started) return;
+  try {
+    posthog.reset();
+  } catch {
+    /* ignore */
   }
 }
 
@@ -98,6 +166,9 @@ export function setEnabled(on: boolean): void {
   } catch {
     /* ignore */
   }
+  // Opting in is the first moment an identity held back by the consent gate can
+  // actually be applied.
+  if (on && pendingIdentity) identify(pendingIdentity);
 }
 
 /**

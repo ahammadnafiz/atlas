@@ -1,4 +1,4 @@
-import { useState, memo } from "react";
+import { useState, memo, type ReactNode } from "react";
 import * as Dialog from "@radix-ui/react-dialog";
 import { cn } from "@/lib/utils";
 import type { ChatMessage } from "@/types/agent";
@@ -27,6 +27,16 @@ import { useLayoutStore } from "@/features/layout/stores/layout-store";
 import { useProjectStore } from "@/features/project/stores/project-store";
 import { CachedMarkdown } from "@/lib/markdown-cache";
 import { StreamingMarkdown } from "./streaming-markdown";
+
+/** Avatar glyphs that never vary per message, hoisted to module scope so a
+ *  thread of N rows allocates ZERO extra elements for them. The agent-side
+ *  glyph is supplied by the parent (see `agentAvatar`); this generic mark is
+ *  only the fallback for surfaces with no agent identity (memory chat, BYOK
+ *  model chat), which is also what they rendered before the agent-icon work. */
+const USER_AVATAR = <User size={14} className="text-[var(--accent-primary)]" />;
+const GENERIC_AGENT_AVATAR = (
+  <Sparkles size={14} className="text-[var(--text-secondary)]" />
+);
 
 import {
   getFilePathFromInput,
@@ -81,6 +91,8 @@ export const MessageItem = memo(function MessageItem({
   model,
   timeGapAbove,
   tabId,
+  agentAvatar,
+  agentLabel,
 }: {
   message: ChatMessage;
   streaming?: boolean;
@@ -110,6 +122,12 @@ export const MessageItem = memo(function MessageItem({
    * fixes the "orange line" inter-block gaps the user flagged.
    */
   isLastInGroup?: boolean;
+  /** Pre-built agent avatar glyph, hoisted to MessagesList so the session's
+   *  agent identity is resolved ONCE per thread instead of per row. Both this
+   *  and `agentLabel` are referentially stable across renders (memoized on
+   *  agentType upstream), so they never defeat this component's memo. */
+  agentAvatar?: ReactNode;
+  agentLabel?: string;
 }) {
   const isUser = message.role === "user";
   const isAssistant = message.role === "assistant";
@@ -171,11 +189,7 @@ export const MessageItem = memo(function MessageItem({
                 : "bg-[var(--bg-elevated)] border border-[var(--border-default)]",
             )}
           >
-            {isUser ? (
-              <User size={14} className="text-[var(--accent-primary)]" />
-            ) : (
-              <Sparkles size={14} className="text-[var(--text-secondary)]" />
-            )}
+            {isUser ? USER_AVATAR : (agentAvatar ?? GENERIC_AGENT_AVATAR)}
           </div>
         )}
 
@@ -195,7 +209,7 @@ export const MessageItem = memo(function MessageItem({
             {!compact && (
               <div className="flex items-center gap-2">
                 <span className="text-[11px] font-semibold text-[var(--text-secondary)] uppercase tracking-wide">
-                  {isUser ? "You" : isAssistant ? "Assistant" : message.role}
+                  {isUser ? "You" : isAssistant ? (agentLabel ?? "Assistant") : message.role}
                 </span>
                 <span className="text-[10px] text-[var(--text-tertiary)] font-mono">
                   {new Date(message.timestamp).toLocaleTimeString([], {

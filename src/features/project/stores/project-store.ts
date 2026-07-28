@@ -54,6 +54,10 @@ export interface AppSettings {
    *  the Rust emitter and the frontend crash reporter. See
    *  `src/features/telemetry`. */
   shareTelemetry: boolean;
+  /** Attribute telemetry to the signed-in Atlas account rather than keeping it
+   *  on the anonymous per-device person. Default ON; irrelevant while signed out
+   *  or while `shareTelemetry` is off — both gate it. */
+  linkTelemetryToAccount: boolean;
   /** Selected on-device embedding model id (== dir name). Managed by the Local
    *  Model Manager; carried here so settings round-trips never clobber it. */
   embeddingModelId: string;
@@ -89,6 +93,7 @@ const DEFAULT_SETTINGS: AppSettings = {
   showHiddenFiles: true,
   uiScale: DEFAULT_SCALE,
   shareTelemetry: true,
+  linkTelemetryToAccount: true,
   embeddingModelId: "all-MiniLM-L6-v2",
   llmModelId: "qwen3-0.6b",
   codeEditorTheme: DEFAULT_EDITOR_THEME_ID,
