@@ -149,11 +149,13 @@ export function Titlebar() {
 }
 
 /**
- * The titlebar project label. Click copies the workspace's full path to the
- * clipboard; hovering shows a custom tooltip with that path, and on copy the
- * tooltip text animates over to a "Copied" confirmation before reverting.
- * It's a <button> (not a span) so the titlebar's drag/double-click-zoom
- * handlers skip it — see `isTitlebarSurface`.
+ * The titlebar project label — `org / project`, with the capture dot.
+ *
+ * Clicking it opens capture setup. It used to copy the workspace path and show
+ * a hover tooltip of that path; both are gone, because the click now opens a
+ * panel and a tooltip that fires every time you approach that panel is noise in
+ * front of it. It stays a <button> (not a span) so the titlebar's
+ * drag/double-click-zoom handlers skip it — see `isTitlebarSurface`.
  */
 function ProjectLabel({
   name,
@@ -164,7 +166,6 @@ function ProjectLabel({
   orgName?: string | null;
   path?: string;
 }) {
-  const [hovered, setHovered] = useState(false);
   const [captureOpen, setCaptureOpen] = useState(false);
   const [binding, setBinding] = useState<Binding | null>(null);
   const [health, setHealth] = useState<CaptureHealth | null>(null);
@@ -189,14 +190,8 @@ function ProjectLabel({
 
   useEffect(() => readCapture(), [readCapture]);
 
-  const showTip = !!path && !captureOpen && hovered;
-
   return (
-    <div
-      className="relative min-w-0"
-      onMouseEnter={() => setHovered(true)}
-      onMouseLeave={() => setHovered(false)}
-    >
+    <div className="relative min-w-0">
       {/* Pill: `org / project`. The org segment is de-emphasised so the project
           — the thing that changes most — still reads as the primary label.
 
@@ -206,7 +201,11 @@ function ProjectLabel({
       <Popover.Root open={captureOpen} onOpenChange={setCaptureOpen}>
         <Popover.Trigger asChild>
           <button
-            className="group flex h-[19px] max-w-[320px] min-w-0 cursor-pointer items-center gap-1 rounded-full border border-[#303030] bg-[#0C0C0C] px-2 text-[11px] font-medium transition-colors hover:bg-[#1f1f1f]"
+            // `leading-none` is what actually centres the capture dot: with the
+            // inherited line-height the label spans set a taller line box than
+            // the dot, and `items-center` centred the dot against *that* — which
+            // is why it sat visibly high.
+            className="group flex h-[19px] max-w-[320px] min-w-0 cursor-pointer items-center gap-1 rounded-full border border-[#303030] bg-[#0C0C0C] px-2 text-[11px] leading-none font-medium transition-colors hover:bg-[#1f1f1f]"
             title={health?.summary ?? "Session capture"}
           >
             {orgName && (
@@ -231,7 +230,12 @@ function ProjectLabel({
               side="bottom"
               align="start"
               sideOffset={6}
-              className="z-[var(--z-max)] origin-[var(--radix-popover-content-transform-origin)] data-[state=closed]:animate-scale-out data-[state=open]:animate-scale-in"
+              // Enter is animated by the panel itself (`atlas-panel-in-tl`), not
+              // here: this wrapper would hold a transform for the duration, and
+              // a transformed ancestor becomes the backdrop root — which
+              // flattens the panel's blur while it plays. Exit stays here
+              // because Radix needs the animation on the element it unmounts.
+              className="z-[var(--z-max)] origin-[var(--radix-popover-content-transform-origin)] data-[state=closed]:animate-scale-out"
             >
               <CapturePopover
                 projectPath={path}
@@ -243,18 +247,6 @@ function ProjectLabel({
           </Popover.Portal>
         )}
       </Popover.Root>
-      {showTip && (
-        <div className="pointer-events-none absolute left-1 top-full z-[var(--z-max)] mt-1.5 origin-top-left animate-scale-in">
-          {/* `w-max` sizes the box to the path's intrinsic width (capped by
-              max-w) — without it the absolutely-positioned box has no width to
-              resolve against and `break-all` collapses it to one char per line. */}
-          <div className="w-max max-w-[70vw] rounded-md border border-black/10 bg-white px-2 py-1 shadow-[var(--shadow-overlay)]">
-            <span className="block animate-fade-in whitespace-nowrap font-mono text-[10px] leading-snug text-black/80">
-              {path}
-            </span>
-          </div>
-        </div>
-      )}
     </div>
   );
 }

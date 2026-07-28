@@ -561,6 +561,68 @@
   animation: atlas-panel-in-br 200ms cubic-bezier(0.32, 0.72, 0, 1);
 }
 
+/* Same, mirrored: the capture popover grows out of the titlebar project pill
+   it hangs below. The no-fill-mode rule above applies here for the same
+   reason — this element carries `backdrop-filter`. */
+@keyframes atlas-panel-in-tl {
+  from { opacity: 0; transform: translate3d(-4px, -8px, 0) scale(0.965); }
+  to   { opacity: 1; transform: translate3d(0, 0, 0) scale(1); }
+}
+.atlas-panel-in-tl {
+  transform-origin: 0 0;
+  animation: atlas-panel-in-tl 200ms cubic-bezier(0.32, 0.72, 0, 1);
+}
+
+/* Capture popover — the Timeline teaser.
+
+   A pulse runs down the rail every few seconds so the mock reads as a live
+   recorder rather than a static illustration, and the rows arrive staggered
+   underneath it. Both are CSS rather than a motion library: this is the only
+   animated illustration in the app and it is not worth a dependency.
+   `--atlas-beam-travel` is set per-instance to the rail's height. */
+@keyframes atlas-timeline-beam {
+  0%   { opacity: 0; transform: translateY(0); }
+  12%  { opacity: 1; }
+  82%  { opacity: 1; }
+  100% { opacity: 0; transform: translateY(var(--atlas-beam-travel, 48px)); }
+}
+.atlas-timeline-beam {
+  animation: atlas-timeline-beam 3.4s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+}
+
+/* Capture popover — the radar on a bound project.
+
+   The sweep *wobbles* between roughly -55° and -42° instead of rotating: a full
+   turn reads as a loading spinner, and this is a recorder that never finishes.
+   The ping restarts on every hop (React keys it on the blip index). */
+@keyframes atlas-radar-sweep {
+  0%   { transform: rotate(-55deg); opacity: 0.75; }
+  25%  { transform: rotate(-43deg); opacity: 1; }
+  50%  { transform: rotate(-50deg); opacity: 0.85; }
+  75%  { transform: rotate(-45deg); opacity: 1; }
+  100% { transform: rotate(-55deg); opacity: 0.75; }
+}
+.atlas-radar-sweep {
+  animation: atlas-radar-sweep 16s ease-in-out infinite;
+}
+
+@keyframes atlas-radar-ping {
+  0%   { transform: scale(0.6); opacity: 0.9; }
+  70%  { opacity: 0.35; }
+  100% { transform: scale(1.6); opacity: 0; }
+}
+.atlas-radar-ping {
+  animation: atlas-radar-ping 1.4s ease-out 0.35s both;
+}
+
+@keyframes atlas-timeline-row {
+  from { opacity: 0; transform: translateY(3px); filter: blur(2px); }
+  to   { opacity: 1; transform: translateY(0); filter: blur(0); }
+}
+.atlas-timeline-row {
+  animation: atlas-timeline-row 320ms ease-out both;
+}
+
 /* Brief highlight when jumping to a message (Cmd+F / links panel). */
 @keyframes atlas-jump-flash-kf {
   0%   { background-color: var(--accent-primary); opacity: 0.14; }
@@ -601,7 +663,18 @@
   .atlas-stream-caret { animation: none; }
   .atlas-pill-in,
   .atlas-panel-in-br,
+  .atlas-panel-in-tl,
+  .atlas-timeline-row,
   .atlas-fade-in { animation: none; }
+  /* The two looping animations in the chrome: the capture dot's halo and the
+     Timeline teaser's rail pulse. Both are decorative. */
+  .animate-ping,
+  .atlas-radar-sweep,
+  .atlas-radar-ping,
+  .atlas-timeline-beam { animation: none; }
+  .atlas-timeline-beam, .atlas-radar-ping { opacity: 0; }
+  /* Hold the sweep at its resting angle rather than un-rotated. */
+  .atlas-radar-sweep { transform: rotate(-50deg); }
   .animate-scale-in,
   .animate-fade-in,
   .animate-slide-in-right { animation: none !important; }

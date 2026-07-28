@@ -106,6 +106,13 @@
   --stat-added: #3fb950;
   --stat-removed: #f85149;
 
+  /* Session capture's "recording" green — the dot in the titlebar pill and the
+     radar sweep in its popover. Chromatic on purpose and NOT `--status-success`,
+     which is deliberately grey (#4d4d4d) because success is the ordinary case
+     everywhere else in the chrome. This is the one signal that has to read as
+     *on*, so it borrows the Artifacts surface's green rather than the neutral. */
+  --capture-live: #3fb950;
+
   /* === Diff — monochromatic === */
   --diff-added-bg: rgba(77, 77, 77, 0.08);
   --diff-added-text: #4d4d4d;

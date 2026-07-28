@@ -14,6 +14,7 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 import { cn } from "@/lib/utils";
+import { copyText } from "@/lib/clipboard";
 import { timeAgo } from "@/lib/time-ago";
 import { AccountAvatar } from "@/features/auth/components/account-avatar";
 import { useAuthStore } from "@/features/auth/stores/auth-store";
@@ -696,11 +697,13 @@ function RolePicker({
   );
 }
 
+/**
+ * Both call sites copy *after* an await — the invite round-trip, or a click
+ * handler that already yielded — so this must go through `copyText`, which
+ * falls back to the native pasteboard when WKWebView has dropped the user
+ * activation the web clipboard API demands.
+ */
 async function copy(text: string, success: string) {
-  try {
-    await navigator.clipboard.writeText(text);
-    toast.success(success);
-  } catch {
-    toast.error("Couldn't copy to the clipboard.");
-  }
+  if (await copyText(text)) toast.success(success);
+  else toast.error("Couldn't copy to the clipboard.");
 }
