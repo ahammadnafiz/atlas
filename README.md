@@ -36,7 +36,7 @@ Most "AI IDEs" today are forks of VS Code with a chat pane bolted on. Atlas is t
 Concretely:
 
 - **The agent is plural.** Multiple Claude Code sessions run concurrently, each with its own thread history and stop button. Switching tabs never freezes a running stream.
-- **State is just files.** No SQLite, no proprietary format. Chat history is JSONL on disk (read directly by Claude Code's own resume flag), notes are markdown, canvases are JSON.
+- **State is just files.** No proprietary format. Chat history is JSONL on disk (read directly by Claude Code's own resume flag), notes are markdown, canvases are JSON. The one exception is the checkpoint record — which agent session produced which commit — which is SQLite in the project's gitignored `.atlas/`, because it is queried, not read.
 - **Local-first.** Your projects, notes, chat history, and memory live on your machine and are never uploaded. Atlas does talk to the network — the model providers you point it at, the research and GitHub features you invoke, an update check, and anonymous usage data you can switch off — but none of that carries your content. See [Accounts and privacy](#accounts-and-privacy).
 - **The account is optional.** Atlas has an Atlas account you can connect to (see [Accounts and privacy](#accounts-and-privacy)), but nothing is gated behind it. Signed out, every feature works exactly as it does signed in.
 
