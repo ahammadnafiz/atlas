@@ -27,7 +27,7 @@ use notify::RecursiveMode;
 use notify_debouncer_full::new_debouncer;
 use parking_lot::RwLock;
 use serde::Serialize;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 use super::git::{git_refs_compute, GitRefs};
 
@@ -91,6 +91,28 @@ impl GitWatcherState {
         *self.refs_cache.write() = None;
     }
 
+    /// Is a watcher currently attached for this workspace?
+    ///
+    /// The capture-health signal asks the registry directly rather than
+    /// inferring liveness from event silence — a quiet repository and a dead
+    /// watcher produce exactly the same (absence of) events, which is why the
+    /// clear-all bug went unnoticed for as long as it did.
+    pub fn is_watching(&self, workspace_id: &str) -> bool {
+        self.watchers.read().contains_key(workspace_id)
+    }
+
+    /// Is any watcher attached for this repository root?
+    ///
+    /// The registry is keyed by the workspace UUID the frontend supplies, but
+    /// health callers only reliably know the project path — and looking a path
+    /// up in a UUID-keyed map answered `false` forever, turning an omitted
+    /// optional parameter into a permanent false "capture stopped". Each
+    /// watcher also remembers its root, so liveness is answerable by either
+    /// key.
+    pub fn is_watching_root(&self, root: &Path) -> bool {
+        self.watchers.read().values().any(|w| w.root == root)
+    }
+
     /// Shared handle for the watcher closure to invalidate the cache
     /// from outside `impl GitWatcherState`. Arc-cloning is constant
     /// time; the closure ends up owning a second Arc and writes
@@ -118,12 +140,16 @@ pub async fn git_watch_start(
 ) -> Result<(), String> {
     let key = workspace_id.unwrap_or_else(|| project_path.clone());
     let root = PathBuf::from(&project_path);
-    let dot_git = root.join(".git");
-    if !dot_git.is_dir() {
+    // `.git` may be a directory (an ordinary repository) or a file carrying a
+    // `gitdir:` pointer (a linked worktree). Both are valid repositories, and
+    // refusing the file form left every worktree permanently unwatched — with
+    // the health signal telling the user to "reopen the Workspace", which
+    // could never fix it.
+    let Some(git_dirs) = resolve_git_dirs(&root) else {
         // Not a git project — leave any existing watcher alone (caller
         // may switch projects in/out of a non-repo).
         return Ok(());
-    }
+    };
 
     // Idempotent: if this workspace already watches the same root (e.g. on a
     // switch back), don't drop + recreate the watcher.
@@ -152,6 +178,7 @@ pub async fn git_watch_start(
             String,
         > {
             let project_str = root_for_task.to_string_lossy().into_owned();
+            let root_for_cb = root_for_task.clone();
             let app_for_cb = app_for_task.clone();
             let mut debouncer = new_debouncer(
                 Duration::from_millis(200),
@@ -163,6 +190,18 @@ pub async fn git_watch_start(
                         // the event, a fresh compute would be cheap
                         // *and* correct.
                         *refs_cache_for_cb.write() = None;
+
+                        // Session capture's commit walk. The first in-process
+                        // consumer of this watcher: everything else here goes
+                        // out as a window event for the frontend, but commit
+                        // detection must not depend on a window being open or
+                        // on a renderer being responsive. This only enqueues —
+                        // the walk itself runs on the capture worker thread, so
+                        // the debounced callback returns immediately.
+                        app_for_cb
+                            .state::<super::capture::CaptureState>()
+                            .note_git_change(&root_for_cb);
+
                         let _ = app_for_cb.emit(
                             "atlas:git-changed",
                             GitChangedPayload {
@@ -179,12 +218,15 @@ pub async fn git_watch_start(
             )
             .map_err(|e| format!("failed to create git watcher: {e}"))?;
 
-            // Targeted watches — see module doc for rationale.
-            let dot_git = root_for_task.join(".git");
-            let head = dot_git.join("HEAD");
-            let packed_refs = dot_git.join("packed-refs");
-            let refs_dir = dot_git.join("refs");
-            let index = dot_git.join("index");
+            // Targeted watches — see module doc for rationale. For a linked
+            // worktree, HEAD and the index live in its private gitdir while
+            // refs and packed-refs live in the shared common dir; watching the
+            // shared refs also surfaces commits made from sibling worktrees,
+            // which the debounced walk handles as ordinary no-ops.
+            let head = git_dirs.git_dir.join("HEAD");
+            let packed_refs = git_dirs.common_dir.join("packed-refs");
+            let refs_dir = git_dirs.common_dir.join("refs");
+            let index = git_dirs.git_dir.join("index");
 
             for (label, path, recursive) in [
                 ("HEAD", head, RecursiveMode::NonRecursive),
@@ -208,6 +250,14 @@ pub async fn git_watch_start(
     .await
     .map_err(|e| e.to_string())??;
 
+    // Open-time backfill. This is what catches every commit made while Atlas
+    // was closed — the decisive advantage over git hooks, which can only ever
+    // see commits made after they were installed. It is also the *only*
+    // mechanism for a Workspace that is never activated again, since a watcher
+    // exists only for workspaces activated at least once this app session.
+    app.state::<super::capture::CaptureState>()
+        .note_git_change(&root);
+
     state.watchers.write().insert(
         key,
         ActiveWatcher {
@@ -218,15 +268,24 @@ pub async fn git_watch_start(
     Ok(())
 }
 
+/// Stop watching one workspace.
+///
+/// The workspace id is **required**. It used to be optional, with a missing id
+/// meaning "drop every watcher" — and the frontend called it that way whenever
+/// the current project became null, killing commit detection for every open
+/// workspace at once. Nothing observed that, because a dead watcher and a quiet
+/// repository look identical from the outside. Making the id mandatory puts that
+/// failure out of reach rather than relying on call sites to remember; genuine
+/// teardown uses [`git_watch_stop_all`], which says what it does.
 #[tauri::command]
-pub fn git_watch_stop(workspace_id: Option<String>, state: State<'_, GitWatcherState>) {
-    match workspace_id {
-        Some(id) => {
-            state.watchers.write().remove(&id);
-        }
-        // No id (legacy / app teardown): drop everything.
-        None => state.watchers.write().clear(),
-    }
+pub fn git_watch_stop(workspace_id: String, state: State<'_, GitWatcherState>) {
+    state.watchers.write().remove(&workspace_id);
+}
+
+/// Drop every watcher. Application teardown only.
+#[tauri::command]
+pub fn git_watch_stop_all(state: State<'_, GitWatcherState>) {
+    state.watchers.write().clear();
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -255,6 +314,50 @@ pub fn git_watch_status(
             root: None,
         },
     }
+}
+
+/// Where a repository's git metadata actually lives.
+struct GitDirs {
+    /// The repository's own gitdir: `.git/` for an ordinary checkout, or the
+    /// `.git/worktrees/<name>/` directory a worktree's `.git` file points at.
+    /// HEAD and the index live here.
+    git_dir: PathBuf,
+    /// The shared directory holding refs and packed-refs. Identical to
+    /// `git_dir` except for linked worktrees, whose `commondir` file points
+    /// back at the main repository's `.git/`.
+    common_dir: PathBuf,
+}
+
+/// Resolve the watchable git directories for a project root, accepting both an
+/// ordinary `.git/` directory and a worktree's `.git` gitdir-pointer file.
+fn resolve_git_dirs(root: &Path) -> Option<GitDirs> {
+    let dot_git = root.join(".git");
+    if dot_git.is_dir() {
+        return Some(GitDirs { git_dir: dot_git.clone(), common_dir: dot_git });
+    }
+    if !dot_git.is_file() {
+        return None;
+    }
+
+    // A gitdir pointer: `gitdir: /path/to/repo/.git/worktrees/<name>`.
+    let content = std::fs::read_to_string(&dot_git).ok()?;
+    let pointer = content.strip_prefix("gitdir:")?.trim();
+    let git_dir = {
+        let p = Path::new(pointer);
+        if p.is_absolute() { p.to_path_buf() } else { root.join(p) }
+    };
+    if !git_dir.is_dir() {
+        return None;
+    }
+
+    let common_dir = match std::fs::read_to_string(git_dir.join("commondir")) {
+        Ok(raw) => {
+            let p = Path::new(raw.trim());
+            if p.is_absolute() { p.to_path_buf() } else { git_dir.join(p) }
+        }
+        Err(_) => git_dir.clone(),
+    };
+    Some(GitDirs { git_dir, common_dir })
 }
 
 /// Allow other modules (e.g. `git_status` post-write or future

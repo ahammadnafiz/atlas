@@ -33,6 +33,11 @@ pub use atlas_cersei::{MemDoc, MemorySearchFn, ReplayItem, register_memory_searc
 pub use atlas_cersei::{corpus_sessions as cersei_corpus_sessions, CorpusSession as CerseiCorpusSession};
 // On-disk cersei session dir (cwd-hashed) — used by the session file-watcher.
 pub use atlas_cersei::project_sessions_dir as cersei_project_sessions_dir;
+// The native agent's plugin id. Re-exported so a host that only sees a
+// `SessionSnapshot` can tell the native agent from an ACP-hosted one without
+// taking its own dependency on atlas-cersei — session capture needs the
+// distinction because only the native agent reports a real token split.
+pub use atlas_cersei::CERSEI_PLUGIN_ID;
 pub use atlas_agentkit::{
     AgentConnection, AuthFlow, CompressionCtl, EffortControl, ModelSelector, RunningTurn,
     SessionModes, TurnId,

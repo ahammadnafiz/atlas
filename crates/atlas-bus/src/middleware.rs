@@ -136,6 +136,58 @@ mod tests {
         }
     }
 
+    /// Why a consumer that must not miss an event belongs here rather than on
+    /// the broadcast bus.
+    ///
+    /// The bus is a ring buffer: `publish` never blocks, so a subscriber that
+    /// falls further behind than the capacity *loses events* — counted and
+    /// logged, but gone. That is the correct trade for the UI fan-out, where a
+    /// dropped frame is invisible. It is the wrong trade for session capture,
+    /// where a dropped event is a turn missing from the permanent record.
+    ///
+    /// The pipeline runs synchronously on the emit thread and therefore cannot
+    /// lag by construction. This test pins the contrast so a future refactor
+    /// that "simplifies" capture onto a bus subscription fails here first.
+    #[tokio::test]
+    async fn the_pipeline_sees_every_event_where_a_lagging_subscriber_loses_some() {
+        use crate::EventBus;
+
+        const CAPACITY: usize = 4;
+        const BURST: u32 = 64;
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let pipe = OutboundPipeline::new().with(Arc::new(Recorder {
+            tag: "capture",
+            log: seen.clone(),
+        }));
+
+        let bus: EventBus<u32> = EventBus::with_capacity(CAPACITY);
+        let mut lagging = bus.subscribe_counted("bare-subscription");
+
+        for event in 0..BURST {
+            bus.publish(event);
+            pipe.run(&event);
+        }
+
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            BURST as usize,
+            "the pipeline must see every event"
+        );
+
+        drop(bus);
+        let mut received = 0;
+        while lagging.recv().await.is_some() {
+            received += 1;
+        }
+        assert!(
+            received < BURST as usize && lagging.dropped() > 0,
+            "the bare subscription was expected to lose events under this burst \
+             (received {received}, dropped {})",
+            lagging.dropped()
+        );
+    }
+
     #[tokio::test]
     async fn inbound_threads_context_in_order() {
         let pipe = InboundPipeline::new()

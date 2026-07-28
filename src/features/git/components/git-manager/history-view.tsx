@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import * as Popover from "@radix-ui/react-popover";
+import { invoke } from "@tauri-apps/api/core";
 import { toast } from "sonner";
 import {
   ArrowLeft,
@@ -7,12 +8,14 @@ import {
   Undo2,
   GitGraph,
   RotateCcw,
+  Sparkles,
   Tag,
   Check,
   ShieldCheck,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useGitStore } from "../../stores/git-store";
+import { useArtifactsStore } from "@/features/artifacts/stores/artifacts-store";
 import { useReviewStore } from "@/features/review-agents/stores/review-store";
 import { useLayoutStore } from "@/features/layout/stores/layout-store";
 import { DiffView } from "../diff-view";
@@ -131,6 +134,7 @@ export function HistoryView() {
             <div className="mt-1 text-[10px] text-text-tertiary">
               {selected.author} · {selected.date}
             </div>
+            <CommitSessions sha={selected.hash} />
           </div>
         </div>
         <DiffView diff={selected.diff} className="flex-1 min-h-0" emptyLabel="No file changes" />
@@ -204,5 +208,84 @@ function ResetMenu({ onReset }: { onReset: (mode: "soft" | "mixed" | "hard") => 
         </Popover.Content>
       </Popover.Portal>
     </Popover.Root>
+  );
+}
+
+/** One Session that produced this commit. */
+interface CommitSession {
+  sessionId: string;
+  title: string | null;
+  messageCount: number;
+  toolCallCount: number;
+  files: string[];
+}
+
+/**
+ * The Sessions behind the selected commit — the answer to "why is this written
+ * this way", offered where the question actually gets asked.
+ *
+ * Renders nothing at all when the commit has no recorded Session, which is the
+ * common case: capture may be off, the commit may predate it, or it may be
+ * human work the link rule deliberately did not attribute to an agent.
+ */
+function CommitSessions({ sha }: { sha: string }) {
+  const repoPath = useGitStore.use.repoPath();
+  const addTab = useLayoutStore.use.actions().addTab;
+  const [sessions, setSessions] = useState<CommitSession[]>([]);
+
+  useEffect(() => {
+    if (!repoPath) return;
+    let cancelled = false;
+    setSessions([]);
+    invoke<CommitSession[]>("capture_commit_sessions", { projectPath: repoPath, commitSha: sha })
+      .then((found) => {
+        if (!cancelled) setSessions(found);
+      })
+      // A Workspace with capture off returns an empty list rather than failing,
+      // so reaching here means a store-level problem. The git panel is not the
+      // place to report it — capture health already owns that signal.
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [repoPath, sha]);
+
+  if (sessions.length === 0) return null;
+
+  const open = (sessionId: string) => {
+    if (!repoPath) return;
+    // The sha travels with the request so the Session lands on this commit's
+    // Checkpoint rather than at the top of a conversation that may have
+    // produced several.
+    useArtifactsStore.getState().actions.openSession({ sessionId, projectPath: repoPath, commitSha: sha });
+    addTab({ id: "artifacts", type: "artifacts", title: "Timeline", closable: true, dirty: false, data: {} });
+  };
+
+  return (
+    <div className="mt-2 border-t border-border-subtle pt-2">
+      <div className="text-[9px] uppercase tracking-wider text-text-tertiary">
+        Produced by {sessions.length} session{sessions.length === 1 ? "" : "s"}
+      </div>
+      {sessions.map((s) => (
+        <button
+          key={s.sessionId}
+          onClick={() => open(s.sessionId)}
+          className="mt-1 w-full rounded border border-border-default bg-bg-raised px-2 py-1.5 text-left hover:bg-bg-hover group"
+          title="Open this Session in the Timeline"
+        >
+          <div className="flex items-start gap-1.5">
+            <Sparkles size={11} className="mt-0.5 shrink-0 text-text-tertiary" />
+            <span className="text-[11px] text-text-secondary group-hover:text-text-primary line-clamp-2">
+              {s.title ?? "Untitled session"}
+            </span>
+          </div>
+          <div className="mt-0.5 pl-[18px] text-[9px] text-text-tertiary truncate">
+            {s.messageCount} message{s.messageCount === 1 ? "" : "s"} · {s.toolCallCount} tool call
+            {s.toolCallCount === 1 ? "" : "s"}
+            {s.files.length > 0 && ` · ${s.files.join(", ")}`}
+          </div>
+        </button>
+      ))}
+    </div>
   );
 }

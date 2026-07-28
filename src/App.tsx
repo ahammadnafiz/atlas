@@ -941,7 +941,11 @@ export function App() {
     if (!currentProject) {
       fileIndex.closeProject().catch(() => {});
       markFileIndexClosed();
-      void invoke("git_watch_stop").catch(() => {});
+      // Deliberately does NOT stop git watchers. This branch runs whenever the
+      // *current* project becomes null, but watchers are per-workspace and a
+      // backgrounded workspace must keep watching — its commits still need
+      // linking to its Sessions. Tearing one down is `teardownHot`'s job, with
+      // the workspace id it actually owns.
       void invoke("recent_files_close_project").catch(() => {});
       // Drop the mention cache so the @-picker doesn't briefly
       // surface the previous project's notes / symbols on a fresh
@@ -960,6 +964,12 @@ export function App() {
       projectPath: currentProject.path,
       workspaceId,
     }).catch((e) => console.warn("git watch start failed:", e));
+    // Capture: a bound Workspace just became active — open its store (which
+    // also heals a folder rename) and kick its transcript import and drain.
+    // A no-op for Workspaces that never enabled capture.
+    void invoke("capture_activate", { projectPath: currentProject.path }).catch((e) =>
+      console.warn("capture activate failed:", e),
+    );
     // Clear the global recents mirror SYNCHRONOUSLY before the async reload so
     // there's no window where it still shows the previous project's files
     // (the picker also filters by project as a belt-and-suspenders guard).

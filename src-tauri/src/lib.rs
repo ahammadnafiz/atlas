@@ -194,6 +194,17 @@ pub fn run() {
                     .unwrap_or_else(|_| std::path::PathBuf::from("."));
                 app.manage(commands::auth::AuthState::new(config_dir));
                 commands::auth::restore_on_launch(&app.handle());
+
+                // Session capture's drain needs a credential, and the auth core
+                // only exists from here on. Installed rather than passed in at
+                // construction because `CaptureState` is registered earlier in
+                // the builder chain; until this runs the drain simply parks,
+                // which is exactly Local-mode behaviour.
+                let core = app.state::<commands::auth::AuthState>().core();
+                app.state::<commands::capture::CaptureState>()
+                    .install_token_provider(Box::new(move || {
+                        tauri::async_runtime::block_on(core.mint_access_token()).ok()
+                    }));
             }
 
             commands::updater::init_on_startup(&app.handle());
@@ -240,6 +251,10 @@ pub fn run() {
         .manage(commands::memory_chat::MemoryChatState::new())
         .manage(commands::memory_sharing::MemorySharingState::new())
         .manage(commands::shared_memory::SharedMemoryStore::new())
+        // Owns the per-Workspace session stores and the capture worker
+        // thread. Managed before `install_manager` runs its pipeline so a
+        // delta arriving early finds it.
+        .manage(commands::capture::CaptureState::new())
         .manage(commands::updater::UpdaterState::new())
         // Drop a window's per-window index + mention caches when it closes, so
         // its file watcher stops and memory is freed (these states are keyed by
@@ -360,6 +375,29 @@ pub fn run() {
             commands::git_ops::git_op_control,
             commands::git_watcher::git_watch_start,
             commands::git_watcher::git_watch_stop,
+            commands::git_watcher::git_watch_stop_all,
+            commands::capture::capture_detect,
+            commands::capture::capture_binding,
+            commands::capture::capture_enable,
+            commands::capture::capture_refresh,
+            commands::capture::capture_disable,
+            commands::capture::capture_git_init,
+            commands::capture::capture_health,
+            commands::capture::capture_import_preview,
+            commands::capture::capture_import_confirm,
+            commands::capture::capture_slug_available,
+            commands::capture::capture_register_cloud,
+            commands::capture::capture_promotion_preview,
+            commands::capture::capture_promote,
+            commands::capture::capture_connect_options,
+            commands::capture::capture_connect,
+            commands::capture::capture_activate,
+            commands::capture::capture_retry_failed,
+            commands::capture::artifacts_sessions,
+            commands::capture::artifacts_session,
+            commands::capture::artifacts_payload,
+            commands::capture::capture_commit_sessions,
+            commands::capture::artifacts_board,
             commands::git_watcher::git_watch_status,
             commands::mention_search::mention_search,
             commands::mention_search::mention_cache_set_knowledge,

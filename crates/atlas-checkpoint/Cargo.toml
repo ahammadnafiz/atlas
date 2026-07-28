@@ -1,0 +1,35 @@
+[package]
+name = "atlas-checkpoint"
+version = "0.1.0"
+edition = "2021"
+description = "Atlas's agent-session record: local SQLite store, redact-on-write capture, git commit linkage, transcript import, and the sync outbox. Tauri-free so the whole surface is testable against a real database and a real git repository."
+
+[lib]
+name = "atlas_checkpoint"
+
+[dependencies]
+# The store. Bundled so the database is self-contained and does not depend on a
+# system sqlite — the same reason src-tauri already bundles it for the Codex
+# history reader.
+rusqlite = { version = "0.32", features = ["bundled"] }
+# Redaction runs before persistence, so this is a hard dependency of the write
+# path rather than of the upload path.
+atlas-redact = { path = "../atlas-redact" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4"] }
+sha2 = "0.10"
+tracing = "0.1"
+# The drain is the only networked part of this crate. `blocking` because it runs
+# on the capture worker's own thread, and rustls rather than native-tls for the
+# same reason the app does: the macOS Security.framework path fails silently in
+# sandboxed release builds.
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "blocking",
+    "rustls-tls",
+] }
+
+[dev-dependencies]
+tempfile = "3"

@@ -41,6 +41,7 @@ import { useRecentChatsStore, type RecentChat } from "../stores/recent-chats-sto
 import { useProjectStore } from "@/features/project/stores/project-store";
 import { useOrgStore } from "@/features/organisations/stores/org-store";
 import { OrgSwitcher } from "@/features/organisations/components/org-switcher";
+import { CaptureControl } from "@/features/capture/components/capture-control";
 import { useLayoutStore } from "@/features/layout/stores/layout-store";
 import { AtlasIcon } from "@/components/atlas-icon";
 import { useFullscreen } from "@/hooks/use-fullscreen";
@@ -639,6 +640,12 @@ export function WorkspaceSidebar() {
       {/* Organisation switcher — the top-level tenant picker. Sits below the
        *  titlebar drag zone so it clears the traffic lights. */}
       <OrgSwitcher />
+
+      {/* Sessions captured in the current Workspace. Sits above the other
+       *  header actions because it is Workspace-scoped, unlike Console/Logs —
+       *  and carries the recording dot, so whether work is being recorded is
+       *  answerable without opening anything. */}
+      <CaptureControl />
 
       {/* Header actions. */}
       <div className="px-1.5 pb-1 shrink-0 space-y-0.5">

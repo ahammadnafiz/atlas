@@ -99,6 +99,13 @@
   --status-purple: #999999;
   --status-orange: #CD9731;
 
+  /* Session line counts — the one deliberately chromatic pair in the
+     Artifacts surface. The app's diff views stay monochrome; a session's
+     +N/-N is a summary statistic read at a glance, and the reference
+     surfaces established green/red as its vocabulary. */
+  --stat-added: #3fb950;
+  --stat-removed: #f85149;
+
   /* === Diff — monochromatic === */
   --diff-added-bg: rgba(77, 77, 77, 0.08);
   --diff-added-text: #4d4d4d;

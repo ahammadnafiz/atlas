@@ -403,23 +403,30 @@ fn apply_tool_call(
                 tc.arguments = normalise_tool_input(Some(input));
             }
             if let Some(t) = title.clone() {
-                tc.tool_name = t.clone();
+                // Only the display title is refreshed. `tool_name` keeps its
+                // first-sighting value: for the native agent that IS the real
+                // tool name ("Read", "Bash"), and overwriting it with a later
+                // title threw that away — leaving no field anywhere carrying the
+                // name, which is what session capture needs to group by.
                 tc.title = Some(t);
             }
             if let Some(k) = kind.clone() {
                 tc.kind = Some(k);
             }
+            // Locations arrive late. Many agents (Claude Code especially) attach
+            // them only on the completion update and never on the create, and
+            // this branch previously never read them — so the paths an edit
+            // touched were silently lost. Two visible symptoms: the file chips on
+            // the turn card went missing, and a Checkpoint never formed. Empty is
+            // treated as "no news" rather than "cleared", because an update
+            // carrying only a status must not erase paths we already have.
+            if let Some(locations) = v.get("locations").and_then(|l| l.as_array()) {
+                if !locations.is_empty() {
+                    tc.locations = locations.clone();
+                }
+            }
             if let Some(result) = formatted.clone() {
                 tc.result = Some(result);
-            }
-            // Claude Code frequently reports `locations` only on the UPDATE and
-            // never on the create, so the create-only assignment below silently
-            // dropped every path it told us about. Guarded on non-empty: an
-            // update that omits the field must not wipe what the create set.
-            if let Some(locs) = v.get("locations").and_then(|l| l.as_array()) {
-                if !locs.is_empty() {
-                    tc.locations = locs.clone();
-                }
             }
             let updated = tc.clone();
             let msg_id = msg.id.clone();
@@ -490,16 +497,18 @@ mod tests {
         fn emit(&self, _envelope: SessionDeltaEnvelope) {}
     }
 
-    fn harness() -> (Emitter, Mutex<SessionState>) {
-        (
-            Emitter::new(Arc::new(NullSink)),
-            Mutex::new(SessionState::new(
-                AgentId::new(),
-                "sess-1".into(),
-                "/tmp".into(),
-                "codex".into(),
-            )),
-        )
+    /// A session with a fixed (nil) agent id so nothing in these tests depends on
+    /// a random value. The plugin id / cwd are inert here — every assertion below
+    /// is about tool-call bookkeeping, not routing.
+    fn session() -> (Emitter, Mutex<SessionState>) {
+        let emitter = Emitter::new(Arc::new(NullSink));
+        let state = Mutex::new(SessionState::new(
+            AgentId(uuid::Uuid::nil()),
+            "sess-1".into(),
+            "/tmp/project".into(),
+            "claude-code".into(),
+        ));
+        (emitter, state)
     }
 
     /// Read the single tool call back out of the session state.
@@ -513,13 +522,164 @@ mod tests {
             .clone()
     }
 
+    // ---------------------------------------------------------------------
+    // Entry point: `apply_session_update` — the real ACP dispatch path.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn locations_arriving_only_on_a_completion_update_are_captured() {
+        // The defect this pins: many agents attach `locations` only when the
+        // call completes, and the upsert branch used to never read the field.
+        // Two symptoms, neither an error: the turn card's file chips went
+        // missing, and a Checkpoint never formed because the paths the edit
+        // touched were silently lost.
+        let (emitter, state) = session();
+
+        apply_session_update(
+            &emitter,
+            &state,
+            serde_json::from_value(serde_json::json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "tc-1",
+                "title": "Edit src/lib.rs",
+                "kind": "edit",
+                "status": "in_progress",
+            }))
+            .expect("tool_call decodes"),
+        );
+        assert!(only_tool_call(&state).locations.is_empty());
+
+        apply_session_update(
+            &emitter,
+            &state,
+            serde_json::from_value(serde_json::json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "tc-1",
+                "status": "completed",
+                "locations": [{ "path": "/tmp/project/src/lib.rs" }],
+            }))
+            .expect("tool_call_update decodes"),
+        );
+
+        let tc = only_tool_call(&state);
+        assert_eq!(tc.status, ToolCallStatus::Completed);
+        assert_eq!(tc.locations.len(), 1, "locations from the update were dropped");
+        assert_eq!(tc.locations[0]["path"], "/tmp/project/src/lib.rs");
+    }
+
+    #[test]
+    fn a_later_update_without_locations_does_not_erase_the_ones_we_have() {
+        let (emitter, state) = session();
+
+        apply_session_update(
+            &emitter,
+            &state,
+            serde_json::from_value(serde_json::json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "tc-1",
+                "title": "Edit src/lib.rs",
+                "kind": "edit",
+                "status": "in_progress",
+                "locations": [{ "path": "/tmp/project/src/lib.rs" }],
+            }))
+            .unwrap(),
+        );
+        apply_session_update(
+            &emitter,
+            &state,
+            serde_json::from_value(serde_json::json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "tc-1",
+                "status": "completed",
+            }))
+            .unwrap(),
+        );
+
+        assert_eq!(only_tool_call(&state).locations.len(), 1);
+    }
+
+    #[test]
+    fn the_first_sighting_tool_name_survives_a_later_title_change() {
+        // For the native agent the first-sighting title IS the real tool name
+        // ("Read", "Bash"). Overwriting `tool_name` with every later title threw
+        // that away, leaving no field anywhere carrying the name that session
+        // capture needs to group by.
+        let (emitter, state) = session();
+
+        apply_session_update(
+            &emitter,
+            &state,
+            serde_json::from_value(serde_json::json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "tc-1",
+                "title": "Bash",
+                "kind": "execute",
+                "status": "in_progress",
+            }))
+            .unwrap(),
+        );
+        apply_session_update(
+            &emitter,
+            &state,
+            serde_json::from_value(serde_json::json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "tc-1",
+                "title": "Bash(cargo test --package atlas-review)",
+                "status": "completed",
+            }))
+            .unwrap(),
+        );
+
+        let tc = only_tool_call(&state);
+        assert_eq!(tc.tool_name, "Bash", "the name must not churn with the title");
+        assert_eq!(
+            tc.title.as_deref(),
+            Some("Bash(cargo test --package atlas-review)"),
+            "the display title must still refresh"
+        );
+    }
+
+    #[test]
+    fn a_failed_tool_call_keeps_its_failed_status() {
+        let (emitter, state) = session();
+        apply_session_update(
+            &emitter,
+            &state,
+            serde_json::from_value(serde_json::json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "tc-1",
+                "title": "Bash",
+                "kind": "execute",
+                "status": "in_progress",
+            }))
+            .unwrap(),
+        );
+        apply_session_update(
+            &emitter,
+            &state,
+            serde_json::from_value(serde_json::json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "tc-1",
+                "status": "failed",
+            }))
+            .unwrap(),
+        );
+        assert_eq!(only_tool_call(&state).status, ToolCallStatus::Failed);
+    }
+
+    // ---------------------------------------------------------------------
+    // Entry point: `apply_tool_call` directly. Same invariants, exercised one
+    // layer below the `sessionUpdate` dispatch — so a regression in either the
+    // decode or the upsert is caught on its own.
+    // ---------------------------------------------------------------------
+
     /// Claude Code often reports `locations` only on the UPDATE. Before this was
     /// fixed the update branch ignored the field entirely, so every path it told
     /// us about was dropped — the file chips on the turn card went missing and
     /// the analytics middleware had nothing to count.
     #[test]
     fn locations_survive_update_only_delivery() {
-        let (emitter, state) = harness();
+        let (emitter, state) = session();
 
         apply_tool_call(
             &emitter,
@@ -555,7 +715,7 @@ mod tests {
     /// an earlier update) established.
     #[test]
     fn empty_locations_update_does_not_wipe() {
-        let (emitter, state) = harness();
+        let (emitter, state) = session();
 
         apply_tool_call(
             &emitter,

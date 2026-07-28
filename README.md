@@ -29,6 +29,7 @@ Start with [CONTRIBUTING.md](CONTRIBUTING.md) to send a change, or [open an issu
 
 - [Why Atlas](#why-atlas)
 - [How it works](#how-it-works)
+- [Checkpoints](#checkpoints)
 - [Features](#features)
 - [Download](#download)
 - [Build from source](#build-from-source)
@@ -45,7 +46,7 @@ Agents now write a large share of the code and keep none of the reasoning behind
 - **Switching agents loses the thread.** The first message of a new session carries a curated fact pack and the tail of your last one, even when that session ran on a different agent.
 - **You can't review what you can't see.** Every session is stored and searchable, next to a real commit graph and file-level diffs of what actually landed.
 - **Context lives in ten places.** The knowledge base, `CLAUDE.md`, `AGENTS.md`, Claude Code's memory files, and Codex's history fold into one index every agent reads from.
-- **Nothing is locked in.** Notes are markdown, canvases are JSON, sessions are JSONL, and the editor is a file on disk. Close Atlas and pick up in vim.
+- **Nothing is locked in.** Notes are markdown, canvases are JSON, sessions are JSONL, and the editor is a file on disk. Close Atlas and pick up in vim. The one exception is the checkpoint record — which agent session produced which commit — which is SQLite in the project's gitignored `.atlas/`, because it is queried, not read.
 - **Built for agents from the ground up.** The agent runtime, shared memory, and session history are the foundation the rest of the app is built on.
 
 ## How it works
@@ -68,6 +69,10 @@ Before your message reaches the agent, Atlas assembles context around it:
 - **Claude Code's memory is visible to Codex, and the reverse.** Neither agent can read the other's history on its own.
 - **Folders resolve to a pointer, not a paste.** `@`-ing a 5000-line file sends a path the agent reads on demand, so one mention doesn't occupy the context window for the rest of the session.
 - **Embedding runs on your machine.** Retrieval never leaves the device.
+
+## Checkpoints
+
+Atlas records every agent session locally in `.atlas/sessions.db`, with secrets scrubbed before anything touches disk. When you commit — from any tool, even with Atlas closed — the commit is linked back to the session that produced it as a Checkpoint, and links survive rebases and amends. Local mode works fully offline with no account.
 
 ## Features
 
@@ -164,6 +169,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md). Two things catch people out:
 
 - **Your code, notes, and sessions stay on your machine.** Nothing is uploaded to run an agent.
 - **Secrets are scrubbed before anything is written to disk.** Not before upload, before persistence.
+- **Session capture is local-only by default.** The [Checkpoints](#checkpoints) record of your agent sessions is written to `.atlas/sessions.db` on your machine and stays there — no account required, and nothing sent anywhere until you explicitly opt in to sync.
 - **Accounts are opt-in.** Sign in to create an organisation and sync across devices and teammates.
 - **Anonymous usage analytics are on by default.** Coarse metadata, never code or prompts. [What's collected, and how to turn it off](TELEMETRY.md).
 

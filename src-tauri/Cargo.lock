@@ -355,10 +355,12 @@ dependencies = [
  "anyhow",
  "atlas-acp",
  "atlas-agents",
+ "atlas-checkpoint",
  "atlas-codeindex",
  "atlas-embed",
  "atlas-gitdiff",
  "atlas-memory",
+ "atlas-redact",
  "atlas-review",
  "atlas-terminal",
  "base64 0.21.7",
@@ -478,6 +480,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "atlas-checkpoint"
+version = "0.1.0"
+dependencies = [
+ "atlas-redact",
+ "chrono",
+ "reqwest 0.12.28",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "atlas-codeindex"
 version = "0.1.0"
 dependencies = [
@@ -527,6 +544,14 @@ dependencies = [
  "tokio",
  "tracing",
  "usearch",
+]
+
+[[package]]
+name = "atlas-redact"
+version = "0.1.0"
+dependencies = [
+ "regex",
+ "serde_json",
 ]
 
 [[package]]
@@ -6278,6 +6303,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "encoding_rs",
+ "futures-channel",
  "futures-core",
  "futures-util",
  "h2",
