@@ -9,6 +9,7 @@ import {
   ChevronDown,
   GitCompare,
   FileCode2,
+  GitCommitHorizontal,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useGitStore, type GitFileStatus } from "../../stores/git-store";
@@ -383,16 +384,19 @@ export function ChangesView() {
             />
             Amend last commit
           </label>
+          {/* The house pill, same as the session-capture footer's actions and
+              the create-organisation modal's. The old style was a filled white
+              rectangle when enabled and a flat grey slab when not — two shapes
+              for one button, neither of them the app's own language. The pill
+              keeps its outline in both states and dims rather than changing
+              colour, so the control stays the same object while it waits for a
+              summary. */}
           <button
             onClick={doCommit}
             disabled={!canCommit}
-            className={cn(
-              "ml-auto px-3 h-7 rounded-md text-[11px] font-medium transition-colors",
-              canCommit
-                ? "bg-[var(--accent-primary)] text-[var(--bg-base)] hover:bg-[var(--accent-primary-hover)]"
-                : "bg-bg-elevated text-text-tertiary cursor-not-allowed",
-            )}
+            className="ml-auto inline-flex cursor-pointer items-center gap-1.5 rounded-full border border-[var(--border-default)] bg-[var(--bg-elevated)] px-3 py-1.5 text-[11px] font-medium leading-none text-[var(--text-primary)] transition-colors hover:bg-[var(--bg-hover)] disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-[var(--bg-elevated)]"
           >
+            <GitCommitHorizontal size={11} />
             {amend ? "Amend" : "Commit"}
           </button>
         </div>
