@@ -140,6 +140,32 @@ export function identify(id: TelemetryIdentity): void {
 }
 
 /**
+ * Attribute subsequent renderer events to an Organisation.
+ *
+ * The mirror of Rust's `telemetry_set_org`: posthog-js keeps its own state, so
+ * a crash reported from the renderer would otherwise land ungrouped even while
+ * every Rust event carried the org. Registered as a super-property *as well as*
+ * a group so it survives into `$exception` events, which is the only kind this
+ * client sends.
+ *
+ * Called on every org change — including switches while signed out and to
+ * local-only orgs, which is exactly the case sign-in-driven grouping missed.
+ */
+export function setOrgGroup(orgId: string | null): void {
+  if (!started) return;
+  try {
+    if (orgId) {
+      posthog.group("organisation", orgId);
+      posthog.register({ atlas_org_id: orgId });
+    } else {
+      posthog.unregister("atlas_org_id");
+    }
+  } catch {
+    /* never throw into the app */
+  }
+}
+
+/**
  * Return to the anonymous device person on sign-out.
  *
  * Not optional: `persistence: "localStorage"` means the account's distinct id

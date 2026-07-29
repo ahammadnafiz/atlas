@@ -6,6 +6,7 @@ import { useWorkspaceStore } from "@/features/workspaces/stores/workspace-store"
 import { useRecentChatsStore } from "@/features/workspaces/stores/recent-chats-store";
 import type { Organisation } from "../types";
 import { slugify } from "../types";
+import { syncOrgTelemetry } from "../lib/org-telemetry";
 import { auth, type AccountOrg } from "@/features/auth/lib/auth-api";
 import { useAuthStore } from "@/features/auth/stores/auth-store";
 import { toast } from "sonner";
@@ -170,6 +171,12 @@ export const useOrgStore = createSelectors(
           organisations: payload.organisations ?? [],
           activeOrganisationId: payload.activeOrganisationId ?? null,
         });
+        // Boot attribution. Rust seeds the same value from `state.json` at
+        // startup, so this is usually a no-op — but a profile whose active org
+        // is decided during hydrate (a v2 migration, a repaired pointer) would
+        // otherwise report events against the pre-migration org for the rest of
+        // the session.
+        syncOrgTelemetry(payload.activeOrganisationId ?? null);
       },
 
       createOrg: (name, slug) => {
@@ -322,7 +329,12 @@ export const useOrgStore = createSelectors(
 
       setSwitching: (v) => set({ orgSwitching: v }),
 
-      setActiveOrganisation: (id) => set({ activeOrganisationId: id }),
+      // The one place the active org changes, so the one place analytics
+      // attribution has to follow it.
+      setActiveOrganisation: (id) => {
+        set({ activeOrganisationId: id });
+        syncOrgTelemetry(id);
+      },
 
       mergeServerOrgs: (serverOrgs) => {
         // Repair first: earlier builds could append a local org for a server id
@@ -403,6 +415,10 @@ export const useOrgStore = createSelectors(
             ),
           }));
           scheduleAppStateSave();
+          // The org id did not change but its *kind* did — local→cloud — and
+          // with it what telemetry may say about it (a synced org has a
+          // server-side name worth defining on the group). Re-resolve.
+          if (get().activeOrganisationId === id) syncOrgTelemetry(id);
           logEvent({
             source: "project",
             kind: "org-enable-sync",

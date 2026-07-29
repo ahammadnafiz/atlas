@@ -195,6 +195,25 @@ pub fn run() {
                 app.manage(commands::auth::AuthState::new(config_dir));
                 commands::auth::restore_on_launch(&app.handle());
 
+                // Seed the Organisation every event is attributed to, from the
+                // state we just loaded. The app has an active org from its first
+                // frame; waiting for the renderer to announce it would leave
+                // every launch-time event ungrouped, which is exactly the
+                // window where launch/update/crash events land. Runs after
+                // `AuthState` is managed because a synced org's role is read
+                // from the auth snapshot.
+                {
+                    let handle = app.handle();
+                    let active = handle
+                        .state::<AppStateHandle>()
+                        .lock()
+                        .active_organisation_id
+                        .clone();
+                    handle
+                        .state::<Arc<telemetry::TelemetryClient>>()
+                        .set_active_org(commands::telemetry::resolve_org(handle, active.as_deref()));
+                }
+
                 // Session capture's drain needs a credential, and the auth core
                 // only exists from here on. Installed rather than passed in at
                 // construction because `CaptureState` is registered earlier in
@@ -479,6 +498,7 @@ pub fn run() {
             commands::telemetry::telemetry_config,
             commands::telemetry::telemetry_set_enabled,
             commands::telemetry::telemetry_capture,
+            commands::telemetry::telemetry_set_org,
             commands::feedback::feedback_submit,
             commands::updater::update_check_now,
             commands::updater::update_apply,

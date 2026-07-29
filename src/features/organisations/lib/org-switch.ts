@@ -1,4 +1,5 @@
 import { logEvent } from "@/features/log/lib/log";
+import { useLogStore } from "@/features/log/stores/log-store";
 import { flushAll } from "@/features/workspaces/lib/flush-registry";
 import { useWorkspaceStore } from "@/features/workspaces/stores/workspace-store";
 import {
@@ -69,8 +70,17 @@ export async function switchOrg(id: string): Promise<void> {
     wsActions.teardownForOrgSwitch();
     projectActions.setActiveProject(null);
 
-    // 4) Make the org swap authoritative.
+    // 4) Make the org swap authoritative. `setActiveOrganisation` also
+    //    re-points analytics attribution (see `syncOrgTelemetry`), so events
+    //    from here on are filed under the incoming org.
     orgActions.setActiveOrganisation(id);
+
+    //    Re-scope the activity console the same way: drop the outgoing org's
+    //    buffered entries and load the incoming org's pins. Without this the
+    //    console keeps showing work from projects the teardown above just
+    //    unmounted, which is the one surface in the app that would still be
+    //    global after an org switch.
+    void useLogStore.getState().actions.setOrg(id);
 
     // 5) Resolve the incoming org's target workspace and bring it online via
     //    the normal cold-load path. `switchTo` runs `loadProjectStores` + the

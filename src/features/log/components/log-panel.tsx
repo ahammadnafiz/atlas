@@ -31,6 +31,7 @@ import { cn } from "@/lib/utils";
 import { timeAgo } from "@/lib/time-ago";
 import { useLogStore, type LogEntry, type LogSource } from "../stores/log-store";
 import { useProjectStore } from "@/features/project/stores/project-store";
+import { useOrgStore } from "@/features/organisations/stores/org-store";
 
 const SOURCES: LogSource[] = [
   "atlas",
@@ -112,6 +113,7 @@ export function LogPanel() {
     useLogStore.use.actions();
 
   const currentProject = useProjectStore.use.currentProject();
+  const activeOrganisationId = useOrgStore.use.activeOrganisationId();
 
   const [search, setSearch] = useState("");
   const [activeSources, setActiveSources] = useState<Set<LogSource>>(
@@ -122,9 +124,13 @@ export function LogPanel() {
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [copiedId, setCopiedId] = useState<string | null>(null);
 
+  // Keyed on the Organisation, not just on `ready`: the panel can mount before
+  // the org store has hydrated (pins then load as empty), and an org switch has
+  // to re-read. `loadPinned` no-ops when the loaded org already matches, so
+  // firing it on every org change is free.
   useEffect(() => {
-    if (!ready) loadPinned();
-  }, [ready, loadPinned]);
+    void loadPinned();
+  }, [activeOrganisationId, ready, loadPinned]);
 
   // Restore (and scope) the activity log for the current project from disk.
   useEffect(() => {
