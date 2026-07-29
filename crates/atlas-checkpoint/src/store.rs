@@ -1546,6 +1546,36 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    /// The newest Checkpoints in this Workspace, with the title of the Session
+    /// that produced each.
+    ///
+    /// The title is joined here rather than looked up per row: the picker this
+    /// feeds shows every Checkpoint with the work it came from, and N+1 reads
+    /// for a list that is capped anyway is a query the store can just answer.
+    pub fn recent_checkpoints(
+        &self,
+        workspace_id: &str,
+        limit: i64,
+    ) -> Result<Vec<(Checkpoint, Option<String>)>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {}, s.title
+               FROM checkpoint c
+               JOIN agent_session s ON s.id = c.session_id
+              WHERE s.workspace_id = ?1
+              ORDER BY c.created_at DESC
+              LIMIT ?2",
+            CHECKPOINT_COLUMNS
+                .split(", ")
+                .map(|c| format!("c.{}", c.trim()))
+                .collect::<Vec<_>>()
+                .join(", "),
+        ))?;
+        let rows = stmt.query_map(rusqlite::params![workspace_id, limit], |row| {
+            Ok((row_to_checkpoint(row)?, row.get::<_, Option<String>>(14)?))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     /// Re-point a Checkpoint at the commit now carrying its change.
     ///
     /// If a row for `(session, commit_sha)` already exists — the walk saw the

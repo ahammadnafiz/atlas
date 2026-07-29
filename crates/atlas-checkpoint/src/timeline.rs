@@ -291,6 +291,59 @@ fn summarize(
     }
 }
 
+/// One Checkpoint, flat enough to list.
+///
+/// A deliberately smaller shape than [`TimelineEntry`]: this is a jump target,
+/// not a reading surface. It carries what identifies a commit (sha, subject,
+/// branch), what it cost (`insertions`/`deletions`/`files`) and enough to open
+/// the Session it belongs to — and nothing else.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CheckpointRow {
+    pub session_id: String,
+    /// The Session's title, so a row says which work produced the commit.
+    pub session_title: Option<String>,
+    pub commit_sha: String,
+    /// Read from git at display time, like every other commit subject here —
+    /// `None` when the repository has moved or the commit is gone.
+    pub commit_subject: Option<String>,
+    pub branch: Option<String>,
+    pub link_state: LinkState,
+    pub insertions: i64,
+    pub deletions: i64,
+    pub files: usize,
+    pub at: String,
+}
+
+/// The newest Checkpoints across a Workspace, most recent first.
+///
+/// `subject_for` is a callback for the same reason it is on [`detail`]: the read
+/// model has to work for a Workspace whose repository has moved, where the rows
+/// still render without subjects.
+pub fn recent_checkpoints(
+    store: &Store,
+    workspace_id: &str,
+    limit: i64,
+    subject_for: impl Fn(&str) -> Option<String>,
+) -> Result<Vec<CheckpointRow>> {
+    Ok(store
+        .recent_checkpoints(workspace_id, limit)?
+        .into_iter()
+        .map(|(checkpoint, session_title)| CheckpointRow {
+            session_id: checkpoint.session_id,
+            session_title,
+            commit_subject: subject_for(&checkpoint.commit_sha),
+            commit_sha: checkpoint.commit_sha,
+            branch: checkpoint.branch,
+            link_state: checkpoint.link_state,
+            insertions: checkpoint.insertions,
+            deletions: checkpoint.deletions,
+            files: checkpoint.files_touched.len(),
+            at: checkpoint.created_at.to_rfc3339(),
+        })
+        .collect())
+}
+
 /// One Session as an ordered timeline.
 ///
 /// `subject_for` resolves a commit sha to its subject line. It is a callback

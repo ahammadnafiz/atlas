@@ -123,6 +123,30 @@ export const DEFAULT_FILTERS: TimelineFilters = {
 };
 
 /**
+ * One Checkpoint on the board — mirrors `atlas_checkpoint::CheckpointRow` plus
+ * the project tag `commands::capture::BoardCheckpoint` adds.
+ *
+ * Deliberately smaller than a `TimelineEntry`: this is a jump target, not a
+ * reading surface.
+ */
+export interface BoardCheckpoint {
+  sessionId: string;
+  /** The Session's title, so a row says which work produced the commit. */
+  sessionTitle: string | null;
+  commitSha: string;
+  /** Read from git at display time; `null` if the repo moved or the commit is gone. */
+  commitSubject: string | null;
+  branch: string | null;
+  linkState: LinkState;
+  insertions: number;
+  deletions: number;
+  files: number;
+  at: string;
+  projectPath: string;
+  projectName: string;
+}
+
+/**
  * A board row: a Session plus the project it came from.
  *
  * The board spans every project in the Organisation, so a row can no longer

@@ -294,3 +294,87 @@ fn the_writer_keeps_writing_while_a_reader_is_open() {
     assert_eq!(sessions.len(), 1);
     assert_eq!(sessions[0].id, session_id);
 }
+
+/// The recent-Checkpoints jump list.
+///
+/// Worth its own test because the query is the only one in the store that
+/// JOINs, and it builds its column list by prefixing `CHECKPOINT_COLUMNS` — a
+/// hand-assembled SELECT whose column order the row mapper depends on. A typo
+/// there is a runtime error no type checks.
+#[test]
+fn recent_checkpoints_are_newest_first_and_carry_their_session_title() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut store, session_id) = seeded(dir.path());
+
+    for (i, sha) in ["aaaaaaa1111111111111111111111111111111111", "bbbbbbb2222222222222222222222222222222222"]
+        .iter()
+        .enumerate()
+    {
+        store
+            .upsert_checkpoint(CheckpointInput {
+                session_id: &session_id,
+                commit_sha: sha,
+                patch_id: None,
+                branch: Some("main"),
+                git_author_name: None,
+                git_author_email: None,
+                files_touched: &["src/lib.rs".into()],
+                insertions: (i as i64 + 1) * 10,
+                deletions: i as i64,
+                sync_state: atlas_checkpoint::SyncState::Local,
+            })
+            .expect("checkpoint recorded");
+    }
+
+    let rows = timeline::recent_checkpoints(&store, WORKSPACE, 10, |sha| {
+        Some(format!("subject for {}", &sha[..4]))
+    })
+    .expect("read");
+
+    assert_eq!(rows.len(), 2);
+    // Newest first — the whole point of the ordering.
+    assert!(rows[0].at >= rows[1].at, "{rows:?}");
+    // The JOIN actually landed a title rather than a NULL.
+    assert!(rows.iter().all(|r| r.session_title.is_some()), "{rows:?}");
+    // Column order survived the `c.`-prefixing: these come from different
+    // positions in the SELECT and a shifted mapper would cross them.
+    let by_sha = rows.iter().find(|r| r.commit_sha.starts_with("bbb")).expect("row");
+    assert_eq!(by_sha.insertions, 20);
+    assert_eq!(by_sha.deletions, 1);
+    assert_eq!(by_sha.branch.as_deref(), Some("main"));
+    assert_eq!(by_sha.files, 1);
+    assert_eq!(by_sha.commit_subject.as_deref(), Some("subject for bbbb"));
+
+    // The limit is honoured, and honoured against the *newest*.
+    let one = timeline::recent_checkpoints(&store, WORKSPACE, 1, |_| None).expect("read");
+    assert_eq!(one.len(), 1);
+    assert_eq!(one[0].commit_sha, rows[0].commit_sha);
+}
+
+/// Another Workspace's Checkpoints are not this Workspace's — the scoping runs
+/// through the JOIN, which is the easiest thing to get wrong when adding one.
+#[test]
+fn recent_checkpoints_are_scoped_to_their_workspace() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut store, session_id) = seeded(dir.path());
+    store
+        .upsert_checkpoint(CheckpointInput {
+            session_id: &session_id,
+            commit_sha: "ccccccc3333333333333333333333333333333333",
+            patch_id: None,
+            branch: None,
+            git_author_name: None,
+            git_author_email: None,
+            files_touched: &[],
+            insertions: 0,
+            deletions: 0,
+            sync_state: atlas_checkpoint::SyncState::Local,
+        })
+        .expect("checkpoint recorded");
+
+    let mine = timeline::recent_checkpoints(&store, WORKSPACE, 10, |_| None).expect("read");
+    assert_eq!(mine.len(), 1);
+
+    let other = timeline::recent_checkpoints(&store, "ws-someone-else", 10, |_| None).expect("read");
+    assert!(other.is_empty(), "{other:?}");
+}

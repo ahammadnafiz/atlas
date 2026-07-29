@@ -1230,6 +1230,90 @@ pub async fn artifacts_board(projects: Vec<String>) -> Result<Vec<BoardSession>,
     .map_err(|e| e.to_string())?
 }
 
+/// One Checkpoint on the board, tagged with the project it came from.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BoardCheckpoint {
+    #[serde(flatten)]
+    pub checkpoint: atlas_checkpoint::CheckpointRow,
+    /// Each project has its own store, so a jump has to remember which one.
+    pub project_path: String,
+    pub project_name: String,
+}
+
+/// How many Checkpoints the recent-commits picker reads across all projects.
+///
+/// Smaller than [`BOARD_LIMIT`] on purpose: this is a "jump to something you
+/// remember doing" list, not a history. Anything older than the newest hundred
+/// is found by opening its Session, which is what the board is for.
+const CHECKPOINT_LIMIT: i64 = 100;
+
+/// The newest Checkpoints across every project, most recent first.
+///
+/// Subjects are resolved from git here for the same reason as
+/// [`artifacts_session`]: this layer knows the Workspace root, and git stays the
+/// single source of truth for a commit message. Unlike that command this asks
+/// git **once per project** with a batched log read rather than once per commit
+/// — a hundred Checkpoints would otherwise be a hundred process spawns to fill
+/// one dropdown.
+#[tauri::command]
+pub async fn artifacts_checkpoints(projects: Vec<String>) -> Result<Vec<BoardCheckpoint>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut out: Vec<BoardCheckpoint> = Vec::new();
+        for project_path in projects {
+            // One unreadable store must not blank the whole list.
+            let Ok(Some(store)) = open_reader(&project_path) else {
+                continue;
+            };
+            let root = Path::new(&project_path).to_path_buf();
+            let is_repo = atlas_checkpoint::git::is_repository(&root);
+
+            let Ok(rows) = atlas_checkpoint::recent_checkpoints(
+                &store,
+                &project_path,
+                CHECKPOINT_LIMIT,
+                |_| None,
+            ) else {
+                continue;
+            };
+
+            // Resolve subjects only for the shas this project actually returned.
+            let mut subjects: HashMap<String, String> = HashMap::new();
+            if is_repo {
+                for row in &rows {
+                    if subjects.contains_key(&row.commit_sha) {
+                        continue;
+                    }
+                    if let Ok(info) = atlas_checkpoint::git::commit_info(&root, &row.commit_sha) {
+                        subjects.insert(row.commit_sha.clone(), info.subject);
+                    }
+                }
+            }
+
+            let project_name = root
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| project_path.clone());
+
+            out.extend(rows.into_iter().map(|mut row| {
+                row.commit_subject = subjects.get(&row.commit_sha).cloned();
+                BoardCheckpoint {
+                    checkpoint: row,
+                    project_path: project_path.clone(),
+                    project_name: project_name.clone(),
+                }
+            }));
+        }
+        // One ordering across every project, then cap — so the list means
+        // "newest" rather than "whichever project was read first".
+        out.sort_by(|a, b| b.checkpoint.at.cmp(&a.checkpoint.at));
+        out.truncate(CHECKPOINT_LIMIT as usize);
+        Ok(out)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 /// One Session that produced a commit.
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]

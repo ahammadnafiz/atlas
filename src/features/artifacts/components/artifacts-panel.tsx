@@ -2,14 +2,20 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import * as Popover from "@radix-ui/react-popover";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { Check, ChevronDown, ChevronLeft, RefreshCw } from "lucide-react";
+import { Check, ChevronLeft, Filter, GitBranch, RefreshCw } from "lucide-react";
 
+import { AtlasIcon } from "@/components/atlas-icon";
 import { useOrgStore } from "@/features/organisations/stores/org-store";
+import {
+  useWorkspaceGitStore,
+  type GitSummary,
+} from "@/features/workspaces/stores/workspace-git-store";
 import { useWorkspaceStore } from "@/features/workspaces/stores/workspace-store";
 import { cn } from "@/lib/utils";
 
 import { useArtifactsStore } from "../stores/artifacts-store";
 import type { BoardSession, SessionDetail as Detail } from "../types";
+import { CheckpointsPicker } from "./checkpoints-picker";
 import { SessionDetail } from "./session-detail";
 import { SessionList } from "./session-list";
 
@@ -48,16 +54,12 @@ export function ArtifactsPanel() {
   const allWorkspaces = useWorkspaceStore.use.workspaces();
   const activeOrganisationId = useOrgStore.use.activeOrganisationId();
   const projects = useMemo(
-    () =>
-      allWorkspaces.filter((w) => w.orgId === activeOrganisationId || w.orgId == null),
+    () => allWorkspaces.filter((w) => w.orgId === activeOrganisationId || w.orgId == null),
     [allWorkspaces, activeOrganisationId],
   );
   // A stable key, so the read effect does not re-fire on unrelated workspace
   // mutations (a rename, a pin) that leave the set of paths unchanged.
-  const projectPaths = useMemo(
-    () => projects.map((w) => w.path).sort(),
-    [projects],
-  );
+  const projectPaths = useMemo(() => projects.map((w) => w.path).sort(), [projects]);
   // Joined only for a cheap dependency comparison — never split back
   // apart. `projectPaths` is already the array every caller wants, and a
   // separator that can occur in a path would corrupt the round trip.
@@ -74,6 +76,11 @@ export function ArtifactsPanel() {
   /** True once the first board read has landed. */
   const [loaded, setLoaded] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
+  /** Board search. Lifted out of the list because the field lives in the header
+   *  now. Local rather than in the store: unlike the open Session and the
+   *  project filter, a search is a thing you are doing right now, and finding it
+   *  still applied after a tab switch would read as an empty board. */
+  const [query, setQuery] = useState("");
   const [error, setError] = useState<string | null>(null);
 
   /** Monotonic read sequence — only the newest read may write list state. */
@@ -194,36 +201,73 @@ export function ArtifactsPanel() {
 
   return (
     <div className="flex h-full min-h-0 flex-col bg-[var(--bg-surface)]">
-      <header className="flex h-[38px] shrink-0 items-center gap-2 border-b border-[var(--border-default)] px-4">
+      {/* 32px and `px-3`, matching the Console dashboard header — this used to
+          be 38px, which made the Timeline the one tab whose header did not line
+          up with the tab strip above it. */}
+      <header className="flex h-[32px] shrink-0 items-center gap-2 border-b border-[var(--border-default)] px-3">
         {open ? (
           <button
             type="button"
             onClick={() => openSession(null)}
-            className="-ml-1 flex items-center gap-1 rounded px-1.5 py-1 text-[12px] text-[var(--text-secondary)] transition-colors duration-150 hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)] focus-visible:ring-1 focus-visible:ring-[var(--border-focus)] active:scale-[0.97]"
+            className="-ml-1.5 flex h-[22px] cursor-pointer items-center gap-1 rounded-md px-1.5 text-[12px] font-semibold text-[var(--text-primary)] transition-colors hover:bg-[var(--bg-hover)]"
           >
-            <ChevronLeft size={13} />
+            <ChevronLeft size={13} className="text-[var(--text-tertiary)]" />
             Timeline
           </button>
         ) : (
+          // The header IS the search field. The Atlas mark sits where a search
+          // glyph would, and the input carries no border, background or padding
+          // of its own — so the bar reads as one surface rather than a control
+          // parked inside a title bar. The title is gone with it: a placeholder
+          // that says "Search sessions" already names the tab, and the tab strip
+          // above says it again.
           <>
-            <span className="text-[12px] font-medium text-[var(--text-primary)]">Timeline</span>
-            {filterable.length > 0 && (
+            <AtlasIcon size={14} className="shrink-0 rounded-[3px]" />
+            <input
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              placeholder="Search sessions..."
+              spellCheck={false}
+              aria-label="Search sessions"
+              className="min-w-0 flex-1 border-0 bg-transparent p-0 text-[12px] text-[var(--text-primary)] outline-none placeholder:text-[var(--text-tertiary)]"
+            />
+          </>
+        )}
+
+        <div className="ml-auto flex shrink-0 items-center gap-1">
+          {!open && filterable.length > 0 && (
+            <>
               <ProjectFilter
                 projects={filterable}
                 value={projectFilter}
                 onChange={setProjectFilter}
               />
-            )}
-          </>
-        )}
-
-        <div className="ml-auto flex items-center gap-1">
+              {/* Separates the scope control from the two actions, the way the
+                  titlebar separates its app actions from the account. */}
+              <span className="mx-0.5 h-3.5 w-px bg-[var(--border-default)]" aria-hidden />
+            </>
+          )}
+          {/* Jump straight to a commit, without having to remember which
+           *  Session produced it first. Reads the same project set as the
+           *  board, so a project filter narrows both. */}
+          <CheckpointsPicker
+            projects={projectFilter ? [projectFilter] : projectPaths}
+            onOpen={(row) =>
+              openSession({
+                sessionId: row.sessionId,
+                projectPath: row.projectPath,
+                commitSha: row.commitSha,
+              })
+            }
+          />
+          {/* Outlined circular icon button — the workspace panel's "add project"
+              control is the house shape for a bare icon action. */}
           <button
             type="button"
             onClick={() => void refresh()}
             aria-label="Reload timeline"
             title="Reload timeline"
-            className="rounded p-1.5 text-[var(--text-tertiary)] transition-colors duration-150 hover:bg-[var(--bg-hover)] hover:text-[var(--text-secondary)] focus-visible:ring-1 focus-visible:ring-[var(--border-focus)] active:scale-[0.94]"
+            className="flex h-6 w-6 cursor-pointer items-center justify-center rounded-full border border-[var(--border-default)] text-[var(--text-secondary)] outline-none transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
           >
             <RefreshCw size={12} className={cn(refreshing && "animate-spin")} />
           </button>
@@ -257,6 +301,7 @@ export function ArtifactsPanel() {
               <SessionList
                 sessions={sessions}
                 loading={!loaded}
+                query={query}
                 onOpen={(sessionId, projectPath) => openSession({ sessionId, projectPath })}
               />
             </div>
@@ -275,7 +320,18 @@ export function ArtifactsPanel() {
   );
 }
 
-/** Narrow the board to one project. Absent until something has been captured. */
+/**
+ * Narrow the board to one project — a searchable combo box, not a plain menu.
+ *
+ * Rows carry the same three facts the workspace sidebar shows, because they
+ * answer the question the picker is actually asked: *which* of these is the one
+ * I was working in. A list of bare names cannot answer that once two projects
+ * are called `api` and `api-v2` — the branch is what tells them apart, and the
+ * dirty dot is what tells you which one you left work in.
+ *
+ * Summaries come from `useWorkspaceGitStore`, which caches at module scope and
+ * is already warm from the sidebar, so opening this costs no `git` calls.
+ */
 function ProjectFilter({
   projects,
   value,
@@ -285,47 +341,178 @@ function ProjectFilter({
   value: string | null;
   onChange: (path: string | null) => void;
 }) {
+  const [query, setQuery] = useState("");
+  const summaries = useWorkspaceGitStore.use.summaries();
+  const { ensure } = useWorkspaceGitStore.use.actions();
   const active = projects.find((p) => p.path === value);
+
+  const filtered = projects.filter((p) => {
+    const q = query.trim().toLowerCase();
+    if (!q) return true;
+    // Path as well as name: two projects can share a folder name, and the
+    // parent directory is the only thing that separates them.
+    return p.name.toLowerCase().includes(q) || p.path.toLowerCase().includes(q);
+  });
+
   return (
-    <Popover.Root>
+    <Popover.Root
+      onOpenChange={(o) => {
+        if (!o) {
+          setQuery("");
+          return;
+        }
+        // Warm any summary the sidebar has not fetched yet. `ensure` is
+        // first-time-only, so this is a no-op for everything already cached.
+        for (const p of projects) ensure(p.path);
+      }}
+    >
       <Popover.Trigger asChild>
         <button
           type="button"
-          title="Filter by project"
-          className="flex items-center gap-1 rounded px-1.5 py-1 text-[11px] text-[var(--text-secondary)] transition-colors duration-150 hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)] focus-visible:ring-1 focus-visible:ring-[var(--border-focus)]"
+          aria-label={active ? `Filtered to ${active.name}` : "Filter by project"}
+          title={active ? `Filtered to ${active.name}` : "Filter by project"}
+          className={cn(
+            "relative flex h-6 w-6 cursor-pointer items-center justify-center rounded-md border outline-none transition-colors",
+            "data-[state=open]:bg-[var(--bg-active)] data-[state=open]:text-[var(--text-primary)]",
+            active
+              ? "border-[var(--border-strong)] bg-[var(--bg-active)] text-[var(--text-primary)]"
+              : "border-[var(--border-default)] text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]",
+          )}
         >
-          <span className="text-[var(--text-ghost)]">/</span>
-          {active?.name ?? "All projects"}
-          <ChevronDown size={11} className="text-[var(--text-tertiary)]" />
+          <Filter size={12} />
+          {/* A filter that is ON has to say so from the collapsed state — the
+              name is inside the menu, and a funnel that looks identical either
+              way hides an empty board behind a control nobody thinks to check. */}
+          {active && (
+            <span
+              aria-hidden
+              className="absolute -right-px -top-px size-[5px] rounded-full ring-2 ring-[var(--bg-surface)]"
+              style={{ backgroundColor: "var(--capture-live)" }}
+            />
+          )}
         </button>
       </Popover.Trigger>
       <Popover.Portal>
         <Popover.Content
           side="bottom"
           align="start"
-          sideOffset={6}
-          className="z-[var(--z-max)] min-w-[180px] origin-[var(--radix-popover-content-transform-origin)] rounded-lg border border-[var(--border-default)] bg-[var(--bg-elevated)] p-1 shadow-[var(--shadow-overlay)] data-[state=closed]:animate-scale-out data-[state=open]:animate-scale-in"
+          sideOffset={4}
+          className="z-[var(--z-max)] flex max-h-[340px] w-[280px] origin-[var(--radix-popover-content-transform-origin)] flex-col overflow-hidden rounded-lg border border-[var(--border-default)] bg-[#000] text-[var(--text-secondary)] shadow-xl data-[state=closed]:animate-scale-out data-[state=open]:animate-scale-in"
         >
-          {[{ path: null, name: "All projects" }, ...projects].map((p) => (
-            <Popover.Close asChild key={p.path ?? "all"}>
+          <input
+            autoFocus
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            placeholder="Search projects…"
+            className="h-[30px] shrink-0 border-b border-[var(--border-default)] bg-transparent px-3 text-[11px] text-[var(--text-primary)] outline-none placeholder:text-[var(--text-tertiary)]"
+          />
+          <div className="min-h-0 flex-1 overflow-y-auto p-1">
+            <Popover.Close asChild>
               <button
                 type="button"
-                onClick={() => onChange(p.path)}
+                onClick={() => onChange(null)}
                 className={cn(
-                  "flex w-full items-center justify-between rounded px-2 py-1 text-left text-[11px] transition-colors duration-150 hover:bg-[var(--bg-hover)]",
-                  (p.path ?? null) === value
-                    ? "text-[var(--text-primary)]"
-                    : "text-[var(--text-secondary)]",
+                  "flex h-[26px] w-full cursor-pointer items-center justify-between rounded px-2 text-left text-[11px] transition-colors hover:bg-[var(--bg-hover)]",
+                  value === null ? "text-[var(--text-primary)]" : "text-[var(--text-secondary)]",
                 )}
               >
-                {p.name}
-                {(p.path ?? null) === value && <Check size={11} />}
+                All projects
+                {value === null && <Check size={11} />}
               </button>
             </Popover.Close>
-          ))}
+
+            {filtered.map((p) => (
+              <Popover.Close asChild key={p.path}>
+                <button
+                  type="button"
+                  onClick={() => onChange(p.path)}
+                  title={p.path}
+                  className="flex w-full cursor-pointer items-center gap-2 rounded px-2 py-1.5 text-left transition-colors hover:bg-[var(--bg-hover)]"
+                >
+                  <GitDot summary={summaries[p.path]} />
+                  <span className="min-w-0 flex-1">
+                    <span
+                      className={cn(
+                        "block truncate text-[11px] leading-tight",
+                        p.path === value
+                          ? "font-medium text-[var(--text-primary)]"
+                          : "text-[var(--text-secondary)]",
+                      )}
+                    >
+                      {p.name}
+                    </span>
+                    <BranchLine summary={summaries[p.path]} />
+                  </span>
+                  {p.path === value ? (
+                    <Check size={11} className="shrink-0 text-[var(--text-primary)]" />
+                  ) : (
+                    <NumStatPill summary={summaries[p.path]} />
+                  )}
+                </button>
+              </Popover.Close>
+            ))}
+
+            {filtered.length === 0 && (
+              <p className="px-2 py-3 text-center text-[11px] text-[var(--text-tertiary)]">
+                No project matches “{query.trim()}”.
+              </p>
+            )}
+          </div>
         </Popover.Content>
       </Popover.Portal>
     </Popover.Root>
+  );
+}
+
+/** Working-tree state at a glance: green clean, amber dirty, grey non-repo. */
+function GitDot({ summary }: { summary?: GitSummary }) {
+  const color =
+    !summary || !summary.isRepo
+      ? "var(--text-tertiary)"
+      : summary.dirty
+        ? "var(--status-warning)"
+        : "var(--capture-live)";
+  return (
+    <span
+      className="size-2 shrink-0 rounded-full"
+      style={{ backgroundColor: color }}
+      title={
+        !summary?.isRepo
+          ? "Not a git repository"
+          : summary.dirty
+            ? "Working tree dirty"
+            : "Working tree clean"
+      }
+    />
+  );
+}
+
+/** `branch  subject`, the second line of a picker row. */
+function BranchLine({ summary }: { summary?: GitSummary }) {
+  return (
+    <span className="mt-0.5 flex items-center gap-1 text-[10px] leading-tight text-[var(--text-tertiary)]">
+      {summary?.isRepo && <GitBranch size={9} className="shrink-0" />}
+      <span className="truncate font-mono">
+        {summary?.isRepo
+          ? `${summary.branch || "—"}${summary.headSubject ? `  ${summary.headSubject}` : ""}`
+          : "no source control"}
+      </span>
+    </span>
+  );
+}
+
+/** +N/−M for an uncommitted working tree. Renders nothing when clean. */
+function NumStatPill({ summary }: { summary?: GitSummary }) {
+  if (!summary || (summary.additions === 0 && summary.deletions === 0)) return null;
+  return (
+    <span className="flex shrink-0 items-center gap-1.5 rounded-full bg-[var(--bg-elevated)] px-1.5 py-[1px] font-mono text-[9px]">
+      {summary.additions > 0 && (
+        <span className="text-[var(--stat-added)]">+{summary.additions}</span>
+      )}
+      {summary.deletions > 0 && (
+        <span className="text-[var(--stat-removed)]">−{summary.deletions}</span>
+      )}
+    </span>
   );
 }
 
@@ -339,13 +526,11 @@ function ProjectFilter({
 function NotEnabled() {
   return (
     <div className="flex h-full flex-col items-center justify-center px-8 text-center">
-      <h2 className="text-[14px] font-medium text-[var(--text-primary)]">
-        Nothing captured yet
-      </h2>
+      <h2 className="text-[14px] font-medium text-[var(--text-primary)]">Nothing captured yet</h2>
       <p className="mt-1.5 max-w-[420px] text-[12px] leading-relaxed text-[var(--text-tertiary)]">
         Turn capture on for a project and Atlas records what you asked, what the agent did, and
-        which commits came out of it — stored on this machine, with secrets scrubbed before
-        anything is written.
+        which commits came out of it — stored on this machine, with secrets scrubbed before anything
+        is written.
       </p>
       {/* The control is deliberately not repeated here. Capture is per project
        *  and this board spans all of them, so the honest place to switch it on

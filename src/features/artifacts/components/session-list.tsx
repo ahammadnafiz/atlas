@@ -1,5 +1,5 @@
 import { useMemo, useState } from "react";
-import { ChevronDown, ChevronRight, GitBranch, Search, TriangleAlert } from "lucide-react";
+import { ChevronDown, ChevronRight, GitBranch, TriangleAlert } from "lucide-react";
 
 import { cn } from "@/lib/utils";
 
@@ -21,12 +21,14 @@ interface Props {
   sessions: BoardSession[];
   /** True while the first read for this Workspace is in flight. */
   loading: boolean;
+  /** Search text. Owned by the panel — the field lives in the header now, so
+   *  that the board reads as one surface rather than a toolbar over a list. */
+  query: string;
   /** The project is passed back because each one has its own store. */
   onOpen: (id: string, projectPath: string) => void;
 }
 
-export function SessionList({ sessions, loading, onOpen }: Props) {
-  const [query, setQuery] = useState("");
+export function SessionList({ sessions, loading, query, onOpen }: Props) {
   const [branch, setBranch] = useState<string>("");
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
 
@@ -63,29 +65,17 @@ export function SessionList({ sessions, loading, onOpen }: Props) {
 
   return (
     <div className="flex h-full min-h-0 flex-col">
-      <div className="flex shrink-0 items-center gap-2 px-4 py-2.5">
-        <div className="relative flex-1 max-w-[420px]">
-          <Search
-            size={12}
-            className="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-[var(--text-tertiary)]"
-          />
-          <input
-            value={query}
-            onChange={(e) => setQuery(e.target.value)}
-            placeholder="Search sessions..."
-            className="w-full rounded-md border border-[var(--border-default)] bg-[var(--bg-input)] py-1.5 pl-7 pr-2 text-[12px] text-[var(--text-primary)] outline-none placeholder:text-[var(--text-tertiary)] focus:border-[var(--border-focus)]"
-          />
-        </div>
-
-        {/* Only offered once there is more than one branch to choose between —
-         *  a select with a single option is furniture, not a control. */}
-        {branches.length > 1 && (
-          <label className="ml-auto flex items-center gap-1.5 rounded-md border border-[var(--border-default)] bg-[var(--bg-input)] px-2 py-1.5">
+      {/* Only rendered once there is more than one branch to choose between — a
+       *  select with a single option is furniture, and with the search field
+       *  gone to the header an otherwise-empty toolbar row is just a gap. */}
+      {branches.length > 1 && (
+        <div className="flex shrink-0 items-center px-4 py-2">
+          <label className="ml-auto flex items-center gap-1.5 rounded-md border border-[var(--border-default)] bg-[var(--bg-input)] px-2 py-1">
             <GitBranch size={12} className="text-[var(--text-tertiary)]" />
             <select
               value={branch}
               onChange={(e) => setBranch(e.target.value)}
-              className="bg-transparent text-[12px] text-[var(--text-secondary)] outline-none"
+              className="bg-transparent text-[11px] text-[var(--text-secondary)] outline-none"
             >
               <option value="">All branches</option>
               {branches.map((b) => (
@@ -95,10 +85,10 @@ export function SessionList({ sessions, loading, onOpen }: Props) {
               ))}
             </select>
           </label>
-        )}
-      </div>
+        </div>
+      )}
 
-      <div className="min-h-0 flex-1 overflow-y-auto px-4 pb-4">
+      <div className="min-h-0 flex-1 overflow-y-auto px-4 pb-4 pt-1">
         {loading ? (
           <p className="py-8 text-center text-[12px] text-[var(--text-tertiary)]">
             Reading the session store…
