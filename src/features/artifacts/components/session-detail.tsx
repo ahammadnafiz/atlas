@@ -24,7 +24,8 @@ import {
   type TimelineEntry,
   type TimelineFilters,
 } from "../types";
-import { AgentBadge, prettyModel } from "./session-list";
+import { prettyModel } from "../lib/board";
+import { AgentBadge } from "./session-list";
 
 /**
  * One Session, as the ordered record of what happened.
@@ -88,9 +89,8 @@ export function SessionDetail({ detail, projectPath, focusCommitSha }: Props) {
 
   const failedCount = useMemo(
     () =>
-      detail.entries.filter(
-        (entry) => entry.kind === "tool_call" && entry.toolStatus === "failed",
-      ).length,
+      detail.entries.filter((entry) => entry.kind === "tool_call" && entry.toolStatus === "failed")
+        .length,
     [detail.entries],
   );
 
@@ -132,9 +132,7 @@ export function SessionDetail({ detail, projectPath, focusCommitSha }: Props) {
     if (!pendingJump) return;
     const index = visible.findIndex((entry) => entry.id === pendingJump);
     if (index === -1) {
-      setFilters((current) =>
-        current.checkpoints ? current : { ...current, checkpoints: true },
-      );
+      setFilters((current) => (current.checkpoints ? current : { ...current, checkpoints: true }));
       return;
     }
     if (index >= renderCount) {
@@ -339,9 +337,7 @@ function Header({ detail }: { detail: Detail }) {
         {(s.insertions > 0 || s.deletions > 0) && (
           <span className="font-mono">
             {facts.length > 0 && <span className="pr-2 font-sans">·</span>}
-            {s.insertions > 0 && (
-              <span className="text-[var(--stat-added)]">+{s.insertions}</span>
-            )}
+            {s.insertions > 0 && <span className="text-[var(--stat-added)]">+{s.insertions}</span>}
             {s.insertions > 0 && s.deletions > 0 && " / "}
             {s.deletions > 0 && <span className="text-[var(--stat-removed)]">-{s.deletions}</span>}
           </span>
@@ -354,8 +350,8 @@ function Header({ detail }: { detail: Detail }) {
         <p className="mt-2 flex items-start gap-1.5 rounded bg-[var(--status-warning-muted)] px-2 py-1.5 text-[11px] text-[var(--status-warning)]">
           <TriangleAlert size={12} className="mt-px shrink-0" />
           <span>
-            {s.attentionReason ?? "Part of this session could not be recorded."} Content that
-            could not be scrubbed was not stored.
+            {s.attentionReason ?? "Part of this session could not be recorded."} Content that could
+            not be scrubbed was not stored.
           </span>
         </p>
       )}
@@ -682,57 +678,57 @@ function Checkpoint({ entry }: { entry: TimelineEntry }) {
             : "border-[var(--border-default)] bg-[var(--bg-raised)]",
         )}
       >
-      <span className="shrink-0 font-mono text-[11px] text-[var(--text-tertiary)]">
-        {entry.commitSha?.slice(0, 7)}
-      </span>
+        <span className="shrink-0 font-mono text-[11px] text-[var(--text-tertiary)]">
+          {entry.commitSha?.slice(0, 7)}
+        </span>
 
-      <span
-        className={cn(
-          "min-w-0 flex-1 truncate text-[12px]",
-          orphaned ? "text-[var(--text-secondary)]" : "text-[var(--text-primary)]",
-        )}
-      >
-        {entry.commitSubject ?? (
-          // The Checkpoint is a real record even when git can no longer resolve
-          // it — a moved repository or a pruned commit must not erase it.
-          <span className="text-[var(--text-tertiary)]">
-            {orphaned ? "Commit no longer reachable" : "Subject unavailable"}
+        <span
+          className={cn(
+            "min-w-0 flex-1 truncate text-[12px]",
+            orphaned ? "text-[var(--text-secondary)]" : "text-[var(--text-primary)]",
+          )}
+        >
+          {entry.commitSubject ?? (
+            // The Checkpoint is a real record even when git can no longer resolve
+            // it — a moved repository or a pruned commit must not erase it.
+            <span className="text-[var(--text-tertiary)]">
+              {orphaned ? "Commit no longer reachable" : "Subject unavailable"}
+            </span>
+          )}
+        </span>
+
+        {/* A squash or a conflict-resolved rebase leaves the subject and the diff
+         *  stat intact, so without saying so outright an orphaned Checkpoint reads
+         *  exactly like a live one — the "wrong link" this whole subsystem exists
+         *  to avoid. The state is named on the row, not inferred from a border. */}
+        {orphaned && (
+          <span
+            className="shrink-0 rounded bg-[var(--status-warning-muted)] px-1.5 py-px text-[10px] text-[var(--status-warning)]"
+            title="This commit is no longer in history — rewritten or squashed. The Session record is kept."
+          >
+            orphaned
           </span>
         )}
-      </span>
 
-      {/* A squash or a conflict-resolved rebase leaves the subject and the diff
-       *  stat intact, so without saying so outright an orphaned Checkpoint reads
-       *  exactly like a live one — the "wrong link" this whole subsystem exists
-       *  to avoid. The state is named on the row, not inferred from a border. */}
-      {orphaned && (
-        <span
-          className="shrink-0 rounded bg-[var(--status-warning-muted)] px-1.5 py-px text-[10px] text-[var(--status-warning)]"
-          title="This commit is no longer in history — rewritten or squashed. The Session record is kept."
-        >
-          orphaned
-        </span>
-      )}
+        {/* Suppressed when orphaned: the branch no longer contains this commit,
+         *  so showing it would assert exactly the link that was lost. */}
+        {entry.branch && !orphaned && (
+          <span className="hidden shrink-0 font-mono text-[10px] text-[var(--text-tertiary)] md:block">
+            {entry.branch}
+          </span>
+        )}
 
-      {/* Suppressed when orphaned: the branch no longer contains this commit,
-       *  so showing it would assert exactly the link that was lost. */}
-      {entry.branch && !orphaned && (
-        <span className="hidden shrink-0 font-mono text-[10px] text-[var(--text-tertiary)] md:block">
-          {entry.branch}
-        </span>
-      )}
-
-      {(entry.insertions > 0 || entry.deletions > 0) && (
-        <span className="shrink-0 font-mono text-[11px]">
-          {entry.insertions > 0 && (
-            <span className="text-[var(--stat-added)]">+{entry.insertions}</span>
-          )}
-          {entry.insertions > 0 && entry.deletions > 0 && (
-            <span className="text-[var(--text-ghost)]"> / </span>
-          )}
-          {entry.deletions > 0 && (
-            <span className="text-[var(--stat-removed)]">-{entry.deletions}</span>
-          )}
+        {(entry.insertions > 0 || entry.deletions > 0) && (
+          <span className="shrink-0 font-mono text-[11px]">
+            {entry.insertions > 0 && (
+              <span className="text-[var(--stat-added)]">+{entry.insertions}</span>
+            )}
+            {entry.insertions > 0 && entry.deletions > 0 && (
+              <span className="text-[var(--text-ghost)]"> / </span>
+            )}
+            {entry.deletions > 0 && (
+              <span className="text-[var(--stat-removed)]">-{entry.deletions}</span>
+            )}
           </span>
         )}
       </div>

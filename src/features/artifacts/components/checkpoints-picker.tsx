@@ -21,6 +21,8 @@ import { GitBranch, GitCommitHorizontal, Loader2, Unlink } from "lucide-react";
 
 import { timeAgo } from "@/lib/time-ago";
 
+import { SEGMENT_TRIGGER } from "./segment";
+
 import type { BoardCheckpoint } from "../types";
 
 export function CheckpointsPicker({
@@ -83,7 +85,7 @@ export function CheckpointsPicker({
           type="button"
           aria-label="Recent checkpoints"
           title="Recent checkpoints"
-          className="flex h-6 w-6 cursor-pointer items-center justify-center rounded-full border border-[var(--border-default)] text-[var(--text-secondary)] outline-none transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)] data-[state=open]:bg-[var(--bg-active)] data-[state=open]:text-[var(--text-primary)]"
+          className={SEGMENT_TRIGGER}
         >
           <GitCommitHorizontal size={13} />
         </button>
@@ -116,7 +118,7 @@ export function CheckpointsPicker({
             className="h-[28px] shrink-0 border-b border-[var(--border-default)] bg-transparent px-3 text-[11px] text-[var(--text-primary)] outline-none placeholder:text-[var(--text-tertiary)]"
           />
 
-          <div className="min-h-0 flex-1 overflow-y-auto">
+          <div className="hide-scrollbar min-h-0 flex-1 overflow-y-auto">
             {rows === null ? (
               <p className="px-3 py-4 text-center text-[11px] text-[var(--text-tertiary)]">
                 Reading checkpoints…

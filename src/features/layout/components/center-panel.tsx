@@ -383,7 +383,12 @@ const TabColumn = memo(function TabColumn({
             })}
           </div>
 
-          <div className="relative flex items-center shrink-0">
+          {/* `pr-1.5` on the group, not on the last button: the trailing gap
+              used to live on whichever action happened to be rightmost, so it
+              was 2px behind "Split right" in a single pane and 4px behind
+              "Close split" in a split one — the button sat almost flush with
+              the window edge in the common case. */}
+          <div className="relative flex shrink-0 items-center pr-1.5">
             <div
               aria-hidden
               className="pointer-events-none absolute right-full top-0 h-full w-8"
@@ -402,7 +407,7 @@ const TabColumn = memo(function TabColumn({
               <button
                 onClick={addGroup}
                 title="Split right (⌘\\)"
-                className="self-center flex items-center justify-center w-6 h-6 text-text-tertiary hover:text-text-secondary hover:bg-bg-hover rounded transition-colors shrink-0 mr-0.5 cursor-pointer outline-none"
+                className="self-center flex items-center justify-center w-6 h-6 text-text-tertiary hover:text-text-secondary hover:bg-bg-hover rounded transition-colors shrink-0 cursor-pointer outline-none"
               >
                 <Columns2 size={13} />
               </button>
@@ -411,7 +416,7 @@ const TabColumn = memo(function TabColumn({
               <button
                 onClick={() => closeGroup(groupId)}
                 title="Close split (⌥W)"
-                className="self-center flex items-center justify-center w-6 h-6 text-text-tertiary hover:text-text-secondary hover:bg-bg-hover rounded transition-colors shrink-0 mr-1 cursor-pointer outline-none"
+                className="self-center flex items-center justify-center w-6 h-6 text-text-tertiary hover:text-text-secondary hover:bg-bg-hover rounded transition-colors shrink-0 cursor-pointer outline-none"
               >
                 <X size={13} />
               </button>

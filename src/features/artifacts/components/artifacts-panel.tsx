@@ -2,22 +2,40 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import * as Popover from "@radix-ui/react-popover";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { Check, ChevronLeft, Filter, GitBranch, RefreshCw } from "lucide-react";
+import {
+  CalendarDays,
+  Check,
+  ChevronLeft,
+  ChevronUp,
+  Filter,
+  ListTree,
+  RefreshCw,
+} from "lucide-react";
 
 import { AtlasIcon } from "@/components/atlas-icon";
 import { useOrgStore } from "@/features/organisations/stores/org-store";
-import {
-  useWorkspaceGitStore,
-  type GitSummary,
-} from "@/features/workspaces/stores/workspace-git-store";
+import { BranchLine, GitDot, NumStatPill } from "@/features/workspaces/components/git-summary";
+import { useWorkspaceGitStore } from "@/features/workspaces/stores/workspace-git-store";
 import { useWorkspaceStore } from "@/features/workspaces/stores/workspace-store";
 import { cn } from "@/lib/utils";
 
 import { useArtifactsStore } from "../stores/artifacts-store";
 import type { BoardSession, SessionDetail as Detail } from "../types";
+import {
+  activeFacetCount,
+  facetMatches,
+  facets,
+  NO_FACETS,
+  type Facet,
+  type FacetKey,
+  type FacetSelection,
+} from "../lib/board";
+import { CalendarView } from "./calendar-view";
+import { Divider, Segment, SegmentButton, SEGMENT_ACTIVE, SEGMENT_TRIGGER } from "./segment";
 import { CheckpointsPicker } from "./checkpoints-picker";
 import { SessionDetail } from "./session-detail";
 import { SessionList } from "./session-list";
+import { SessionStats } from "./session-stats";
 
 /** Mirrors `BOARD_LIMIT` in `capture.rs` — how many rows one board read returns. */
 const BOARD_LIMIT = 500;
@@ -81,6 +99,16 @@ export function ArtifactsPanel() {
    *  project filter, a search is a thing you are doing right now, and finding it
    *  still applied after a tab switch would read as an empty board. */
   const [query, setQuery] = useState("");
+  /** Which axis the board is drawn on. */
+  const [view, setView] = useState<"timeline" | "calendar">("timeline");
+  /** The stats strip is 118px over a board you have already narrowed, so it is
+   *  collapsible — and it opens by default, because a summary nobody knows is
+   *  there is a summary nobody reads. */
+  const [statsOpen, setStatsOpen] = useState(true);
+  /** Agent / model / branch narrowing, on top of the project filter. Project
+   *  stays in the store because it also narrows the *query* sent to Rust; these
+   *  three only narrow what is already on screen. */
+  const [selection, setSelection] = useState<FacetSelection>(NO_FACETS);
   const [error, setError] = useState<string | null>(null);
 
   /** Monotonic read sequence — only the newest read may write list state. */
@@ -199,6 +227,30 @@ export function ArtifactsPanel() {
   /** The cap was reached, so there is older history the board is not showing. */
   const capped = !projectFilter && sessions.length >= BOARD_LIMIT;
 
+  // The facet menu counts against everything the board holds, not against what
+  // the search has already narrowed — otherwise every option reads "0" the
+  // moment you type, and the menu stops being a way to find anything.
+  const facetGroups = useMemo(() => facets(sessions), [sessions]);
+
+  /** Search + facets. One list, shared by the board, the calendar and the stats
+   *  strip — a summary that ignores the filter above it is unreadable. */
+  const visible = useMemo(() => {
+    const needle = query.trim().toLowerCase();
+    return sessions.filter((s) => {
+      if (!facetMatches(s, selection)) return false;
+      if (!needle) return true;
+      // Title, project, agent, model and branch — the five things someone
+      // would type. Message bodies are deliberately not searched: full-text
+      // over every Session is a different feature with an index behind it, and
+      // pretending to offer it here returns nothing for the queries it invites.
+      return [s.title, s.projectName, s.agent, s.model, ...s.branches]
+        .filter(Boolean)
+        .some((field) => field!.toLowerCase().includes(needle));
+    });
+  }, [sessions, query, selection]);
+
+  const narrowed = query.trim().length > 0 || activeFacetCount(selection) > 0;
+
   return (
     <div className="flex h-full min-h-0 flex-col bg-[var(--bg-surface)]">
       {/* 32px and `px-3`, matching the Console dashboard header — this used to
@@ -226,7 +278,7 @@ export function ArtifactsPanel() {
             <input
               value={query}
               onChange={(e) => setQuery(e.target.value)}
-              placeholder="Search sessions..."
+              placeholder="Search sessions, projects, models…"
               spellCheck={false}
               aria-label="Search sessions"
               className="min-w-0 flex-1 border-0 bg-transparent p-0 text-[12px] text-[var(--text-primary)] outline-none placeholder:text-[var(--text-tertiary)]"
@@ -234,40 +286,99 @@ export function ArtifactsPanel() {
           </>
         )}
 
-        <div className="ml-auto flex shrink-0 items-center gap-1">
-          {!open && filterable.length > 0 && (
+        <div className="ml-auto flex shrink-0 items-center gap-1.5">
+          {!open && query.trim().length > 0 && (
+            <button
+              type="button"
+              onClick={() => setQuery("")}
+              className="flex h-5 cursor-pointer items-center rounded-[3px] border border-[var(--border-default)] bg-[var(--bg-elevated)] px-1.5 font-mono text-[10px] uppercase tracking-[0.06em] text-[var(--text-tertiary)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
+            >
+              Clear
+            </button>
+          )}
+
+          {!open && (
             <>
-              <ProjectFilter
-                projects={filterable}
-                value={projectFilter}
-                onChange={setProjectFilter}
-              />
-              {/* Separates the scope control from the two actions, the way the
-                  titlebar separates its app actions from the account. */}
-              <span className="mx-0.5 h-3.5 w-px bg-[var(--border-default)]" aria-hidden />
+              {/* View + stats in one segment: all three change what the board
+               *shows*, and grouping them says that without a label. */}
+              <Segment>
+                <SegmentButton
+                  active={view === "timeline"}
+                  label="Timeline"
+                  onClick={() => setView("timeline")}
+                >
+                  <ListTree size={13} />
+                </SegmentButton>
+                <SegmentButton
+                  active={view === "calendar"}
+                  label="Calendar"
+                  onClick={() => setView("calendar")}
+                  divided
+                >
+                  <CalendarDays size={13} />
+                </SegmentButton>
+                <SegmentButton
+                  active={statsOpen}
+                  label={statsOpen ? "Hide stats" : "Show stats"}
+                  onClick={() => setStatsOpen((v) => !v)}
+                  divided
+                >
+                  <ChevronUp
+                    size={13}
+                    className={cn("transition-transform", !statsOpen && "rotate-180")}
+                  />
+                </SegmentButton>
+              </Segment>
+
+              <Divider />
             </>
           )}
-          {/* Jump straight to a commit, without having to remember which
-           *  Session produced it first. Reads the same project set as the
-           *  board, so a project filter narrows both. */}
-          <CheckpointsPicker
-            projects={projectFilter ? [projectFilter] : projectPaths}
-            onOpen={(row) =>
-              openSession({
-                sessionId: row.sessionId,
-                projectPath: row.projectPath,
-                commitSha: row.commitSha,
-              })
-            }
-          />
-          {/* Outlined circular icon button — the workspace panel's "add project"
-              control is the house shape for a bare icon action. */}
+
+          {/* Scope: which rows the board is drawn from. Both open a menu over
+              the same set of sessions, so they share a segment. */}
+          <Segment>
+            {/* Jump straight to a commit, without having to remember which
+             *  Session produced it first. Reads the same project set as the
+             *  board, so a project filter narrows both. */}
+            <CheckpointsPicker
+              projects={projectFilter ? [projectFilter] : projectPaths}
+              onOpen={(row) =>
+                openSession({
+                  sessionId: row.sessionId,
+                  projectPath: row.projectPath,
+                  commitSha: row.commitSha,
+                })
+              }
+            />
+            {!open && (
+              <BoardFilter
+                projects={filterable}
+                projectFilter={projectFilter}
+                onProjectFilter={setProjectFilter}
+                facets={facetGroups}
+                selection={selection}
+                onSelect={(key, value) =>
+                  setSelection((prev) => ({ ...prev, [key]: prev[key] === value ? null : value }))
+                }
+                onClear={() => {
+                  setSelection(NO_FACETS);
+                  setProjectFilter(null);
+                }}
+              />
+            )}
+          </Segment>
+
+          <Divider />
+
+          {/* Alone after the last divider: refresh acts on the data rather than
+              on what is shown, which is a different kind of thing from
+              everything to its left. */}
           <button
             type="button"
             onClick={() => void refresh()}
             aria-label="Reload timeline"
             title="Reload timeline"
-            className="flex h-6 w-6 cursor-pointer items-center justify-center rounded-full border border-[var(--border-default)] text-[var(--text-secondary)] outline-none transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
+            className="flex h-6 w-6 cursor-pointer items-center justify-center rounded-md border border-[var(--border-default)] text-[var(--text-secondary)] outline-none transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
           >
             <RefreshCw size={12} className={cn(refreshing && "animate-spin")} />
           </button>
@@ -297,13 +408,30 @@ export function ArtifactsPanel() {
           <NotEnabled />
         ) : (
           <div className="flex h-full min-h-0 flex-col">
-            <div className="min-h-0 flex-1">
-              <SessionList
-                sessions={sessions}
-                loading={!loaded}
-                query={query}
-                onOpen={(sessionId, projectPath) => openSession({ sessionId, projectPath })}
-              />
+            {statsOpen && loaded && <SessionStats sessions={visible} />}
+            {/* `hide-scrollbar`: the board is a continuous rail from the first
+                session to the last, and a scrollbar gutter cutting down beside
+                it breaks that line — the same reason every other panel in the
+                app hides its bars. Scrolling itself is unaffected. */}
+            <div
+              className={cn(
+                "min-h-0 flex-1",
+                view === "calendar" ? "flex" : "hide-scrollbar overflow-y-auto",
+              )}
+            >
+              {view === "calendar" ? (
+                <CalendarView
+                  sessions={visible}
+                  onOpen={(sessionId, projectPath) => openSession({ sessionId, projectPath })}
+                />
+              ) : (
+                <SessionList
+                  sessions={visible}
+                  loading={!loaded}
+                  filtered={narrowed}
+                  onOpen={(sessionId, projectPath) => openSession({ sessionId, projectPath })}
+                />
+              )}
             </div>
             {/* Say what is being left out. A board that silently stops at the
              *  newest few hundred reads as "this is everything". */}
@@ -321,38 +449,49 @@ export function ArtifactsPanel() {
 }
 
 /**
- * Narrow the board to one project — a searchable combo box, not a plain menu.
+ * Scope the board: project, agent, model, branch.
  *
- * Rows carry the same three facts the workspace sidebar shows, because they
- * answer the question the picker is actually asked: *which* of these is the one
- * I was working in. A list of bare names cannot answer that once two projects
- * are called `api` and `api-v2` — the branch is what tells them apart, and the
- * dirty dot is what tells you which one you left work in.
+ * One menu rather than four controls in the header. Each group is single-select
+ * and clicking the active option clears it, which is the interaction people try
+ * first and the one that needs no second control to undo.
  *
- * Summaries come from `useWorkspaceGitStore`, which caches at module scope and
- * is already warm from the sidebar, so opening this costs no `git` calls.
+ * **Counts are against the whole board, not the filtered view.** A menu whose
+ * every option reads "0" the moment you type is a menu that cannot be used to
+ * find anything.
+ *
+ * The PROJECT group carries the git detail the workspace sidebar shows — a dot
+ * for working-tree state and the current branch — because that is what tells two
+ * projects called `api` and `api-v2` apart. The other groups are plain values,
+ * and searching only filters projects, which is the only list long enough to
+ * need it.
  */
-function ProjectFilter({
+function BoardFilter({
   projects,
-  value,
-  onChange,
+  projectFilter,
+  onProjectFilter,
+  facets: groups,
+  selection,
+  onSelect,
+  onClear,
 }: {
   projects: { path: string; name: string }[];
-  value: string | null;
-  onChange: (path: string | null) => void;
+  projectFilter: string | null;
+  onProjectFilter: (path: string | null) => void;
+  facets: Facet[];
+  selection: FacetSelection;
+  onSelect: (key: FacetKey, value: string | null) => void;
+  onClear: () => void;
 }) {
   const [query, setQuery] = useState("");
   const summaries = useWorkspaceGitStore.use.summaries();
   const { ensure } = useWorkspaceGitStore.use.actions();
-  const active = projects.find((p) => p.path === value);
 
-  const filtered = projects.filter((p) => {
-    const q = query.trim().toLowerCase();
-    if (!q) return true;
-    // Path as well as name: two projects can share a folder name, and the
-    // parent directory is the only thing that separates them.
-    return p.name.toLowerCase().includes(q) || p.path.toLowerCase().includes(q);
-  });
+  const active = activeFacetCount(selection) + (projectFilter ? 1 : 0);
+  const q = query.trim().toLowerCase();
+  const shownProjects = projects.filter(
+    (p) => !q || p.name.toLowerCase().includes(q) || p.path.toLowerCase().includes(q),
+  );
+  const otherGroups = groups.filter((g) => g.key !== "project");
 
   return (
     <Popover.Root
@@ -361,7 +500,7 @@ function ProjectFilter({
           setQuery("");
           return;
         }
-        // Warm any summary the sidebar has not fetched yet. `ensure` is
+        // Warm any summary the sidebar has not fetched. `ensure` is
         // first-time-only, so this is a no-op for everything already cached.
         for (const p of projects) ensure(p.path);
       }}
@@ -369,94 +508,97 @@ function ProjectFilter({
       <Popover.Trigger asChild>
         <button
           type="button"
-          aria-label={active ? `Filtered to ${active.name}` : "Filter by project"}
-          title={active ? `Filtered to ${active.name}` : "Filter by project"}
+          aria-label={active ? `${active} filters active` : "Filter sessions"}
+          title={active ? `${active} filter${active === 1 ? "" : "s"} active` : "Filter sessions"}
           className={cn(
-            "relative flex h-6 w-6 cursor-pointer items-center justify-center rounded-md border outline-none transition-colors",
-            "data-[state=open]:bg-[var(--bg-active)] data-[state=open]:text-[var(--text-primary)]",
-            active
-              ? "border-[var(--border-strong)] bg-[var(--bg-active)] text-[var(--text-primary)]"
-              : "border-[var(--border-default)] text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]",
+            SEGMENT_TRIGGER,
+            "relative border-l border-[var(--border-default)]",
+            active && SEGMENT_ACTIVE,
           )}
         >
-          <Filter size={12} />
+          <Filter size={13} />
           {/* A filter that is ON has to say so from the collapsed state — the
-              name is inside the menu, and a funnel that looks identical either
-              way hides an empty board behind a control nobody thinks to check. */}
-          {active && (
-            <span
-              aria-hidden
-              className="absolute -right-px -top-px size-[5px] rounded-full ring-2 ring-[var(--bg-surface)]"
-              style={{ backgroundColor: "var(--capture-live)" }}
-            />
+              values are inside the menu, and a funnel that looks identical
+              either way hides an empty board behind a control nobody checks. */}
+          {active > 0 && (
+            <span className="absolute -right-1 -top-1 flex h-[13px] min-w-[13px] items-center justify-center rounded-full bg-[var(--text-primary)] px-[3px] font-mono text-[9px] font-medium text-[var(--text-inverse)]">
+              {active}
+            </span>
           )}
         </button>
       </Popover.Trigger>
       <Popover.Portal>
         <Popover.Content
           side="bottom"
-          align="start"
+          align="end"
           sideOffset={4}
-          className="z-[var(--z-max)] flex max-h-[340px] w-[280px] origin-[var(--radix-popover-content-transform-origin)] flex-col overflow-hidden rounded-lg border border-[var(--border-default)] bg-[#000] text-[var(--text-secondary)] shadow-xl data-[state=closed]:animate-scale-out data-[state=open]:animate-scale-in"
+          className="z-[var(--z-max)] flex max-h-[420px] w-[262px] origin-[var(--radix-popover-content-transform-origin)] flex-col overflow-hidden rounded-lg border border-[var(--border-default)] bg-[#000] shadow-xl data-[state=closed]:animate-scale-out data-[state=open]:animate-scale-in"
         >
+          {active > 0 && (
+            <div className="flex h-[28px] shrink-0 items-center justify-between border-b border-[var(--border-default)] px-3">
+              <span className="font-mono text-[10px] text-[var(--text-tertiary)]">
+                {active} active
+              </span>
+              <Popover.Close asChild>
+                <button
+                  type="button"
+                  onClick={onClear}
+                  className="cursor-pointer font-mono text-[10px] uppercase tracking-[0.06em] text-[var(--text-secondary)] underline underline-offset-2 transition-colors hover:no-underline hover:text-[var(--text-primary)]"
+                >
+                  Clear all
+                </button>
+              </Popover.Close>
+            </div>
+          )}
+
           <input
             autoFocus
             value={query}
             onChange={(e) => setQuery(e.target.value)}
             placeholder="Search projects…"
-            className="h-[30px] shrink-0 border-b border-[var(--border-default)] bg-transparent px-3 text-[11px] text-[var(--text-primary)] outline-none placeholder:text-[var(--text-tertiary)]"
+            className="h-[28px] shrink-0 border-b border-[var(--border-default)] bg-transparent px-3 text-[11px] text-[var(--text-primary)] outline-none placeholder:text-[var(--text-tertiary)]"
           />
-          <div className="min-h-0 flex-1 overflow-y-auto p-1">
-            <Popover.Close asChild>
-              <button
-                type="button"
-                onClick={() => onChange(null)}
-                className={cn(
-                  "flex h-[26px] w-full cursor-pointer items-center justify-between rounded px-2 text-left text-[11px] transition-colors hover:bg-[var(--bg-hover)]",
-                  value === null ? "text-[var(--text-primary)]" : "text-[var(--text-secondary)]",
-                )}
-              >
-                All projects
-                {value === null && <Check size={11} />}
-              </button>
-            </Popover.Close>
 
-            {filtered.map((p) => (
-              <Popover.Close asChild key={p.path}>
-                <button
-                  type="button"
-                  onClick={() => onChange(p.path)}
-                  title={p.path}
-                  className="flex w-full cursor-pointer items-center gap-2 rounded px-2 py-1.5 text-left transition-colors hover:bg-[var(--bg-hover)]"
-                >
-                  <GitDot summary={summaries[p.path]} />
-                  <span className="min-w-0 flex-1">
-                    <span
-                      className={cn(
-                        "block truncate text-[11px] leading-tight",
-                        p.path === value
-                          ? "font-medium text-[var(--text-primary)]"
-                          : "text-[var(--text-secondary)]",
-                      )}
-                    >
-                      {p.name}
-                    </span>
-                    <BranchLine summary={summaries[p.path]} />
-                  </span>
-                  {p.path === value ? (
-                    <Check size={11} className="shrink-0 text-[var(--text-primary)]" />
-                  ) : (
-                    <NumStatPill summary={summaries[p.path]} />
-                  )}
-                </button>
-              </Popover.Close>
+          <div className="hide-scrollbar min-h-0 flex-1 overflow-y-auto p-1">
+            <GroupLabel>Project</GroupLabel>
+            <Option
+              label="All projects"
+              count={projects.length}
+              selected={projectFilter === null}
+              onSelect={() => onProjectFilter(null)}
+            />
+            {shownProjects.map((p) => (
+              <Option
+                key={p.path}
+                label={p.name}
+                title={p.path}
+                selected={projectFilter === p.path}
+                onSelect={() => onProjectFilter(projectFilter === p.path ? null : p.path)}
+                lead={<GitDot summary={summaries[p.path]} />}
+                sub={<BranchLine summary={summaries[p.path]} className="mt-0.5" />}
+                trail={<NumStatPill summary={summaries[p.path]} />}
+              />
             ))}
-
-            {filtered.length === 0 && (
-              <p className="px-2 py-3 text-center text-[11px] text-[var(--text-tertiary)]">
+            {shownProjects.length === 0 && (
+              <p className="px-2 py-2 text-center text-[11px] text-[var(--text-tertiary)]">
                 No project matches “{query.trim()}”.
               </p>
             )}
+
+            {otherGroups.map((group) => (
+              <div key={group.key}>
+                <GroupLabel>{group.label}</GroupLabel>
+                {group.options.map((o) => (
+                  <Option
+                    key={`${group.key}:${o.value ?? "all"}`}
+                    label={o.label}
+                    count={o.count}
+                    selected={selection[group.key] === o.value}
+                    onSelect={() => onSelect(group.key, o.value)}
+                  />
+                ))}
+              </div>
+            ))}
           </div>
         </Popover.Content>
       </Popover.Portal>
@@ -464,55 +606,66 @@ function ProjectFilter({
   );
 }
 
-/** Working-tree state at a glance: green clean, amber dirty, grey non-repo. */
-function GitDot({ summary }: { summary?: GitSummary }) {
-  const color =
-    !summary || !summary.isRepo
-      ? "var(--text-tertiary)"
-      : summary.dirty
-        ? "var(--status-warning)"
-        : "var(--capture-live)";
+function GroupLabel({ children }: { children: React.ReactNode }) {
   return (
-    <span
-      className="size-2 shrink-0 rounded-full"
-      style={{ backgroundColor: color }}
-      title={
-        !summary?.isRepo
-          ? "Not a git repository"
-          : summary.dirty
-            ? "Working tree dirty"
-            : "Working tree clean"
-      }
-    />
+    <p className="px-2 pb-1 pt-2 text-[10px] font-semibold uppercase tracking-[0.08em] text-[var(--text-tertiary)]">
+      {children}
+    </p>
   );
 }
 
-/** `branch  subject`, the second line of a picker row. */
-function BranchLine({ summary }: { summary?: GitSummary }) {
+function Option({
+  label,
+  title,
+  count,
+  selected,
+  onSelect,
+  lead,
+  sub,
+  trail,
+}: {
+  label: string;
+  title?: string;
+  count?: number;
+  selected: boolean;
+  onSelect: () => void;
+  lead?: React.ReactNode;
+  sub?: React.ReactNode;
+  trail?: React.ReactNode;
+}) {
   return (
-    <span className="mt-0.5 flex items-center gap-1 text-[10px] leading-tight text-[var(--text-tertiary)]">
-      {summary?.isRepo && <GitBranch size={9} className="shrink-0" />}
-      <span className="truncate font-mono">
-        {summary?.isRepo
-          ? `${summary.branch || "—"}${summary.headSubject ? `  ${summary.headSubject}` : ""}`
-          : "no source control"}
+    <button
+      type="button"
+      title={title}
+      onClick={onSelect}
+      className={cn(
+        "flex w-full cursor-pointer items-center gap-2 rounded px-2 py-1.5 text-left transition-colors hover:bg-[var(--bg-hover)]",
+        selected && "bg-[var(--bg-selected)]",
+      )}
+    >
+      {lead}
+      <span className="min-w-0 flex-1">
+        <span
+          className={cn(
+            "block truncate text-[11px] leading-tight",
+            selected ? "font-medium text-[var(--text-primary)]" : "text-[var(--text-secondary)]",
+          )}
+        >
+          {label}
+        </span>
+        {sub}
       </span>
-    </span>
-  );
-}
-
-/** +N/−M for an uncommitted working tree. Renders nothing when clean. */
-function NumStatPill({ summary }: { summary?: GitSummary }) {
-  if (!summary || (summary.additions === 0 && summary.deletions === 0)) return null;
-  return (
-    <span className="flex shrink-0 items-center gap-1.5 rounded-full bg-[var(--bg-elevated)] px-1.5 py-[1px] font-mono text-[9px]">
-      {summary.additions > 0 && (
-        <span className="text-[var(--stat-added)]">+{summary.additions}</span>
+      {selected ? (
+        <Check size={11} className="shrink-0 text-[var(--text-primary)]" />
+      ) : (
+        (trail ??
+        (count !== undefined ? (
+          <span className="shrink-0 font-mono text-[10px] tabular-nums text-[var(--text-tertiary)]">
+            {count}
+          </span>
+        ) : null))
       )}
-      {summary.deletions > 0 && (
-        <span className="text-[var(--stat-removed)]">−{summary.deletions}</span>
-      )}
-    </span>
+    </button>
   );
 }
 
@@ -551,7 +704,7 @@ function NotFound({ onBack }: { onBack: () => void }) {
       <button
         type="button"
         onClick={onBack}
-        className="mt-3 rounded border border-[var(--border-default)] px-3 py-1.5 text-[12px] text-[var(--text-secondary)] transition-colors duration-150 hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)] focus-visible:ring-1 focus-visible:ring-[var(--border-focus)] active:scale-[0.97]"
+        className="mt-3 cursor-pointer rounded-md border border-[var(--border-default)] px-3 py-1.5 text-[12px] text-[var(--text-secondary)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
       >
         Back to sessions
       </button>

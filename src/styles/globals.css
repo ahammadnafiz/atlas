@@ -573,6 +573,17 @@
   animation: atlas-panel-in-tl 200ms cubic-bezier(0.32, 0.72, 0, 1);
 }
 
+/* Breathing ring — the Timeline's live/attention markers and stat dots. A
+   box-shadow pulse rather than an opacity fade, so the dot itself stays at full
+   strength and only the halo moves. */
+@keyframes atlas-live-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 var(--atlas-pulse-color, rgba(63, 185, 80, 0.5)); }
+  50%      { box-shadow: 0 0 0 4px transparent; }
+}
+.atlas-live-pulse {
+  animation: atlas-live-pulse 2s ease-in-out infinite;
+}
+
 /* Marching-ants border — the capture-health banner when capture is stopped.
 
    A CSS `border: dashed` cannot animate its dashes, so the four edges are drawn
@@ -693,6 +704,7 @@
   /* The two looping animations in the chrome: the capture dot's halo and the
      Timeline teaser's rail pulse. Both are decorative. */
   /* The dashes stay — only their travel stops. */
+  .atlas-live-pulse,
   .atlas-ants,
   .animate-ping,
   .atlas-radar-sweep,
