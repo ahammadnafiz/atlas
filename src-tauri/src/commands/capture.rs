@@ -953,12 +953,23 @@ pub async fn capture_retry_failed(project_path: String, app: AppHandle) -> Resul
 /// inferred from "no events lately" — a quiet repository and a dead watcher are
 /// indistinguishable from the event stream, which is exactly how the clear-all
 /// bug stayed invisible.
+///
+/// **A missing watcher is healed here, not reported here.** An Organisation
+/// switch tears down every mounted Workspace and restarts the incoming one's
+/// watcher; if that restart loses a race, health had no way to do anything but
+/// tell the user to reopen the Workspace — advice for a problem one idempotent
+/// call fixes. So the poll attempts the restart itself and only reports what is
+/// still broken afterwards. `git_watch_start` is idempotent (it returns early
+/// when the same root is already watched), so the attempt is free on the
+/// overwhelmingly common healthy path.
 #[tauri::command]
 pub async fn capture_health(
     project_path: String,
     workspace_id: Option<String>,
     app: AppHandle,
 ) -> Result<atlas_checkpoint::CaptureHealth, String> {
+    heal_git_watcher(&app, &project_path, workspace_id.as_deref()).await;
+
     tauri::async_runtime::spawn_blocking(move || {
         let root = std::path::Path::new(&project_path);
         // A reader, so a status poll never waits behind an import — and
@@ -1020,6 +1031,62 @@ pub async fn capture_health(
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+/// Restart this Workspace's git watcher if it should have one and does not.
+///
+/// Silent and best-effort: this is a repair attempt on a status poll, so a
+/// failure is not the poll's error to report — the health evaluation that runs
+/// straight afterwards reads the registry again and says so properly.
+///
+/// Not a repository, or already watched, and this is a no-op.
+async fn heal_git_watcher(app: &AppHandle, project_path: &str, workspace_id: Option<&str>) {
+    let root = std::path::Path::new(project_path);
+    if !atlas_checkpoint::git::is_repository(root) {
+        return;
+    }
+    {
+        let watchers = app.state::<super::git_watcher::GitWatcherState>();
+        let attached = workspace_id.is_some_and(|id| watchers.is_watching(id))
+            || watchers.is_watching_root(root);
+        if attached {
+            return;
+        }
+    }
+
+    // Straight through the command the frontend calls on Workspace open, so
+    // the repair path and the ordinary path cannot drift apart.
+    let state = app.state::<super::git_watcher::GitWatcherState>();
+    if let Err(e) = super::git_watcher::git_watch_start(
+        project_path.to_string(),
+        workspace_id.map(str::to_string),
+        app.clone(),
+        state,
+    )
+    .await
+    {
+        tracing::warn!(
+            target: "atlas::capture",
+            project = %project_path,
+            "git watcher self-heal failed: {e}"
+        );
+    }
+}
+
+/// Restart the git watcher for a Workspace and report the health that results.
+///
+/// The retry behind the health banner. Distinct from the silent heal on every
+/// poll because this one is a human pressing a button: it runs the same repair
+/// and then answers with the *new* state, so the banner either clears or says
+/// what is still wrong — rather than clearing optimistically and reappearing on
+/// the next poll.
+#[tauri::command]
+pub async fn capture_retry_watcher(
+    project_path: String,
+    workspace_id: Option<String>,
+    app: AppHandle,
+) -> Result<atlas_checkpoint::CaptureHealth, String> {
+    capture_health(project_path, workspace_id, app).await
 }
 
 fn off_health(summary: &str) -> atlas_checkpoint::CaptureHealth {

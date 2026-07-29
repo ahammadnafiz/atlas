@@ -22,6 +22,8 @@ import { useOrgStore } from "@/features/organisations/stores/org-store";
 import type { Organisation } from "@/features/organisations/types";
 import { cn } from "@/lib/utils";
 
+import { activeWorkspaceId } from "@/features/workspaces/lib/active-workspace";
+
 import { CaptureDot } from "./capture-status";
 
 import type {
@@ -280,7 +282,9 @@ export function CapturePopover({ projectPath, health, onChanged, onClose }: Prop
       {binding && <CaptureRadar live={binding.enabled} health={health} />}
 
       <div className="px-3.5 py-3">
-        {view.kind === "main" && <HealthDetail health={health} />}
+        {view.kind === "main" && (
+          <HealthDetail health={health} projectPath={projectPath} onRetried={onChanged} />
+        )}
 
         {view.kind === "main" &&
           (binding ? (
@@ -474,38 +478,102 @@ function DisclosureStep({
 }
 
 /**
- * Why capture is degraded or stopped.
+ * Why capture is degraded or stopped, and one click to try to fix it.
  *
  * Nothing renders while healthy or switched off — a permanent banner trains
  * people to stop reading the thing they are supposed to notice.
+ *
+ * **One line per issue.** It used to stack the reason over its `nextStep` as two
+ * paragraphs, which turned a two-issue banner into four lines of red prose that
+ * nobody finished reading. The reason is the line; the `nextStep` moves to the
+ * title, so it is still reachable and no longer competing.
+ *
+ * **The banner is the retry.** Clicking it re-runs `capture_retry_watcher`,
+ * which restarts the git watcher and answers with the health that *results* —
+ * so the banner either clears or keeps saying what is still wrong, rather than
+ * clearing optimistically and returning on the next poll. The retry is offered
+ * for any unhealthy state rather than only the watcher issue: `HealthIssue`
+ * carries prose, not a machine-readable code, and string-matching a sentence to
+ * decide whether a button appears is the kind of thing that breaks silently the
+ * next time the wording changes. Re-running health is harmless when the problem
+ * was something else — it just tells the truth again.
  */
-function HealthDetail({ health }: { health: CaptureHealth | null }) {
+function HealthDetail({
+  health,
+  projectPath,
+  onRetried,
+}: {
+  health: CaptureHealth | null;
+  projectPath: string;
+  /** Re-read after a retry. `health` is owned by the titlebar, so the banner
+   *  updates by asking it to re-read rather than by holding a second copy. */
+  onRetried: () => void;
+}) {
+  const [retrying, setRetrying] = useState(false);
+
   if (!health || health.issues.length === 0) return null;
 
   const stopped = health.state === "stopped";
+  const tone = stopped ? "var(--status-error)" : "var(--status-warning)";
+
+  const retry = async () => {
+    if (retrying) return;
+    setRetrying(true);
+    try {
+      await invoke<CaptureHealth>("capture_retry_watcher", {
+        projectPath,
+        workspaceId: activeWorkspaceId(),
+      });
+      onRetried();
+    } catch {
+      // The banner is already saying something is wrong; a failed retry does
+      // not need a second, competing error.
+    } finally {
+      setRetrying(false);
+    }
+  };
+
   return (
-    <ul
+    <button
+      type="button"
+      onClick={() => void retry()}
+      disabled={retrying}
+      aria-label="Retry — restart capture for this project"
       className={cn(
-        "mb-2.5 space-y-1.5 rounded-lg px-2.5 py-2",
-        stopped ? "bg-[var(--status-error-muted)]" : "bg-[var(--status-warning-muted)]",
+        // The ants are drawn as background gradients, so the fill has to be a
+        // background-COLOR or it would paint over them.
+        "atlas-ants mb-2.5 block w-full cursor-pointer rounded-lg px-2.5 py-2 text-left transition-opacity",
+        "hover:opacity-90 disabled:cursor-wait",
       )}
+      style={{
+        backgroundColor: stopped ? "var(--status-error-muted)" : "var(--status-warning-muted)",
+        ["--atlas-ants-color" as string]: `color-mix(in oklab, ${tone} 55%, transparent)`,
+      }}
     >
-      {health.issues.map((issue, index) => (
-        // Index in the key: two issues can share their reason text.
-        <li key={`${index}-${issue.reason}`} className="text-[11px]">
-          <p
-            className={
+      <span className="flex flex-col gap-1">
+        {health.issues.map((issue, index) => (
+          // Index in the key: two issues can share their reason text.
+          <span
+            key={`${index}-${issue.reason}`}
+            title={issue.nextStep || undefined}
+            className={cn(
+              "flex items-center gap-1.5 text-[11px]",
               issue.state === "stopped"
                 ? "text-[var(--status-error)]"
-                : "text-[var(--status-warning)]"
-            }
+                : "text-[var(--status-warning)]",
+            )}
           >
-            {issue.reason}
-          </p>
-          {issue.nextStep && <p className="text-[var(--text-tertiary)]">{issue.nextStep}</p>}
-        </li>
-      ))}
-    </ul>
+            {index === 0 &&
+              (retrying ? (
+                <Loader2 size={10} className="shrink-0 animate-spin" />
+              ) : (
+                <RefreshCw size={10} className="shrink-0 opacity-70" />
+              ))}
+            <span className="min-w-0 flex-1 truncate">{issue.reason}</span>
+          </span>
+        ))}
+      </span>
+    </button>
   );
 }
 

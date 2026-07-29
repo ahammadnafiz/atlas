@@ -573,6 +573,30 @@
   animation: atlas-panel-in-tl 200ms cubic-bezier(0.32, 0.72, 0, 1);
 }
 
+/* Marching-ants border — the capture-health banner when capture is stopped.
+
+   A CSS `border: dashed` cannot animate its dashes, so the four edges are drawn
+   as four background gradients and the whole set is scrolled. The four values in
+   the keyframe are one per edge, and their signs are what send each edge round
+   the box in the same direction rather than two of them running backwards.
+
+   `--atlas-ants-color` is set by the caller so the same rule serves any status
+   tone. */
+@keyframes atlas-ants {
+  to { background-position: 8px 0, -8px 100%, 0 -8px, 100% 8px; }
+}
+.atlas-ants {
+  background-image:
+    repeating-linear-gradient(90deg, var(--atlas-ants-color) 0 4px, transparent 4px 8px),
+    repeating-linear-gradient(90deg, var(--atlas-ants-color) 0 4px, transparent 4px 8px),
+    repeating-linear-gradient(0deg,  var(--atlas-ants-color) 0 4px, transparent 4px 8px),
+    repeating-linear-gradient(0deg,  var(--atlas-ants-color) 0 4px, transparent 4px 8px);
+  background-size: 100% 1px, 100% 1px, 1px 100%, 1px 100%;
+  background-position: 0 0, 0 100%, 0 0, 100% 0;
+  background-repeat: no-repeat;
+  animation: atlas-ants 700ms linear infinite;
+}
+
 /* Capture popover — the Timeline teaser.
 
    A pulse runs down the rail every few seconds so the mock reads as a live
@@ -668,6 +692,8 @@
   .atlas-fade-in { animation: none; }
   /* The two looping animations in the chrome: the capture dot's halo and the
      Timeline teaser's rail pulse. Both are decorative. */
+  /* The dashes stay — only their travel stops. */
+  .atlas-ants,
   .animate-ping,
   .atlas-radar-sweep,
   .atlas-radar-ping,

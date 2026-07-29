@@ -413,6 +413,7 @@ pub fn run() {
             commands::capture::capture_connect,
             commands::capture::capture_activate,
             commands::capture::capture_retry_failed,
+            commands::capture::capture_retry_watcher,
             commands::capture::artifacts_sessions,
             commands::capture::artifacts_session,
             commands::capture::artifacts_payload,
