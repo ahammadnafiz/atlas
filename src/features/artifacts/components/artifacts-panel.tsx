@@ -413,10 +413,16 @@ export function ArtifactsPanel() {
                 session to the last, and a scrollbar gutter cutting down beside
                 it breaks that line — the same reason every other panel in the
                 app hides its bars. Scrolling itself is unaffected. */}
+            {/* The calendar branch is `overflow-hidden`, NOT `flex`. As a flex
+                container this box made the calendar a flex ITEM, which sizes to
+                its content on the main axis — so the month grid stopped
+                wherever its widest cell ended and left the rest of the panel
+                black. A block parent lets the grid fill the width, and the
+                calendar scrolls its own body. */}
             <div
               className={cn(
                 "min-h-0 flex-1",
-                view === "calendar" ? "flex" : "hide-scrollbar overflow-y-auto",
+                view === "calendar" ? "overflow-hidden" : "hide-scrollbar overflow-y-auto",
               )}
             >
               {view === "calendar" ? (

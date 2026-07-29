@@ -79,7 +79,7 @@ export function CalendarView({
   );
 
   return (
-    <section className="flex h-full min-h-0 flex-col">
+    <section className="flex h-full min-h-0 w-full flex-col">
       <header className="flex h-7 shrink-0 items-center gap-2 border-b border-[var(--border-subtle)] bg-[var(--bg-raised)] px-4">
         <span className="text-[11px] font-semibold uppercase tracking-[0.08em] text-[var(--text-secondary)]">
           {monthStart.toLocaleDateString(undefined, { month: "long", year: "numeric" })}

@@ -13,7 +13,7 @@
 
 # Atlas
 
-Atlas is version control for coding agents at scale. Run **Claude Code**, **Codex**, and Atlas's own native agent side by side on the same codebase, with shared memory between them and a searchable history of what each one changed.
+Atlas is an open source software factory that coordinates automation of the entire software development lifecycle. Teams use Atlas to coordinate fleets of agents that share context across your codebase to open issues, document changes, and execute on new tasks all in one interface.
 
 - **Run agents in parallel.** Multiple sessions across tabs, each streaming independently. Switching tabs never freezes or drops a run in flight.
 - **One memory, three agents.** A decision Claude Code made shows up in Codex's next prompt. Plans, file changes, failures, and architecture notes are shared automatically, matched on-device against what you're asking about.
