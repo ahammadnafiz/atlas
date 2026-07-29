@@ -219,6 +219,11 @@ pub fn run() {
                 // construction because `CaptureState` is registered earlier in
                 // the builder chain; until this runs the drain simply parks,
                 // which is exactly Local-mode behaviour.
+                // The worker announces its writes through this handle — without
+                // it the Timeline board only ever sees them on its 15 s poll.
+                app.state::<commands::capture::CaptureState>()
+                    .install_notifier(app.handle().clone());
+
                 let core = app.state::<commands::auth::AuthState>().core();
                 app.state::<commands::capture::CaptureState>()
                     .install_token_provider(Box::new(move || {

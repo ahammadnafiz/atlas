@@ -573,6 +573,22 @@
   animation: atlas-panel-in-tl 200ms cubic-bezier(0.32, 0.72, 0, 1);
 }
 
+/* Stats-rail collapse — the Timeline's summary opening and closing.
+
+   Two curves, on purpose. The wrapper's HEIGHT uses the house decelerating
+   curve, because a height that overshoots would open a gap under a fixed-height
+   panel and then close it. The CONTENT gets the overshoot instead: it settles
+   just past its resting place and eases back, which is what reads as spring
+   rather than as a drawer sliding. Separating them is the whole trick. */
+.atlas-rail {
+  transition: height 340ms cubic-bezier(0.32, 0.72, 0, 1);
+}
+.atlas-rail-body {
+  transition:
+    transform 380ms cubic-bezier(0.22, 1.4, 0.36, 1),
+    opacity 200ms ease-out;
+}
+
 /* Breathing ring — the Timeline's live/attention markers and stat dots. A
    box-shadow pulse rather than an opacity fade, so the dot itself stays at full
    strength and only the halo moves. */
@@ -704,6 +720,9 @@
   /* The two looping animations in the chrome: the capture dot's halo and the
      Timeline teaser's rail pulse. Both are decorative. */
   /* The dashes stay — only their travel stops. */
+  /* The rail snaps instead of springing. */
+  .atlas-rail,
+  .atlas-rail-body { transition: none; }
   .atlas-live-pulse,
   .atlas-ants,
   .animate-ping,

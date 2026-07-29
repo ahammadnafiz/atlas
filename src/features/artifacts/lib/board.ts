@@ -40,6 +40,22 @@ export function sessionState(session: BoardSession, now = Date.now()): SessionSt
   return "done";
 }
 
+/**
+ * What a row can honestly say about token use.
+ *
+ * The native agent reports a real input/output split; ACP agents (Claude Code,
+ * Codex) report only context-window occupancy. Rendering the second as though
+ * it were the first would inflate every ACP row and go *down* after a
+ * compaction, so the two read differently: `212.8K tok` for a real total,
+ * `853.1K / 1.0M ctx` for a gauge.
+ */
+export function tokenLabel(session: BoardSession): string | null {
+  if (session.totalTokens > 0) return `${formatTokens(session.totalTokens)} tok`;
+  if (session.contextUsed == null) return null;
+  const size = session.contextSize ? ` / ${formatTokens(session.contextSize)}` : "";
+  return `${formatTokens(session.contextUsed)}${size} ctx`;
+}
+
 /** `84.2K`, `1.24M` — the design's token shorthand. */
 export function formatTokens(n: number): string {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(2)}M`;
@@ -167,11 +183,11 @@ function totals(rows: BoardSession[]): string {
 interface WeekDay {
   /** Local midnight. */
   key: number;
-  /** `M`, `T`, `W`… */
-  letter: string;
   minutes: number;
-  /** `Jul 27` */
+  /** `Jul 27` — the week-range endpoints. */
   label: string;
+  /** `Wed Jul 29` — the hovered day, which needs the weekday to be readable. */
+  full: string;
 }
 
 /** The last seven days, oldest first, ending today. */
@@ -184,9 +200,13 @@ export function lastSevenDays(sessions: BoardSession[]): WeekDay[] {
     const rows = byDay.get(key) ?? [];
     return {
       key,
-      letter: date.toLocaleDateString(undefined, { weekday: "narrow" }),
       minutes: Math.round(rows.reduce((a, s) => a + s.durationSeconds, 0) / 60),
       label: shortDate(date),
+      full: date.toLocaleDateString(undefined, {
+        weekday: "short",
+        day: "numeric",
+        month: "short",
+      }),
     };
   });
 }

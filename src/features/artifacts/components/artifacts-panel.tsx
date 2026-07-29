@@ -35,7 +35,7 @@ import { Divider, Segment, SegmentButton, SEGMENT_ACTIVE, SEGMENT_TRIGGER } from
 import { CheckpointsPicker } from "./checkpoints-picker";
 import { SessionDetail } from "./session-detail";
 import { SessionList } from "./session-list";
-import { SessionStats } from "./session-stats";
+import { SessionStats, STATS_HEIGHT } from "./session-stats";
 
 /** Mirrors `BOARD_LIMIT` in `capture.rs` — how many rows one board read returns. */
 const BOARD_LIMIT = 500;
@@ -154,11 +154,20 @@ export function ArtifactsPanel() {
   // capture writes (turn finished, import progressed, drain sent rows) that
   // move no git ref and therefore emit no event.
   useEffect(() => {
+    // Two push signals, then the poll as a floor.
+    //
+    // `atlas:capture-changed` is the one that matters: the capture worker emits
+    // it (coalesced) whenever it writes, which is what makes a session you just
+    // started appear immediately rather than up to fifteen seconds later. It
+    // did not exist before, so the poll *was* the refresh — and capture writes
+    // move no git ref, so `atlas:git-changed` never fired for them.
+    //
     // Any project's commit can add a Checkpoint to this board, so unlike the
-    // project-scoped view this no longer filters the event by path.
-    const unlisten = listen("atlas:git-changed", () => {
-      void refresh();
-    });
+    // project-scoped view this no longer filters the git event by path.
+    const unlisten = Promise.all([
+      listen("atlas:git-changed", () => void refresh()),
+      listen("atlas:capture-changed", () => void refresh()),
+    ]);
     const timer = setInterval(() => {
       if (document.visibilityState === "visible") void refresh();
     }, 15_000);
@@ -167,7 +176,7 @@ export function ArtifactsPanel() {
     };
     document.addEventListener("visibilitychange", onVisibility);
     return () => {
-      void unlisten.then((stop) => stop());
+      void unlisten.then((stops) => stops.forEach((stop) => stop()));
       clearInterval(timer);
       document.removeEventListener("visibilitychange", onVisibility);
     };
@@ -408,7 +417,24 @@ export function ArtifactsPanel() {
           <NotEnabled />
         ) : (
           <div className="flex h-full min-h-0 flex-col">
-            {statsOpen && loaded && <SessionStats sessions={visible} />}
+            {/* Animated rather than mounted/unmounted: an unmount has no exit,
+                so collapsing would snap shut while expanding eased open. The
+                height carries the house decelerating curve and the body carries
+                the overshoot — see `.atlas-rail` for why they differ. */}
+            <div
+              className="atlas-rail shrink-0 overflow-hidden"
+              style={{ height: statsOpen && loaded ? STATS_HEIGHT : 0 }}
+              aria-hidden={!statsOpen}
+            >
+              <div
+                className={cn(
+                  "atlas-rail-body",
+                  statsOpen ? "translate-y-0 opacity-100" : "-translate-y-3 opacity-0",
+                )}
+              >
+                {loaded && <SessionStats sessions={visible} />}
+              </div>
+            </div>
             {/* `hide-scrollbar`: the board is a continuous rail from the first
                 session to the last, and a scrollbar gutter cutting down beside
                 it breaks that line — the same reason every other panel in the

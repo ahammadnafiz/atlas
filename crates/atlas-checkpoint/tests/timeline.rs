@@ -378,3 +378,54 @@ fn recent_checkpoints_are_scoped_to_their_workspace() {
     let other = timeline::recent_checkpoints(&store, "ws-someone-else", 10, |_| None).expect("read");
     assert!(other.is_empty(), "{other:?}");
 }
+
+/// The branch a Session started on reaches the row even with no commit.
+///
+/// `branches` used to come only from Checkpoints, so the overwhelming majority
+/// of Sessions — the ones that never produced a commit — had none, and the
+/// Timeline's branch filter could not see them.
+#[test]
+fn a_session_carries_its_starting_branch_without_any_checkpoint() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut store, session_id) = seeded(dir.path());
+
+    {
+        let mut capture = Capture::new(&mut store, WorkspaceMode::Local);
+        capture.note_branch(&session_id, Some("feat/atlas-tokens")).expect("branch recorded");
+        // Idempotent: a checkout mid-conversation must not retro-label the row.
+        capture.note_branch(&session_id, Some("main")).expect("second note is a no-op");
+    }
+
+    let rows = timeline::sessions(&store, WORKSPACE).expect("read");
+    let row = rows.iter().find(|r| r.id == session_id).expect("row");
+    assert_eq!(row.branches, vec!["feat/atlas-tokens".to_string()]);
+    assert_eq!(row.checkpoint_count, 0, "no commit, and still a branch");
+}
+
+/// An agent that reports only context occupancy is not reported as token spend.
+///
+/// ACP agents (Claude Code, Codex) emit no input/output split, so `totalTokens`
+/// stays 0 and the gauge travels in its own fields. Folding it into the total
+/// would inflate every ACP row — and a compaction would make the number go
+/// *down*, which no cumulative counter should ever do.
+#[test]
+fn context_occupancy_travels_separately_from_a_token_split() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut store, session_id) = seeded(dir.path());
+
+    {
+        let mut capture = Capture::new(&mut store, WorkspaceMode::Local);
+        capture
+            .record_usage(
+                &session_id,
+                &TokenTotals { context_used: Some(853_100), context_size: Some(1_000_000), ..Default::default() },
+            )
+            .expect("usage recorded");
+    }
+
+    let rows = timeline::sessions(&store, WORKSPACE).expect("read");
+    let row = rows.iter().find(|r| r.id == session_id).expect("row");
+    assert_eq!(row.total_tokens, 0, "occupancy is not consumption");
+    assert_eq!(row.context_used, Some(853_100));
+    assert_eq!(row.context_size, Some(1_000_000));
+}

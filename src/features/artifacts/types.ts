@@ -28,11 +28,18 @@ export interface SessionSummary {
   messageCount: number;
   toolCallCount: number;
   checkpointCount: number;
+  /** Every branch touched: the starting branch first, then Checkpoint branches. */
   branches: string[];
   insertions: number;
   deletions: number;
   filesTouched: number;
+  /** Input + output. `0` for an agent that reports no split — see `contextUsed`. */
   totalTokens: number;
+  /** Context-window occupancy, for agents that report only that (every ACP
+   *  agent). Deliberately not folded into `totalTokens`: occupancy is not
+   *  consumption, and a compaction makes it go down. */
+  contextUsed: number | null;
+  contextSize: number | null;
   needsAttention: boolean;
   attentionReason: string | null;
 }

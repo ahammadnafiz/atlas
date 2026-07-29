@@ -181,21 +181,30 @@ impl Store {
         native_session_id: &str,
         agent: Option<&str>,
         model: Option<&str>,
+        branch: Option<&str>,
         cwd: Option<&str>,
         mode: WorkspaceMode,
     ) -> Result<String> {
+        // `branch` is the branch at the moment of this prompt. It is COALESCEd
+        // onto the EXISTING value below, so the first one seen sticks: a
+        // Session belongs to the branch it started on, and a checkout
+        // mid-conversation must not retro-label it.
         self.require_writer()?;
         let now = Utc::now();
 
         if let Some(id) = self.session_id_for(workspace_id, source, native_session_id)? {
             self.conn.execute(
+                // `model` takes the NEW value when there is one — switching
+                // model mid-conversation should be visible — while `branch`
+                // keeps the first. They differ on purpose.
                 "UPDATE agent_session
                     SET agent = COALESCE(?2, agent),
                         model = COALESCE(?3, model),
-                        cwd = COALESCE(?4, cwd),
-                        updated_at = ?5
+                        branch = COALESCE(branch, ?4),
+                        cwd = COALESCE(?5, cwd),
+                        updated_at = ?6
                   WHERE id = ?1",
-                rusqlite::params![id, agent, model, cwd, now.to_rfc3339()],
+                rusqlite::params![id, agent, model, branch, cwd, now.to_rfc3339()],
             )?;
             return Ok(id);
         }
@@ -203,9 +212,9 @@ impl Store {
         let id = format!("as-{}", uuid::Uuid::new_v4().simple());
         self.conn.execute(
             "INSERT INTO agent_session
-                (id, workspace_id, source, native_session_id, agent, model, cwd,
+                (id, workspace_id, source, native_session_id, agent, model, branch, cwd,
                  started_at, updated_at, sync_state)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, ?9)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9, ?10)",
             rusqlite::params![
                 id,
                 workspace_id,
@@ -213,6 +222,7 @@ impl Store {
                 native_session_id,
                 agent,
                 model,
+                branch,
                 cwd,
                 now.to_rfc3339(),
                 mode.initial_sync_state().as_str(),
@@ -1576,6 +1586,16 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    /// Set the Session's starting branch, keeping any value already there.
+    pub fn set_branch_if_absent(&self, session_id: &str, branch: &str) -> Result<()> {
+        self.require_writer()?;
+        self.conn.execute(
+            "UPDATE agent_session SET branch = COALESCE(branch, ?2) WHERE id = ?1",
+            rusqlite::params![session_id, branch],
+        )?;
+        Ok(())
+    }
+
     /// Re-point a Checkpoint at the commit now carrying its change.
     ///
     /// If a row for `(session, commit_sha)` already exists — the walk saw the
@@ -2175,7 +2195,7 @@ fn next_seq(tx: &rusqlite::Transaction<'_>) -> Result<i64> {
 
 const SESSION_COLUMNS: &str = "id, workspace_id, source, native_session_id, title, agent, model, \
      cwd, token_totals, summary, started_at, updated_at, needs_attention, \
-     attention_reason, redaction_counts, sync_state";
+     attention_reason, redaction_counts, sync_state, branch";
 
 fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
     let source: String = row.get(2)?;
@@ -2200,6 +2220,7 @@ fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
         redaction_counts: serde_json::from_str(&redaction_counts)
             .unwrap_or(serde_json::Value::Null),
         sync_state: SyncState::parse(&sync_state).unwrap_or(SyncState::Local),
+        branch: row.get(16)?,
     })
 }
 

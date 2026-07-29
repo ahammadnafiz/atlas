@@ -53,7 +53,7 @@ use atlas_checkpoint::{
     Capture, FileWrite, Mode, Role, SessionKey, Source, Store, TokenTotals, ToolCallContent,
     ToolStatus, TurnContent, WorkspaceMode,
 };
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Emitter, Manager};
 
 /// Lock a mutex, recovering from poisoning.
 ///
@@ -82,6 +82,10 @@ struct SessionBinding {
     native_session_id: String,
     agent: Option<String>,
     model: Option<String>,
+    /// Branch at the moment of the first prompt. Read once per Session — a
+    /// `git symbolic-ref` on every keystroke-triggered send would be a process
+    /// spawn on the send path for a value that does not change.
+    branch: Option<String>,
     cwd: String,
     /// The turn a message-appended delta belongs to. Message deltas carry no
     /// turn identity of their own, so the send path stamps it here. Seeded from
@@ -228,6 +232,10 @@ pub struct CaptureState {
     pending_turns: Mutex<HashMap<String, PendingTurn>>,
     /// How the drain gets an access token. Shared with the worker.
     token: TokenProvider,
+    /// How the worker tells the UI something was written. Late-bound like
+    /// `token`, for the same reason: the app handle does not exist yet when
+    /// this state is registered.
+    notify: Notifier,
     /// Every writing session store this process has open.
     stores: StoreRegistry,
     /// Set false when the worker thread dies (it should never — each job runs
@@ -240,6 +248,26 @@ pub struct CaptureState {
 /// A late-bound source of access tokens, shared between the command surface and
 /// the capture worker.
 type TokenProvider = Arc<Mutex<Option<Box<dyn Fn() -> Option<String> + Send>>>>;
+
+/// A late-bound window-event emitter, shared with the capture worker.
+type Notifier = Arc<Mutex<Option<AppHandle>>>;
+
+/// Emitted when the worker has written something a reader would want to see.
+///
+/// The Timeline board polls every 15 s as a fallback, which is fine for a
+/// background refresh and far too slow for the session you just started — it
+/// appears up to fifteen seconds after you sent the prompt. Capture writes move
+/// no git ref, so `atlas:git-changed` never fires for them and there was nothing
+/// else to listen to.
+const CAPTURE_CHANGED: &str = "atlas:capture-changed";
+
+/// Coalescing window for [`CAPTURE_CHANGED`].
+///
+/// One streaming turn produces dozens of jobs — every tool call, every finished
+/// message, every usage update. Emitting per job would have the board re-reading
+/// every project's store dozens of times a turn. Leading-edge plus trailing, so
+/// the first write of a burst shows immediately and the last one is not lost.
+const NOTIFY_DEBOUNCE: Duration = Duration::from_millis(250);
 
 /// Per-root drain backoff, owned by the worker.
 struct DrainBackoff {
@@ -287,6 +315,8 @@ impl CaptureState {
         // instead of failing it, and is exactly Local-mode behaviour.
         let token: TokenProvider = Arc::new(Mutex::new(None));
         let token_for_worker = token.clone();
+        let notify: Notifier = Arc::new(Mutex::new(None));
+        let notify_for_worker = notify.clone();
         let stores: StoreRegistry = Arc::new(Mutex::new(HashMap::new()));
         let stores_for_worker = stores.clone();
         let worker_alive = Arc::new(AtomicBool::new(true));
@@ -297,7 +327,9 @@ impl CaptureState {
         // milliseconds.
         std::thread::Builder::new()
             .name("atlas-capture".into())
-            .spawn(move || worker(rx, token_for_worker, stores_for_worker, alive_for_worker))
+            .spawn(move || {
+                worker(rx, token_for_worker, notify_for_worker, stores_for_worker, alive_for_worker)
+            })
             .expect("capture worker thread");
         Self {
             sessions: Mutex::new(HashMap::new()),
@@ -305,6 +337,7 @@ impl CaptureState {
             session_calls: Mutex::new(HashMap::new()),
             pending_turns: Mutex::new(HashMap::new()),
             token,
+            notify,
             stores,
             worker_alive,
             tx,
@@ -340,6 +373,15 @@ impl CaptureState {
     /// Called once from `setup`, after the auth core exists.
     pub fn install_token_provider(&self, provider: Box<dyn Fn() -> Option<String> + Send>) {
         *lock_ok(&self.token) = Some(provider);
+    }
+
+    /// Install the handle the worker emits [`CAPTURE_CHANGED`] through.
+    ///
+    /// Called once from `setup`. Until it is, the worker simply writes without
+    /// announcing, and the board's poll is the only refresh — which is the
+    /// behaviour that existed before this event.
+    pub fn install_notifier(&self, app: AppHandle) {
+        *lock_ok(&self.notify) = Some(app);
     }
 
     /// Record the user's prompt and bind the session, from the send path.
@@ -386,6 +428,9 @@ impl CaptureState {
                     native_session_id: session_id.to_string(),
                     agent: Some(plugin_id.to_string()),
                     model: model.map(str::to_string),
+                    // Resolved here, inside `or_insert_with`, so the `git` call
+                    // happens once per Session rather than on every send.
+                    branch: atlas_checkpoint::git::current_branch(Path::new(cwd)),
                     cwd: cwd.to_string(),
                     turn_seq: seed,
                 });
@@ -1872,6 +1917,7 @@ fn open_in(stores: &StoreRegistry, root: &Path) -> Result<StoreHandle, String> {
 fn worker(
     rx: mpsc::Receiver<Job>,
     drain_token: TokenProvider,
+    notify: Notifier,
     stores: StoreRegistry,
     alive: Arc<AtomicBool>,
 ) {
@@ -1891,15 +1937,51 @@ fn worker(
     // the only place drains run.
     let backoff: BackoffMap = Arc::new(Mutex::new(HashMap::new()));
 
+    // Change notification, coalesced. `dirty` says a write landed that a reader
+    // would want; `last_emit` enforces the window. Starting `last_emit` a full
+    // window in the past makes the very first write emit immediately.
+    let mut dirty = false;
+    let mut last_emit = Instant::now() - NOTIFY_DEBOUNCE;
+    // The scan runs on its own clock now, because the receive timeout is short
+    // while there is a pending notification to flush.
+    let mut last_scan = Instant::now();
+
     loop {
+        // Short wait while a notification is pending, so the trailing edge of a
+        // burst is announced promptly rather than at the next scan.
+        let wait = if dirty { NOTIFY_DEBOUNCE } else { IMPORT_SCAN_INTERVAL };
         // A timeout rather than a blocking receive, so the ongoing transcript
         // scan reaches **every bound Workspace** — including backgrounded ones.
         // The existing sessions watcher is a global singleton pointed at the
         // active workspace, so inheriting it would miss exactly the terminal
         // Sessions this is meant to catch.
-        let job = match rx.recv_timeout(IMPORT_SCAN_INTERVAL) {
-            Ok(job) => job,
-            Err(mpsc::RecvTimeoutError::Timeout) => {
+        let job = match rx.recv_timeout(wait) {
+            Ok(job) => Some(job),
+            Err(mpsc::RecvTimeoutError::Timeout) => None,
+            // The app is shutting down.
+            Err(mpsc::RecvTimeoutError::Disconnected) => return,
+        };
+
+        if let Some(job) = job {
+            // One panicking job must not kill the recorder for the rest of the
+            // process. The job is lost (and logged); the mutexes it may have
+            // poisoned are recovered by `lock_ok` everywhere.
+            //
+            // Every job except a drain changes something a reader can see —
+            // a drain only moves outbox state, which no view renders.
+            let visible = !matches!(job, Job::Drain { .. });
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                process_job(job, &mut session_ids, &drain_token, &stores, &backoff);
+            }));
+            if result.is_err() {
+                tracing::error!(target: "atlas::capture", "capture job panicked; job dropped");
+            }
+            dirty |= visible;
+        }
+
+        if last_scan.elapsed() >= IMPORT_SCAN_INTERVAL {
+            last_scan = Instant::now();
+            {
                 let open: Vec<(PathBuf, StoreHandle)> = lock_ok(&stores)
                     .iter()
                     .filter(|(_, handle)| handle.is_writer)
@@ -1925,20 +2007,17 @@ fn worker(
                         );
                     }
                 }
-                continue;
             }
-            // The app is shutting down.
-            Err(mpsc::RecvTimeoutError::Disconnected) => return,
-        };
+            // An import may have added Sessions, so the board wants to know.
+            dirty = true;
+        }
 
-        // One panicking job must not kill the recorder for the rest of the
-        // process. The job is lost (and logged); the mutexes it may have
-        // poisoned are recovered by `lock_ok` everywhere.
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            process_job(job, &mut session_ids, &drain_token, &stores, &backoff);
-        }));
-        if result.is_err() {
-            tracing::error!(target: "atlas::capture", "capture job panicked; job dropped");
+        if dirty && last_emit.elapsed() >= NOTIFY_DEBOUNCE {
+            dirty = false;
+            last_emit = Instant::now();
+            if let Some(app) = lock_ok(&notify).as_ref() {
+                let _ = app.emit(CAPTURE_CHANGED, ());
+            }
         }
     }
 }
@@ -2103,8 +2182,11 @@ fn process_job(
                 binding.model.as_deref(),
                 Some(&binding.cwd),
             )
-            .map(|id| {
+            .and_then(|id| {
+                // The branch is a separate call — see `Capture::note_branch`.
+                capture.note_branch(&id, binding.branch.as_deref())?;
                 session_ids.insert(binding.native_session_id.clone(), id);
+                Ok(())
             }),
         Job::Turn {
             native_message_id,

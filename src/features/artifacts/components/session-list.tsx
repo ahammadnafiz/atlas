@@ -15,7 +15,14 @@
  */
 
 import { useMemo, useState } from "react";
-import { ArrowDown, Check, ChevronDown, ChevronRight, TriangleAlert } from "lucide-react";
+import {
+  ArrowDown,
+  Check,
+  ChevronDown,
+  ChevronRight,
+  GitBranch,
+  TriangleAlert,
+} from "lucide-react";
 
 import { AgentIcons } from "@/components/agent-icons";
 import { AtlasIcon } from "@/components/atlas-icon";
@@ -25,10 +32,10 @@ import { cn } from "@/lib/utils";
 import {
   agentLabel,
   formatDuration,
-  formatTokens,
   groupByDay,
   prettyModel,
   sessionState,
+  tokenLabel,
   type SessionState,
 } from "../lib/board";
 import type { BoardSession } from "../types";
@@ -124,6 +131,9 @@ export function SessionList({ sessions, loading, filtered, onOpen }: Props) {
  */
 const ROW_GRID = "grid grid-cols-[22px_minmax(0,1fr)_28px_92px_68px] items-center gap-4 px-5";
 
+/** Row height. Two lines of content, so taller than the single-line first pass. */
+const ROW_H = "h-14";
+
 function SessionRow({
   session,
   first,
@@ -137,6 +147,15 @@ function SessionRow({
 }) {
   const state = sessionState(session);
   const branch = session.branches[0];
+  // Everything after the branch, each already a complete phrase. Empty entries
+  // are dropped rather than rendered as a bare separator.
+  const meta = [
+    session.projectName,
+    tokenLabel(session),
+    session.checkpointCount > 0
+      ? `${session.checkpointCount} checkpoint${session.checkpointCount === 1 ? "" : "s"}`
+      : null,
+  ].filter((part): part is string => part !== null);
 
   return (
     <button
@@ -145,7 +164,8 @@ function SessionRow({
       title={session.attentionReason ?? undefined}
       className={cn(
         ROW_GRID,
-        "h-12 w-full cursor-pointer text-left transition-colors hover:bg-[var(--bg-hover)]",
+        ROW_H,
+        "w-full cursor-pointer text-left transition-colors hover:bg-[var(--bg-hover)]",
         !last && "border-b border-dashed border-[var(--border-default)]",
         state === "attention" && "bg-[var(--status-warning-muted)]/40",
       )}
@@ -154,10 +174,11 @@ function SessionRow({
         <Node state={state} />
       </Rail>
 
-      <span className="flex min-w-0 items-baseline gap-3">
-        {/* 13px, the app's body size. 14px made the title the only thing on the
-            board in its own size, and next to a 10.5px mono meta it read as two
-            unrelated typefaces sharing a line. */}
+      <span className="flex min-w-0 flex-col gap-1">
+        {/* Two lines, as in the reference: the title is the thing you read, and
+            the branch / tokens are what you check once you have found it.
+            Side by side they competed for the same horizontal space and the
+            title truncated first — which is exactly backwards. */}
         <span
           className={cn(
             "min-w-0 truncate text-[13px] leading-tight tracking-[-0.01em]",
@@ -166,21 +187,19 @@ function SessionRow({
         >
           {session.title ?? <span className="text-[var(--text-tertiary)]">Untitled session</span>}
         </span>
-        {/* 11px mono, the same size as the model and duration columns. The row
-            now has exactly two type sizes — 13px sans for the one thing you
-            read, 11px mono for everything you scan — which is what stops it
-            looking like four fonts sharing a line. */}
-        <span className="flex-none whitespace-nowrap font-mono text-[11px] text-[var(--text-tertiary)]">
-          {[
-            session.projectName,
-            branch,
-            session.totalTokens > 0 ? `${formatTokens(session.totalTokens)} tok` : null,
-            session.checkpointCount > 0
-              ? `${session.checkpointCount} checkpoint${session.checkpointCount === 1 ? "" : "s"}`
-              : null,
-          ]
-            .filter(Boolean)
-            .join(" · ")}
+        <span className="flex min-w-0 items-center gap-1.5 font-mono text-[11px] leading-tight text-[var(--text-tertiary)]">
+          {branch && (
+            <>
+              <GitBranch size={9} className="shrink-0" />
+              <span className="truncate">{branch}</span>
+            </>
+          )}
+          {meta.map((part) => (
+            <span key={part} className="shrink-0 whitespace-nowrap">
+              <span className="mr-1.5 text-[var(--text-ghost)]">·</span>
+              {part}
+            </span>
+          ))}
         </span>
       </span>
 
@@ -190,7 +209,15 @@ function SessionRow({
         {prettyModel(session.model) ?? ""}
       </span>
 
-      <span className="justify-self-end whitespace-nowrap font-mono text-[11px] text-[var(--text-secondary)]">
+      {/* A recording session's duration is still climbing, so it is marked —
+          green with a leading dot, matching the node on the rail. */}
+      <span
+        className={cn(
+          "justify-self-end whitespace-nowrap font-mono text-[11px]",
+          state === "live" ? "text-[var(--capture-live)]" : "text-[var(--text-secondary)]",
+        )}
+      >
+        {state === "live" && <span className="mr-1">·</span>}
         {formatDuration(session.durationSeconds)}
       </span>
     </button>
@@ -428,7 +455,8 @@ function ClusterRow({
         aria-expanded={expanded}
         className={cn(
           ROW_GRID,
-          "h-12 w-full cursor-pointer text-left transition-colors hover:bg-[var(--bg-hover)]",
+          ROW_H,
+          "w-full cursor-pointer text-left transition-colors hover:bg-[var(--bg-hover)]",
           !last && !expanded && "border-b border-dashed border-[var(--border-default)]",
           // Expanded, this row is a container rather than a session, and it
           // takes `--bg-elevated-2` — the ramp's next step ABOVE the day
@@ -468,19 +496,17 @@ function ClusterRow({
           </span>
         </Rail>
 
-        <span className="flex min-w-0 items-baseline gap-3">
+        <span className="flex min-w-0 flex-col gap-1">
           <span className="min-w-0 truncate text-[13px] leading-tight tracking-[-0.01em] text-[var(--text-secondary)]">
             {item.title}
           </span>
-          <span className="flex-none whitespace-nowrap font-mono text-[11px] text-[var(--text-tertiary)]">
-            automated runs
+          <span className="font-mono text-[11px] leading-tight text-[var(--text-tertiary)]">
+            ×{item.sessions.length} automated runs
           </span>
         </span>
 
         <span />
-        <span className="justify-self-end font-mono text-[11px] tabular-nums text-[var(--text-tertiary)]">
-          ×{item.sessions.length}
-        </span>
+        <span />
         <span className="justify-self-end whitespace-nowrap font-mono text-[11px] text-[var(--text-secondary)]">
           {formatDuration(minutes)}
         </span>
