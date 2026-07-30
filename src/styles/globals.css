@@ -674,6 +674,26 @@
   animation: atlas-timeline-row 320ms ease-out both;
 }
 
+/* One entry in a Session's timeline (the Artifacts detail).
+ *
+ * `content-visibility: auto` lets the engine skip layout, style and paint for
+ * rows that are scrolled out of view — the single biggest lever on a Session
+ * that runs to hundreds of entries, each carrying markdown or a highlighted
+ * payload. Nothing about the rendered result changes; the work is deferred to
+ * the moment a row is actually near the viewport.
+ *
+ * `contain-intrinsic-size: auto <fallback>` is what makes it safe: `auto` tells
+ * the engine to remember each row's real height once measured, so the scrollbar
+ * and the cached anchor offsets stay stable after first paint, and the fallback
+ * is only the placeholder for a row that has never been on screen. Rows vary
+ * from one line to a full call table, so the fallback is a deliberate
+ * under-estimate — too tall leaves a gap on first reveal, too short only ever
+ * corrects downward as the reader approaches. */
+.atlas-entry {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 96px;
+}
+
 /* Brief highlight when jumping to a message (Cmd+F / links panel). */
 @keyframes atlas-jump-flash-kf {
   0%   { background-color: var(--accent-primary); opacity: 0.14; }

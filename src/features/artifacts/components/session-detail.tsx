@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import * as Popover from "@radix-ui/react-popover";
 import { invoke } from "@tauri-apps/api/core";
 import {
@@ -33,6 +33,7 @@ import {
 } from "../types";
 import { agentLabel, formatDuration, prettyModel, tokenLabel } from "../lib/board";
 import { exportSession, type ExportFormat } from "../lib/export";
+import { useTimelineScroll } from "../lib/use-timeline-scroll";
 import { CodeBlock, CopyButton, prettyJson } from "./code-block";
 import { AgentGlyph } from "./session-list";
 
@@ -72,9 +73,6 @@ import { AgentGlyph } from "./session-list";
  */
 const WINDOW_CHUNK = 40;
 
-/** Distance from the bottom (px) at which the window grows. */
-const WINDOW_MARGIN = 600;
-
 /** The reading measure. Prose past ~90 characters is measurably harder to scan. */
 const MEASURE = "mx-auto w-full max-w-[920px] px-8";
 
@@ -107,11 +105,7 @@ export function SessionDetail({ detail, projectPath, focusCommitSha }: Props) {
   const [pendingJump, setPendingJump] = useState<string | null>(null);
   /** The entry a jump just landed on, highlighted briefly. */
   const [landed, setLanded] = useState<string | null>(null);
-  /** True while there is content below the fold — drives the bottom fade. */
-  const [more, setMore] = useState(false);
-  /** Index into `anchors` of the last prompt at or above the viewport top. */
-  const [activeAnchor, setActiveAnchor] = useState(0);
-  const railRaf = useRef<number | null>(null);
+  const contentRef = useRef<HTMLDivElement | null>(null);
 
   const s = detail.summary;
 
@@ -172,6 +166,46 @@ export function SessionDetail({ detail, projectPath, focusCommitSha }: Props) {
   /** Live nodes for the rendered anchors, in render order. */
   const anchorRefs = useRef(new Map<number, HTMLDivElement>());
 
+  /**
+   * Registering a row's node.
+   *
+   * Stable on purpose. A ref callback that changes identity is torn down and
+   * re-run on *every* render — React calls the old one with `null` and the new
+   * one with the node — so an inline arrow here meant a Map churn plus an
+   * `anchors` lookup for every rendered row every time any state changed, in
+   * the middle of scrolling. The anchor list is read through a ref so the
+   * callback never has to be rebuilt when it changes.
+   */
+  const anchorIndex = useRef(new Map<string, number>());
+  anchorIndex.current = useMemo(() => {
+    const map = new Map<string, number>();
+    anchors.forEach((anchor, i) => map.set(anchor.id, i));
+    return map;
+  }, [anchors]);
+
+  const register = useCallback((id: string, node: HTMLDivElement | null) => {
+    const rail = anchorIndex.current.get(id);
+    if (node) {
+      entryRefs.current.set(id, node);
+      if (rail !== undefined) anchorRefs.current.set(rail, node);
+    } else {
+      entryRefs.current.delete(id);
+      if (rail !== undefined) anchorRefs.current.delete(rail);
+    }
+  }, []);
+
+  const { more, activeAnchor, onScroll, invalidate } = useTimelineScroll({
+    scrollRef,
+    contentRef,
+    anchorRefs,
+    anchorCount: anchors.length,
+    canGrow: renderCount < groups.length,
+    onGrow: useCallback(
+      () => setRenderCount((count) => Math.min(count + WINDOW_CHUNK, groups.length)),
+      [groups.length],
+    ),
+  });
+
   /** The next prompt below the reader — the action bar's forward jump. */
   const nextAnchor = anchors[Math.min(activeAnchor + 1, anchors.length - 1)];
 
@@ -191,43 +225,17 @@ export function SessionDetail({ detail, projectPath, focusCommitSha }: Props) {
   // A new Session or a filter change restarts the window from the top.
   useEffect(() => {
     setRenderCount(WINDOW_CHUNK);
-    setActiveAnchor(0);
     scrollRef.current?.scrollTo({ top: 0 });
-  }, [detail.summary.id, filters, failedOnly, tools, search]);
+    // The list was swapped wholesale; a same-height replacement would not trip
+    // the ResizeObserver and every cached offset would describe the old rows.
+    invalidate();
+  }, [detail.summary.id, filters, failedOnly, tools, search, invalidate]);
 
-  const rendered = groups.slice(0, renderCount);
-
-  const onScroll = useCallback(() => {
-    const el = scrollRef.current;
-    if (!el) return;
-    const fromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
-    if (renderCount < groups.length && fromBottom <= WINDOW_MARGIN) {
-      setRenderCount((count) => Math.min(count + WINDOW_CHUNK, groups.length));
-    }
-    setMore(fromBottom > 24);
-
-    // The rail's active tick, sampled from the DOM rather than tracked per row:
-    // entries expand and collapse, so a computed offset would be wrong the
-    // moment anyone opened a tool call. rAF-throttled — a fast flick fires
-    // scroll far more often than it produces frames.
-    if (railRaf.current !== null) return;
-    railRaf.current = requestAnimationFrame(() => {
-      railRaf.current = null;
-      const top = el.getBoundingClientRect().top;
-      let active = 0;
-      anchorRefs.current.forEach((node, i) => {
-        if (node.getBoundingClientRect().top - top <= 8) active = i;
-      });
-      setActiveAnchor((prev) => (prev === active ? prev : active));
-    });
-  }, [renderCount, groups.length]);
-
-  useEffect(
-    () => () => {
-      if (railRaf.current !== null) cancelAnimationFrame(railRaf.current);
-    },
-    [],
-  );
+  // Memoised, and load-bearing: this array is `Timeline`'s only changing prop,
+  // so a fresh slice on every render would fail its memo comparison every time
+  // and re-render the whole window on every scroll tick — exactly what the memo
+  // exists to prevent.
+  const rendered = useMemo(() => groups.slice(0, renderCount), [groups, renderCount]);
 
   // Jump-to-Checkpoint has to survive both a filter that hides Checkpoints and a
   // window that has not reached the target yet, so it settles over renders:
@@ -253,15 +261,6 @@ export function SessionDetail({ detail, projectPath, focusCommitSha }: Props) {
       setPendingJump(null);
     }
   }, [pendingJump, groups, renderCount]);
-
-  // Whether there *is* anything below the fold is a fact about the rendered
-  // height, not about scrolling, so it is measured when the content changes as
-  // well as on scroll — otherwise a short Session opens wearing a fade.
-  useEffect(() => {
-    const el = scrollRef.current;
-    if (!el) return;
-    setMore(el.scrollHeight - el.scrollTop - el.clientHeight > 24);
-  }, [renderCount, tab, groups.length]);
 
   useEffect(() => {
     if (!landed) return;
@@ -343,7 +342,7 @@ export function SessionDetail({ detail, projectPath, focusCommitSha }: Props) {
         onScroll={onScroll}
         className="hide-scrollbar min-h-0 flex-1 overflow-y-auto"
       >
-        <div className={cn(MEASURE, "pb-28 pt-7")}>
+        <div ref={contentRef} className={cn(MEASURE, "pb-28 pt-7")}>
           <Masthead detail={detail} />
 
           <div className="mt-5 flex items-center gap-1.5">
@@ -368,26 +367,14 @@ export function SessionDetail({ detail, projectPath, focusCommitSha }: Props) {
               <Empty detail={detail} failedOnly={failedOnly} failedCount={failedCount} />
             ) : (
               <div className="mt-6">
-                {rendered.map((group, i) => (
-                  <Group
-                    key={group.id}
-                    group={group}
-                    first={i === 0}
-                    last={i === rendered.length - 1}
-                    projectPath={projectPath}
-                    agent={s.agent}
-                    expandTools={expandTools}
-                    landed={landed}
-                    register={(id, node) => {
-                      if (node) entryRefs.current.set(id, node);
-                      else entryRefs.current.delete(id);
-                      const rail = anchors.findIndex((a) => a.id === id);
-                      if (rail === -1) return;
-                      if (node) anchorRefs.current.set(rail, node);
-                      else anchorRefs.current.delete(rail);
-                    }}
-                  />
-                ))}
+                <Timeline
+                  groups={rendered}
+                  projectPath={projectPath}
+                  agent={s.agent}
+                  expandTools={expandTools}
+                  landed={landed}
+                  register={register}
+                />
                 {renderCount < groups.length && (
                   <p className="py-6 text-center font-mono text-[11px] text-[var(--text-tertiary)]">
                     {groups.length - renderCount} more…
@@ -739,20 +726,65 @@ function groupEntries(entries: TimelineEntry[]): Group[] {
 }
 
 /**
+ * The rendered window of the timeline.
+ *
+ * Split out and memoised because the scroll loop publishes two pieces of state
+ * — the fade's `more` and the rail's `activeAnchor` — and without this boundary
+ * every tick of either re-rendered every row, every code block and every
+ * markdown body in the window. Now a scroll that changes only where the reader
+ * is re-renders the rail and the fade, and the list is skipped outright.
+ *
+ * `landed` is the one prop that still moves per row, and it moves once per jump.
+ */
+const Timeline = memo(function Timeline({
+  groups,
+  projectPath,
+  agent,
+  expandTools,
+  landed,
+  register,
+}: {
+  groups: Group[];
+  projectPath: string;
+  agent: string | null;
+  expandTools: boolean;
+  landed: string | null;
+  register: (id: string, node: HTMLDivElement | null) => void;
+}) {
+  return (
+    <>
+      {groups.map((group, i) => (
+        <Row
+          key={group.id}
+          group={group}
+          first={i === 0}
+          last={i === groups.length - 1}
+          projectPath={projectPath}
+          agent={agent}
+          expandTools={expandTools}
+          isLanded={group.entries.some((e) => e.id === landed)}
+          register={register}
+        />
+      ))}
+    </>
+  );
+});
+
+/**
  * One node on the rail plus its content.
  *
  * The rail is a hairline in a 26px gutter, drawn per row and joined by the rows
  * above and below — half-height at the two ends so it starts and stops at a node
  * rather than running off into the page.
  */
-function Group({
+const Row = memo(function Row({
   group,
   first,
   last,
   projectPath,
   agent,
   expandTools,
-  landed,
+  isLanded,
   register,
 }: {
   group: Group;
@@ -762,17 +794,17 @@ function Group({
   agent: string | null;
   /** The global "always expand" switch from the filter drawer. */
   expandTools: boolean;
-  landed: string | null;
+  /** A jump just landed here — ringed briefly. */
+  isLanded: boolean;
   register: (id: string, node: HTMLDivElement | null) => void;
 }) {
   const head = group.entries[0];
-  const isLanded = group.entries.some((e) => e.id === landed);
 
   return (
     <div
       ref={(node) => register(head.id, node)}
       className={cn(
-        "grid grid-cols-[26px_minmax(0,1fr)] gap-3.5 rounded-md transition-colors",
+        "atlas-entry grid grid-cols-[26px_minmax(0,1fr)] gap-3.5 rounded-md transition-colors",
         isLanded && "ring-1 ring-[var(--border-strong)]",
       )}
     >
@@ -840,7 +872,7 @@ function Group({
       </div>
     </div>
   );
-}
+});
 
 function kindLabel(group: Group): string {
   switch (group.kind) {
@@ -1609,11 +1641,30 @@ function Clamp({ children }: { children: ReactNode }) {
   const [overflows, setOverflows] = useState(false);
   const [expanded, setExpanded] = useState(false);
 
+  // Observed, not read on mount.
+  //
+  // Rows carry `content-visibility: auto`, so a row below the fold has its
+  // layout skipped entirely — and *reading* `scrollHeight` from inside a
+  // skipped subtree forces the engine to lay it out anyway. An effect-time
+  // read here would therefore have un-skipped all forty rows the moment the
+  // window grew, which is precisely the work the containment exists to avoid.
+  //
+  // A `ResizeObserver` asks the opposite question: tell me when this element
+  // *has* a size. A skipped row reports nothing until it is rendered, so the
+  // measurement happens when the reader arrives and never before.
   useEffect(() => {
     const el = ref.current;
     if (!el) return;
-    setOverflows(el.scrollHeight > CLAMP_MAX_PX + CLAMP_SLACK_PX);
-  }, [children]);
+    const observer = new ResizeObserver(([entry]) => {
+      const height = entry.target.scrollHeight;
+      // Zero means "still skipped", not "empty" — committing that would flip
+      // an already-open clamp shut as it scrolled out of view.
+      if (height === 0) return;
+      setOverflows(height > CLAMP_MAX_PX + CLAMP_SLACK_PX);
+    });
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, []);
 
   return (
     <div className="relative">
