@@ -34,9 +34,13 @@ import { clearDetailCache, readCachedDetail, writeCachedDetail } from "../lib/de
 import { CalendarView } from "./calendar-view";
 import { Divider, Segment, SegmentButton, SEGMENT_ACTIVE, SEGMENT_TRIGGER } from "./segment";
 import { CheckpointsPicker } from "./checkpoints-picker";
+import { SessionChatPanel } from "./session-chat-panel";
 import { SessionDetail } from "./session-detail";
 import { SessionList } from "./session-list";
 import { SessionStats, STATS_HEIGHT } from "./session-stats";
+
+/** The chat half of the split. Wide enough for a code block in an answer. */
+const CHAT_WIDTH = 420;
 
 /** Mirrors `BOARD_LIMIT` in `capture.rs` — how many rows one board read returns. */
 const BOARD_LIMIT = 500;
@@ -111,6 +115,10 @@ export function ArtifactsPanel() {
    *  three only narrow what is already on screen. */
   const [selection, setSelection] = useState<FacetSelection>(NO_FACETS);
   const [error, setError] = useState<string | null>(null);
+  /** Whether the grounded chat occupies the right half of the open Session.
+   *  Local, and reset when the Session changes: a chat about the Session you
+   *  just left is not a chat about the one you just opened. */
+  const [chatOpen, setChatOpen] = useState(false);
 
   /** Monotonic read sequence — only the newest read may write list state. */
   const listSeq = useRef(0);
@@ -214,6 +222,10 @@ export function ArtifactsPanel() {
     },
     [open],
   );
+
+  useEffect(() => {
+    setChatOpen(false);
+  }, [open?.sessionId]);
 
   useEffect(() => {
     if (!open) {
@@ -444,11 +456,39 @@ export function ArtifactsPanel() {
           ) : detail === null ? (
             <NotFound onBack={() => openSession(null)} />
           ) : (
-            <SessionDetail
-              detail={detail}
-              projectPath={open.projectPath}
-              focusCommitSha={open.commitSha}
-            />
+            // Two panes, animated. The chat's *width* is what transitions —
+            // sliding an overlay in would leave the detail at full width behind
+            // it, and the point of the split is that the record stays readable
+            // beside the answer about it.
+            <div className="flex h-full min-h-0">
+              <div className="min-w-0 flex-1">
+                <SessionDetail
+                  detail={detail}
+                  projectPath={open.projectPath}
+                  focusCommitSha={open.commitSha}
+                  chatOpen={chatOpen}
+                  onToggleChat={() => setChatOpen((v) => !v)}
+                />
+              </div>
+              <aside
+                className="atlas-split shrink-0 overflow-hidden border-l border-[var(--border-default)]"
+                style={{ width: chatOpen ? CHAT_WIDTH : 0 }}
+                aria-hidden={!chatOpen}
+              >
+                {/* Fixed inner width so the content does not reflow through the
+                 *  animation — a chat that re-wraps every frame while opening
+                 *  reads as a glitch, not a transition. */}
+                <div style={{ width: CHAT_WIDTH }} className="h-full">
+                  {chatOpen && (
+                    <SessionChatPanel
+                      detail={detail}
+                      projectPath={open.projectPath}
+                      onClose={() => setChatOpen(false)}
+                    />
+                  )}
+                </div>
+              </aside>
+            </div>
           )
         ) : loaded && sessions.length === 0 ? (
           <NotEnabled />

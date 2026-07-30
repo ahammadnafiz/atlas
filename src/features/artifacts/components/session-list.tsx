@@ -35,6 +35,7 @@ import {
   groupByDay,
   prettyModel,
   sessionState,
+  sessionTitle,
   tokenLabel,
   type SessionState,
 } from "../lib/board";
@@ -185,7 +186,9 @@ function SessionRow({
             state === "done" ? "text-[var(--text-secondary)]" : "text-[var(--text-primary)]",
           )}
         >
-          {session.title ?? <span className="text-[var(--text-tertiary)]">Untitled session</span>}
+          {sessionTitle(session.title) ?? (
+            <span className="text-[var(--text-tertiary)]">Untitled session</span>
+          )}
         </span>
         <span className="flex min-w-0 items-center gap-1.5 font-mono text-[11px] leading-tight text-[var(--text-tertiary)]">
           {branch && (

@@ -59,6 +59,8 @@ pub mod recent_files;
 pub mod research;
 pub mod review;
 pub mod search;
+pub mod session_chat;
+pub mod session_chat_sessions;
 pub mod sessions_watch;
 pub mod skills;
 pub mod telemetry;

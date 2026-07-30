@@ -11,6 +11,8 @@
  * they sit in.
  */
 
+import { stripInjectedContext } from "@/features/chat/lib/atlas-context";
+
 import type { BoardSession, SessionSummary } from "../types";
 
 /**
@@ -91,6 +93,24 @@ export function prettyModel(model: string | null): string | null {
   if (m.includes("haiku")) return versioned("Haiku");
   if (m.startsWith("gpt")) return raw.toUpperCase().replace("-CODEX", " Codex");
   return raw;
+}
+
+/**
+ * A Session's title, as it should be read.
+ *
+ * Titles are derived at capture time from the first prompt — and Atlas injects
+ * its own memory blocks into that prompt before the agent ever sees it, so a
+ * Session whose first turn carried context is titled `RELEVANT PROJECT MEMORY
+ * ---`. Stripping here rather than at each display site keeps the board, the
+ * detail and the chat from disagreeing about what a Session is called.
+ *
+ * A title that is *only* injected context strips to nothing, which is a truthful
+ * `null` — the Session genuinely has no title of its own.
+ */
+export function sessionTitle(title: string | null): string | null {
+  if (!title) return null;
+  const clean = stripInjectedContext(title).trim();
+  return clean.length > 0 ? clean : null;
 }
 
 /** The agent's display name, from the plugin id the wire carries. */

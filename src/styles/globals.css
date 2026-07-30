@@ -583,6 +583,15 @@
 .atlas-rail {
   transition: height 340ms cubic-bezier(0.32, 0.72, 0, 1);
 }
+
+/* The Session detail's two-pane split (detail | grounded chat).
+ *
+ * Width rather than transform: the detail must actually give up the space, so
+ * its own layout reflows into what is left. Same easing as the stats rail, so
+ * the two panels in one tab open with one motion. */
+.atlas-split {
+  transition: width 340ms cubic-bezier(0.32, 0.72, 0, 1);
+}
 .atlas-rail-body {
   transition:
     transform 380ms cubic-bezier(0.22, 1.4, 0.36, 1),
@@ -755,6 +764,7 @@
   .animate-scale-in,
   .animate-fade-in,
   .animate-slide-in-right { animation: none !important; }
+  .atlas-split { transition: none !important; }
 }
 
 /* Active match in the terminal search (brighter than the other matches). */

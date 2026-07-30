@@ -31,10 +31,12 @@ import {
   type TimelineEntry,
   type TimelineFilters,
 } from "../types";
-import { agentLabel, formatDuration, prettyModel, tokenLabel } from "../lib/board";
+import { agentLabel, formatDuration, prettyModel, sessionTitle, tokenLabel } from "../lib/board";
 import { exportSession, type ExportFormat } from "../lib/export";
+import { animatedScrollTo } from "../lib/scroll-to";
 import { useTimelineScroll } from "../lib/use-timeline-scroll";
 import { CodeBlock, CopyButton, prettyJson } from "./code-block";
+import { JUMP_EVENT } from "./session-chat-message";
 import { AgentGlyph } from "./session-list";
 
 /**
@@ -73,8 +75,17 @@ import { AgentGlyph } from "./session-list";
  */
 const WINDOW_CHUNK = 40;
 
-/** The reading measure. Prose past ~90 characters is measurably harder to scan. */
-const MEASURE = "mx-auto w-full max-w-[920px] px-8";
+/**
+ * The reading measure. Prose past ~90 characters is measurably harder to scan.
+ *
+ * The horizontal padding is not decorative: the navigation rail is an absolute
+ * overlay at `left: 0` about 40px wide including its fade, and it sits *over*
+ * this column. At `px-8` the first character of every line was inside the rail's
+ * gradient — legible, but reading as though the text had run into the furniture.
+ * 56px clears the rail with room to spare on the left, and stays symmetric so
+ * the column still reads as a measure rather than an indent.
+ */
+const MEASURE = "mx-auto w-full max-w-[920px] px-14";
 
 type Tab = "activity" | "tools";
 
@@ -84,9 +95,18 @@ interface Props {
   projectPath: string;
   /** Opened from a commit: land on that Checkpoint rather than at the top. */
   focusCommitSha?: string;
+  /** Whether the grounded chat occupies the other half of the split. */
+  chatOpen?: boolean;
+  onToggleChat?: () => void;
 }
 
-export function SessionDetail({ detail, projectPath, focusCommitSha }: Props) {
+export function SessionDetail({
+  detail,
+  projectPath,
+  focusCommitSha,
+  chatOpen,
+  onToggleChat,
+}: Props) {
   const [tab, setTab] = useState<Tab>("activity");
   const [filters, setFilters] = useState<TimelineFilters>(DEFAULT_FILTERS);
   /** Narrow tool calls to failed ones — the "which calls failed" question. */
@@ -101,6 +121,25 @@ export function SessionDetail({ detail, projectPath, focusCommitSha }: Props) {
   const [renderCount, setRenderCount] = useState(WINDOW_CHUNK);
   const entryRefs = useRef(new Map<string, HTMLDivElement>());
   const scrollRef = useRef<HTMLDivElement | null>(null);
+  /** Cancels the jump animation in flight, if any. */
+  const cancelScroll = useRef<(() => void) | null>(null);
+
+  /**
+   * Carry the reader to an entry.
+   *
+   * Not `scrollIntoView`: rows carry `content-visibility: auto`, so the ones a
+   * jump passes over are laid out for the first time *during* the scroll — and
+   * a single sampled destination is wrong by the time the animation reaches it.
+   * See `animatedScrollTo`.
+   */
+  const jumpTo = useCallback((node: HTMLElement, block: "start" | "center") => {
+    const container = scrollRef.current;
+    if (!container) return;
+    cancelScroll.current?.();
+    cancelScroll.current = animatedScrollTo(container, node, { block, offset: 12 });
+  }, []);
+
+  useEffect(() => () => cancelScroll.current?.(), []);
   /** A jump target waiting for its entry to be rendered. */
   const [pendingJump, setPendingJump] = useState<string | null>(null);
   /** The entry a jump just landed on, highlighted briefly. */
@@ -217,9 +256,10 @@ export function SessionDetail({ detail, projectPath, focusCommitSha }: Props) {
         setPendingJump(anchor.id);
         return;
       }
-      entryRefs.current.get(anchor.id)?.scrollIntoView({ behavior: "smooth", block: "start" });
+      const node = entryRefs.current.get(anchor.id);
+      if (node) jumpTo(node, "start");
     },
-    [renderCount, groups.length],
+    [renderCount, groups.length, jumpTo],
   );
 
   // A new Session or a filter change restarts the window from the top.
@@ -253,14 +293,14 @@ export function SessionDetail({ detail, projectPath, focusCommitSha }: Props) {
     }
     const node = entryRefs.current.get(pendingJump);
     if (node) {
-      node.scrollIntoView({ behavior: "smooth", block: "center" });
+      jumpTo(node, "center");
       // A smooth scroll into the middle of a long conversation leaves no clue
       // which row was the destination. The ring says "this one", then gets out
       // of the way.
       setLanded(pendingJump);
       setPendingJump(null);
     }
-  }, [pendingJump, groups, renderCount]);
+  }, [pendingJump, groups, renderCount, jumpTo]);
 
   useEffect(() => {
     if (!landed) return;
@@ -275,6 +315,29 @@ export function SessionDetail({ detail, projectPath, focusCommitSha }: Props) {
   // Honoured once per arrival. A live Session re-reads its entries every poll,
   // and without the guard each one would yank the reader back to the Checkpoint
   // they had already scrolled away from.
+  // A citation chip in the chat jumps the timeline. An event rather than a prop
+  // so the chat needs no handle on this component's internals — the same
+  // machinery that serves an arrival from the git panel serves this.
+  useEffect(() => {
+    const onJump = (e: Event) => {
+      const detailPayload = (e as CustomEvent<{ entryId?: string; commitSha?: string }>).detail;
+      if (!detailPayload) return;
+      setTab("activity");
+      if (detailPayload.entryId) {
+        setPendingJump(detailPayload.entryId);
+        return;
+      }
+      if (detailPayload.commitSha) {
+        const target = detail.entries.find(
+          (entry) => entry.kind === "checkpoint" && entry.commitSha === detailPayload.commitSha,
+        );
+        if (target) setPendingJump(target.id);
+      }
+    };
+    window.addEventListener(JUMP_EVENT, onJump);
+    return () => window.removeEventListener(JUMP_EVENT, onJump);
+  }, [detail.entries]);
+
   const honouredFocus = useRef<string | null>(null);
   useEffect(() => {
     if (!focusCommitSha) return;
@@ -465,9 +528,13 @@ export function SessionDetail({ detail, projectPath, focusCommitSha }: Props) {
             <ChevronsDown size={14} strokeWidth={1.6} />
           </BarButton>
           <span aria-hidden className="h-4 w-px bg-[var(--border-default)]" />
-          {/* The Ask panel is not built yet. Rendered disabled rather than
-           *  omitted so the bar does not reflow when it lands. */}
-          <BarButton label="Ask about this session — coming soon" bare disabled>
+          <BarButton
+            label={chatOpen ? "Close chat" : "Ask about this session"}
+            bare
+            active={chatOpen}
+            disabled={!onToggleChat}
+            onClick={onToggleChat}
+          >
             <Sparkles size={14} strokeWidth={1.6} />
           </BarButton>
         </div>
@@ -504,7 +571,9 @@ function Masthead({ detail }: { detail: Detail }) {
   return (
     <>
       <h1 className="text-[26px] font-semibold leading-[1.2] tracking-[-0.03em] text-[var(--text-primary)]">
-        {s.title ?? <span className="text-[var(--text-tertiary)]">Untitled session</span>}
+        {sessionTitle(s.title) ?? (
+          <span className="text-[var(--text-tertiary)]">Untitled session</span>
+        )}
       </h1>
 
       <div className="mt-3 flex items-center gap-2">
