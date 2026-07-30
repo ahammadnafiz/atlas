@@ -22,6 +22,7 @@ import {
 import { AtlasIcon } from "@/components/atlas-icon";
 import { extractInjectedContext, type InjectedBlock } from "@/features/chat/lib/atlas-context";
 import { CachedMarkdown } from "@/lib/markdown-cache";
+import { timeAgo } from "@/lib/time-ago";
 import { cn } from "@/lib/utils";
 
 import {
@@ -36,7 +37,7 @@ import { exportSession, type ExportFormat } from "../lib/export";
 import { animatedScrollTo } from "../lib/scroll-to";
 import { useTimelineScroll } from "../lib/use-timeline-scroll";
 import { CodeBlock, CopyButton, prettyJson } from "./code-block";
-import { JUMP_EVENT } from "./session-chat-message";
+import { JUMP_EVENT, type JumpDetail } from "./session-chat-message";
 import { AgentGlyph } from "./session-list";
 
 /**
@@ -320,7 +321,7 @@ export function SessionDetail({
   // machinery that serves an arrival from the git panel serves this.
   useEffect(() => {
     const onJump = (e: Event) => {
-      const detailPayload = (e as CustomEvent<{ entryId?: string; commitSha?: string }>).detail;
+      const detailPayload = (e as CustomEvent<JumpDetail>).detail;
       if (!detailPayload) return;
       setTab("activity");
       if (detailPayload.entryId) {
@@ -592,7 +593,7 @@ function Masthead({ detail }: { detail: Detail }) {
             </Chip>
           )}
           <span className="font-mono text-[10.5px] text-[var(--text-tertiary)]">
-            {relative(s.updatedAt)} · {formatDuration(s.durationSeconds)}
+            {timeAgo(s.updatedAt, { suffix: true })} · {formatDuration(s.durationSeconds)}
           </span>
           {s.needsAttention && (
             <span
@@ -2123,16 +2124,4 @@ function compact(n: number): string {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
   if (n >= 1_000) return `${Math.round(n / 1_000)}K`;
   return String(n);
-}
-
-function relative(iso: string): string {
-  const seconds = Math.max(0, (Date.now() - new Date(iso).getTime()) / 1000);
-  if (seconds < 60) return "just now";
-  const minutes = Math.floor(seconds / 60);
-  if (minutes < 60) return `${minutes}m ago`;
-  const hours = Math.floor(minutes / 60);
-  if (hours < 24) return `${hours}h ago`;
-  const days = Math.floor(hours / 24);
-  if (days < 7) return `${days}d ago`;
-  return new Date(iso).toLocaleDateString();
 }

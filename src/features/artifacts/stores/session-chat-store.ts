@@ -32,7 +32,7 @@ import {
   type ThreadMeta,
 } from "../lib/session-chat-api";
 
-export interface SessionChatThread {
+interface SessionChatThread {
   id: string;
   title: string;
   /** The recorded Session this thread is about. */

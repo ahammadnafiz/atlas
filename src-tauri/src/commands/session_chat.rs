@@ -559,7 +559,7 @@ fn rank<'a>(entries: &'a [TimelineEntry], query: &str) -> Vec<&'a TimelineEntry>
     scored.truncate(TOP_K);
     // Back into timeline order: a set of moments reads as a narrative when it is
     // chronological and as a list of fragments when it is sorted by score.
-    scored.sort_by(|a, b| a.1.turn_seq.cmp(&b.1.turn_seq));
+    scored.sort_by_key(|(_, entry)| entry.turn_seq);
     scored.into_iter().map(|(_, e)| e).collect()
 }
 

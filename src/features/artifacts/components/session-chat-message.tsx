@@ -50,7 +50,7 @@ export interface JumpDetail {
   commitSha?: string;
 }
 
-export function jumpToSource(source: SourceRef): void {
+function jumpToSource(source: SourceRef): void {
   window.dispatchEvent(
     new CustomEvent<JumpDetail>(JUMP_EVENT, {
       detail: {
@@ -72,7 +72,7 @@ type Part = { kind: "text"; body: string } | { kind: "mermaid"; body: string };
  * source appear and then resolve into a diagram rather than watching mermaid
  * fail to parse a half-written graph on every token.
  */
-export function splitMermaid(content: string): Part[] {
+function splitMermaid(content: string): Part[] {
   const fence = /```mermaid\s*\n([\s\S]*?)```/g;
   const parts: Part[] = [];
   let cursor = 0;

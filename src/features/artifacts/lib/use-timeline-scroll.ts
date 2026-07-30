@@ -41,7 +41,7 @@ const AT_BOTTOM = 24;
  */
 const ANCHOR_SLACK = 8;
 
-export interface TimelineScroll {
+interface TimelineScroll {
   /** True while content extends below the fold — drives the bottom fade. */
   more: boolean;
   /** Index into the anchor list of the prompt at the top of the viewport. */
