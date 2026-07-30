@@ -30,6 +30,7 @@ import {
   type FacetKey,
   type FacetSelection,
 } from "../lib/board";
+import { clearDetailCache, readCachedDetail, writeCachedDetail } from "../lib/detail-cache";
 import { CalendarView } from "./calendar-view";
 import { Divider, Segment, SegmentButton, SEGMENT_ACTIVE, SEGMENT_TRIGGER } from "./segment";
 import { CheckpointsPicker } from "./checkpoints-picker";
@@ -116,6 +117,12 @@ export function ArtifactsPanel() {
   /** Same, for the detail read. */
   const detailSeq = useRef(0);
 
+  // The read cache holds timelines from the *previous* set of projects. Nothing
+  // reads it across a switch — the open Session is dropped too — but a stale
+  // Workspace's entries surviving in memory is exactly the leak this subsystem
+  // is careful about everywhere else.
+  useEffect(() => clearDetailCache, [activeOrganisationId]);
+
   // A filter naming a project that is no longer open would hide everything with
   // no way back, so it is dropped rather than left dangling.
   useEffect(() => {
@@ -195,6 +202,7 @@ export function ArtifactsPanel() {
         sessionId: open.sessionId,
       })
         .then((result) => {
+          if (result) writeCachedDetail(open.projectPath, open.sessionId, result);
           if (seq === detailSeq.current) setDetail(result);
         })
         .catch((e) => {
@@ -211,6 +219,16 @@ export function ArtifactsPanel() {
     if (!open) {
       detailSeq.current += 1;
       setDetail(undefined);
+      return;
+    }
+    // A Session read once this browsing session paints from memory and refreshes
+    // behind the content. Stepping back to the board and into the next row is
+    // the normal way to use the Timeline, and re-reading SQLite for a *finished*
+    // Session put a blank panel in front of that every time.
+    const cached = readCachedDetail(open.projectPath, open.sessionId);
+    if (cached) {
+      setDetail(cached);
+      readDetail(false);
       return;
     }
     readDetail(true);
@@ -275,7 +293,26 @@ export function ArtifactsPanel() {
             <ChevronLeft size={13} className="text-[var(--text-tertiary)]" />
             Timeline
           </button>
-        ) : (
+        ) : null}
+
+        {/* The breadcrumb: which project, which session. A Session id is
+            meaningless prose but a perfectly good *address*, and the board spans
+            every project in the Organisation — so without the project name the
+            open Session does not say where it came from. */}
+        {open && (
+          <>
+            <span aria-hidden className="h-3 w-px shrink-0 bg-[var(--border-default)]" />
+            <span className="min-w-0 truncate font-mono text-[11px] text-[var(--text-tertiary)]">
+              {open.projectPath.split("/").pop()}
+              <span className="text-[var(--text-ghost)]"> / </span>
+              sessions
+              <span className="text-[var(--text-ghost)]"> / </span>
+              <span className="text-[var(--text-secondary)]">{open.sessionId.slice(-7)}</span>
+            </span>
+          </>
+        )}
+
+        {!open && (
           // The header IS the search field. The Atlas mark sits where a search
           // glyph would, and the input carries no border, background or padding
           // of its own — so the bar reads as one surface rather than a control

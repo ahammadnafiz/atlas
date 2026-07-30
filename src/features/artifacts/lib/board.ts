@@ -11,7 +11,7 @@
  * they sit in.
  */
 
-import type { BoardSession } from "../types";
+import type { BoardSession, SessionSummary } from "../types";
 
 /**
  * How recently a session must have been written to count as still recording.
@@ -49,7 +49,7 @@ export function sessionState(session: BoardSession, now = Date.now()): SessionSt
  * compaction, so the two read differently: `212.8K tok` for a real total,
  * `853.1K / 1.0M ctx` for a gauge.
  */
-export function tokenLabel(session: BoardSession): string | null {
+export function tokenLabel(session: SessionSummary): string | null {
   if (session.totalTokens > 0) return `${formatTokens(session.totalTokens)} tok`;
   if (session.contextUsed == null) return null;
   const size = session.contextSize ? ` / ${formatTokens(session.contextSize)}` : "";

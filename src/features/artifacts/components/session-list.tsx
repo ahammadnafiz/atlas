@@ -347,43 +347,30 @@ function AgentChip({ agent }: { agent: string | null }) {
   );
 }
 
-function AgentGlyph({ agent }: { agent: string }) {
+/**
+ * The agent's mark.
+ *
+ * Shared with the Session detail, whose timeline nodes and header chip need the
+ * same three glyphs. The letter fallback matters: a plugin id we have no mark
+ * for still has to render as *something* identifying.
+ *
+ * `mono` drops the brand tint and inherits the surrounding colour, which is how
+ * the chat composer badges its agent — the board's rows keep the tint, because
+ * there the colour is what tells two adjacent rows apart at a glance.
+ */
+export function AgentGlyph({ agent, mono }: { agent: string; mono?: boolean }) {
   if (agent.includes("claude"))
-    return <AgentIcons.Claude className="size-[11px] text-[var(--agent-claude-chip)]" />;
+    return (
+      <AgentIcons.Claude
+        className={cn("size-[11px]", !mono && "text-[var(--agent-claude-chip)]")}
+      />
+    );
   if (agent.includes("codex"))
-    return <AgentIcons.Codex className="size-[11px] text-[var(--agent-codex-chip)]" />;
+    return (
+      <AgentIcons.Codex className={cn("size-[11px]", !mono && "text-[var(--agent-codex-chip)]")} />
+    );
   if (agent.includes("cersei")) return <AtlasIcon size={10} className="rounded-[2px]" />;
   return <span className="font-mono text-[9px]">{agent.slice(0, 1).toUpperCase()}</span>;
-}
-
-/**
- * The agent chip as the *detail* header wants it — full name, no fixed height.
- *
- * Kept separate from the board's `AgentChip`: the row needs a 20px chip that
- * lines up in a fixed column and reads `claude`, while the header has one line
- * of metadata and room for "Claude Code". One component serving both grew a
- * `variant` prop that only ever had two callers.
- */
-export function AgentBadge({ agent, className }: { agent: string; className?: string }) {
-  const tone = agent.includes("claude")
-    ? "text-[var(--agent-claude-chip)] bg-[var(--agent-claude-chip-bg)]"
-    : agent.includes("codex")
-      ? "text-[var(--agent-codex-chip)] bg-[var(--agent-codex-chip-bg)]"
-      : agent.includes("cersei")
-        ? "text-[var(--agent-local-chip)] bg-[var(--agent-local-chip-bg)]"
-        : "text-[var(--text-secondary)] bg-[var(--bg-selected)]";
-
-  return (
-    <span
-      className={cn(
-        "shrink-0 rounded px-1.5 py-0.5 font-mono text-[10px]",
-        className ?? "hidden md:block",
-        tone,
-      )}
-    >
-      {agentLabel(agent)}
-    </span>
-  );
 }
 
 // ── Clustering ──────────────────────────────────────────────────────────────
