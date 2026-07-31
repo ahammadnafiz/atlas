@@ -50,6 +50,7 @@ export function AppLayout() {
   const showLeft = leftPanel.visible && !!currentProject;
   const showRight = rightPanel.visible && !!currentProject;
   const showStatus = bottomPanel.visible;
+  const isLinux = typeof window !== "undefined" && navigator.userAgent.toLowerCase().includes("linux");
 
   return (
     // `relative` so the workspace rail + scrim can be absolutely-positioned
@@ -163,9 +164,10 @@ export function AppLayout() {
           parked off the left edge, transparent. */}
       <div
         className={cn(
-          "absolute left-0 top-0 h-screen w-[244px] z-[60] border-r border-[var(--border-default)] bg-[var(--bg-elevated)]/60 backdrop-blur-2xl shadow-[var(--shadow-overlay)] transition-[transform,opacity] ease-[cubic-bezier(0.32,0.72,0,1)] motion-reduce:transition-none [backface-visibility:hidden]",
+          "absolute left-0 top-0 h-screen w-[244px] z-[60] border-r border-[var(--border-default)] backdrop-blur-2xl shadow-[var(--shadow-overlay)] transition-[transform,opacity] ease-[cubic-bezier(0.32,0.72,0,1)] motion-reduce:transition-none [backface-visibility:hidden]",
           // Closing (slide-out) is 50% slower than opening (300 → 450ms).
           sidebarOpen ? "duration-300" : "duration-[450ms]",
+          `${isLinux ? "bg-[var(--bg-elevated)]/95" : "bg-[var(--bg-elevated)]/60"}`
         )}
         style={{
           transform: sidebarOpen ? "translateX(0)" : "translateX(-244px)",
