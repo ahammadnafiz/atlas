@@ -90,7 +90,7 @@ fn resolve_program_abs(program: &str) -> Option<String> {
     resolved
 }
 
-/// Run `$SHELL -lic <script>` with an OWNED timeout: on expiry the probe child
+/// Run `$SHELL -lc <script>` with an OWNED timeout: on expiry the probe child
 /// is killed (so its reader thread exits promptly) instead of being abandoned
 /// to run forever — the old `recv_timeout`-only pattern leaked one thread AND
 /// one login shell per timed-out probe.
@@ -100,7 +100,7 @@ fn probe_shell(
     timeout: std::time::Duration,
 ) -> Option<std::process::Output> {
     let child = std::process::Command::new(shell)
-        .args(["-lic", script])
+        .args(["-lc", script])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
@@ -259,8 +259,8 @@ fn enrich_path() {
     //    happen synchronously so the very first `acp_spawn_agent` call can
     //    already resolve `npx`/`node` from a Homebrew install.
     //
-    // 2. The user's REAL interactive-shell PATH, queried synchronously via
-    //    `$SHELL -lic 'echo $PATH'` (bounded by a short timeout). This is the
+    // 2. The user's REAL shell PATH, queried synchronously via
+    //    `$SHELL -lc 'echo $PATH'` (bounded by a short timeout). This is the
     //    authoritative fix: macOS GUI apps launched from Finder/the Dock only
     //    inherit `/usr/bin:/bin:/usr/sbin:/sbin`, so `npx`/`node` installed via
     //    nvm/fnm/volta/asdf or a custom npm prefix are invisible — the hardcoded
@@ -285,7 +285,7 @@ fn enrich_path() {
 fn merge_login_shell_path() {
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
 
-    // `-lic` loads the user's full login + interactive config (where
+    // `-lc` loads the user's full login config (where
     // nvm/fnm/etc. mutate PATH). Owned timeout: the probe child is killed on
     // expiry instead of leaking (see `probe_shell`).
     let Some(out) = probe_shell(

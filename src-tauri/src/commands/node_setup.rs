@@ -52,12 +52,12 @@ pub struct NodeStatus {
     pub min_major: u32,
 }
 
-/// Resolve a CLI to an absolute path via the user's login+interactive shell
+/// Resolve a CLI to an absolute path via the user's login shell
 /// (covers nvm/fnm/volta/brew). Mirrors `claude_setup::resolve_cli`.
 async fn resolve_cli(name: &str) -> Option<String> {
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
     let probe = AsyncCommand::new(&shell)
-        .args(["-lic", &format!("command -v {name} 2>/dev/null")])
+        .args(["-lc", &format!("command -v {name} 2>/dev/null")])
         .output();
     if let Ok(Ok(out)) = timeout(Duration::from_secs(5), probe).await {
         if out.status.success() {
