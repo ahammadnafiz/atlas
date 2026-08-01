@@ -1,4 +1,4 @@
-import { useEffect, useRef, useCallback } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
 import { EditorView, keymap, lineNumbers, highlightActiveLine, drawSelection } from "@codemirror/view";
 import { EditorState, Compartment, Transaction, type Extension } from "@codemirror/state";
 import { defaultKeymap, history, historyKeymap, indentWithTab } from "@codemirror/commands";
@@ -17,6 +17,8 @@ import { diffGutter, applyDiffStatus } from "../lib/diff-gutter";
 import { gitDiffLineStatus } from "@/features/git/lib/git-diff-api";
 import { blameInline, applyBlame } from "../lib/blame-inline";
 import { gitBlameFile } from "@/features/git/lib/git-blame-api";
+import { MarkdownFile } from "@/lib/markdown-fileviewer";
+import { cn } from "@/lib/utils";
 
 const TOOLBAR_HEIGHT = 32;
 const DIRTY_CHECK_DEBOUNCE = 300; // ms — only check dirty state, not sync content
@@ -119,6 +121,10 @@ export function EditorPanel({ tabId, filePath, containerHeight }: EditorPanelPro
   const refreshGutterRef = useRef<() => void>(() => {});
   const refreshBlameRef = useRef<() => void>(() => {});
   const dirtyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const [renderMode, setRenderMode] = useState<"editor" | "preview">("editor");
+  const resolvedFileType = (buffer?.language ?? path.split(".").pop()?.toLowerCase() ?? "").toLowerCase();
+  const isMarkdownFile = resolvedFileType === "markdown";
 
   // Load file content from disk — unless this is an untitled scratch
   // buffer (Cmd+N), in which case we seed an empty buffer in-memory
@@ -481,6 +487,34 @@ export function EditorPanel({ tabId, filePath, containerHeight }: EditorPanelPro
         {buffer.dirty && (
           <span className="w-1.5 h-1.5 rounded-full bg-accent shrink-0 ml-2" />
         )}
+        {isMarkdownFile && (
+          <div className="ml-2 inline-flex items-center h-[20px] rounded-full border border-border-default bg-bg-elevated p-[2px] text-[10px] font-medium shrink-0">
+              <button
+                type="button"
+                onClick={() => setRenderMode("editor")}
+                className={cn(
+                  "px-2 h-full rounded-full transition-colors",
+                  renderMode === "editor"
+                    ? "bg-bg-hover text-text-primary"
+                    : "text-text-secondary hover:text-text-primary"
+                )}
+                >
+                  Edit
+              </button>
+              <button
+                type="button"
+                onClick={() => setRenderMode("preview")}
+                className={cn(
+                  "px-2 h-full rounded-full transition-colors",
+                  renderMode === "preview"
+                    ? "bg-bg-hover text-text-primary"
+                    : "text-text-secondary hover:text-text-primary"
+                )}
+              >
+                Preview
+              </button>
+          </div>
+        )}
         {buffer.externallyChanged && (
           <button
             type="button"
@@ -495,9 +529,19 @@ export function EditorPanel({ tabId, filePath, containerHeight }: EditorPanelPro
 
       {/* CodeMirror container */}
       <div
-        ref={containerRef}
-        style={{ height: editorHeight, overflow: "hidden" }}
-      />
+        style={{height:editorHeight, overflow:"hidden"}}
+      >
+        <div
+          ref={containerRef}
+          style={{display: renderMode === "editor" ? "block" : "none", height: editorHeight, overflow: "hidden" }}
+        />
+        <div
+          style={{ display: renderMode === "preview" ? "block" : "none", height: editorHeight }}
+          className="overflow-auto bg-bg-primary px-4 py-3"
+        >
+          {buffer && <MarkdownFile trusted={true} className="max-w-none">{buffer.originalContent}</MarkdownFile>}
+        </div>
+      </div>
     </div>
   );
 }
