@@ -32,7 +32,6 @@ import {
   type FacetSelection,
 } from "../lib/board";
 import { clearDetailCache, readCachedDetail, writeCachedDetail } from "../lib/detail-cache";
-import { PERF, perfBytes, perfTimeAsync } from "../lib/perf";
 import { CalendarView } from "./calendar-view";
 import { Divider, Segment, SegmentButton, SEGMENT_ACTIVE, SEGMENT_TRIGGER } from "./segment";
 import { CheckpointsPicker } from "./checkpoints-picker";
@@ -224,16 +223,11 @@ export function ArtifactsPanel() {
       if (!open) return;
       const seq = ++detailSeq.current;
       if (showLoading) setDetail(undefined);
-      perfTimeAsync("ipc:artifacts_session", () =>
-        invoke<Detail | null>("artifacts_session", {
-          projectPath: open.projectPath,
-          sessionId: open.sessionId,
-        }),
-      )
+      invoke<Detail | null>("artifacts_session", {
+        projectPath: open.projectPath,
+        sessionId: open.sessionId,
+      })
         .then((result) => {
-          // Stringify only when instrumenting: this is a megabyte of JSON and
-          // measuring it costs as much as the read did.
-          if (PERF && result) perfBytes("payload:artifacts_session", JSON.stringify(result).length);
           if (result) writeCachedDetail(open.projectPath, open.sessionId, result);
           if (seq !== detailSeq.current) return;
           // Keep the previous object when nothing changed.

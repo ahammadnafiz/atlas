@@ -13,7 +13,6 @@
 
 import { useEffect, useRef, useState } from "react";
 import { isTypingHot } from "./input-activity";
-import { perfTime } from "@/features/artifacts/lib/perf";
 import { parseMarkdown } from "./markdown-render";
 import MarkdownWorker from "./markdown.worker?worker";
 import "highlight.js/styles/github-dark.css";
@@ -186,8 +185,7 @@ export function CachedMarkdown({ source, className }: CachedMarkdownProps) {
     if (hit !== undefined) return hit;
     // Small blocks parse synchronously (cheap, no flash); large blocks defer
     // to the worker via the effect below.
-    if (source.length <= SYNC_LIMIT)
-      return perfTime("markdown:sync", () => renderToHtmlSync(source));
+    if (source.length <= SYNC_LIMIT) return renderToHtmlSync(source);
     return null;
   });
   const ref = useRef<HTMLDivElement>(null);
@@ -199,7 +197,7 @@ export function CachedMarkdown({ source, className }: CachedMarkdownProps) {
       return;
     }
     if (source.length <= SYNC_LIMIT) {
-      const fresh = perfTime("markdown:sync", () => renderToHtmlSync(source));
+      const fresh = renderToHtmlSync(source);
       if (fresh !== html) setHtml(fresh);
       return;
     }

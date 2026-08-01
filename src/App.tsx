@@ -6,7 +6,6 @@ import { CommandPalette } from "@/components/command-palette";
 import { NewTabPalette } from "@/components/new-tab-palette";
 import { LayoutSwitcher } from "@/features/layout/components/layout-switcher";
 import { SearchOverlay } from "@/components/search-overlay";
-import { PerfOverlay } from "@/features/artifacts/components/perf-overlay";
 import { useHotkeys } from "@/hooks/use-hotkey";
 import { useLayoutStore } from "@/features/layout/stores/layout-store";
 import { useProjectStore, type AppStateWire } from "@/features/project/stores/project-store";
@@ -1252,11 +1251,6 @@ export function App() {
       <CommandPalette open={commandPaletteOpen} onOpenChange={setCommandPaletteOpen} />
       <NewTabPalette open={newTabPaletteOpen} onOpenChange={setNewTabPaletteOpen} />
       <LayoutSwitcher open={layoutSwitcherOpen} onOpenChange={setLayoutSwitcherOpen} />
-      {/* Dev-only Timeline perf readout (⌘⌥P). Renders `null` in a release
-          build — `PERF` folds to `false` — but is NOT tree-shaken, so it ships
-          inert. Temporary: delete this and `features/artifacts/lib/perf.ts`
-          when the work in docs/timeline-scroll-perf-handoff.md lands. */}
-      <PerfOverlay />
       <SearchOverlay open={searchOpen} onOpenChange={setSearchOpen} />
       <FilePicker open={filePickerOpen} onOpenChange={setFilePickerOpen} />
       <HintOverlay />

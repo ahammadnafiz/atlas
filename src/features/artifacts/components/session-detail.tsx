@@ -34,7 +34,6 @@ import {
 } from "../types";
 import { agentLabel, formatDuration, prettyModel, sessionTitle, tokenLabel } from "../lib/board";
 import { exportSession, type ExportFormat } from "../lib/export";
-import { perfCount, perfTime } from "../lib/perf";
 import { observeSize } from "../lib/shared-resize-observer";
 import { animatedScrollTo } from "../lib/scroll-to";
 import { useTimelineScroll } from "../lib/use-timeline-scroll";
@@ -197,7 +196,7 @@ export function SessionDetail({
    * turn keeps its shape.
    */
   const groups = useMemo(
-    () => perfTime("groupEntries", () => groupEntries(foldResponses ? foldRuns(visible) : visible)),
+    () => groupEntries(foldResponses ? foldRuns(visible) : visible),
     [visible, foldResponses],
   );
 
@@ -922,17 +921,6 @@ const Row = memo(function Row({
   register: (id: string, node: HTMLDivElement | null) => void;
 }) {
   const head = group.entries[0];
-  // Counted behind a ref rather than a bare mount effect: React StrictMode
-  // double-invokes effects in dev (mount → cleanup → mount), which would report
-  // exactly twice the real mount count and make the whole table a lie. The ref
-  // survives the simulated remount, so the guard holds.
-  const counted = useRef(false);
-  useEffect(() => {
-    if (counted.current) return;
-    counted.current = true;
-    perfCount(`row:mount:${group.kind}`);
-  }, [group.kind]);
-
   return (
     <div
       ref={(node) => register(head.id, node)}
@@ -1154,7 +1142,7 @@ function Calls({
  * exact for what was recorded and silent when nothing was.
  */
 function CallStat({ calls }: { calls: TimelineEntry[] }) {
-  const stat = useMemo(() => perfTime("CallStat.summarise", () => summarise(calls)), [calls]);
+  const stat = useMemo(() => summarise(calls), [calls]);
   if (!stat.parts.length && !stat.added && !stat.removed) return null;
   return (
     <>
@@ -1952,7 +1940,6 @@ function Clamp({ children }: { children: ReactNode }) {
   useEffect(() => {
     const el = ref.current;
     if (!el) return;
-    perfCount("observeSize:Clamp");
     return observeSize(el, (entry) => {
       const height = (entry.target as HTMLElement).scrollHeight;
       // Zero means "not laid out yet", not "empty" — committing that would flip
@@ -2020,10 +2007,7 @@ function Clamp({ children }: { children: ReactNode }) {
  * where a block ends.
  */
 function Prompt({ entry, projectPath }: { entry: TimelineEntry; projectPath: string }) {
-  const split = useMemo(
-    () => perfTime("extractInjectedContext", () => extractInjectedContext(entry.text ?? "")),
-    [entry.text],
-  );
+  const split = useMemo(() => extractInjectedContext(entry.text ?? ""), [entry.text]);
 
   // Nothing injected: the common case, and it must stay exactly as cheap as it
   // was — one block, no wrapper.
