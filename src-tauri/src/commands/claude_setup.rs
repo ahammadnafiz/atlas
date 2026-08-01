@@ -37,7 +37,9 @@ use tokio::time::timeout;
 /// when this process has a real controlling terminal attached (e.g. any
 /// dev-mode launch from a terminal, vs. a Finder/Dock-launched build).
 /// Falls back to the bare name (relying on the process-wide PATH enrichment
-/// in `atlas_acp::sanitize_host_env`) if the shell probe fails or times out.    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
+/// in `atlas_acp::sanitize_host_env`) if the shell probe fails or times out.
+async fn resolve_cli(name: &str) -> String {
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
     let probe = AsyncCommand::new(&shell)
         .args(["-lc", &format!("command -v {name} 2>/dev/null")])
         .output();
