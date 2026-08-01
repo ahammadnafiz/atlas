@@ -35,7 +35,7 @@ const LIVE_WINDOW_MS = 90_000;
  */
 export type SessionState = "attention" | "live" | "imported" | "done";
 
-export function sessionState(session: BoardSession, now = Date.now()): SessionState {
+export function sessionState(session: SessionSummary, now = Date.now()): SessionState {
   if (session.needsAttention) return "attention";
   if (now - new Date(session.updatedAt).getTime() < LIVE_WINDOW_MS) return "live";
   if (session.source === "external_jsonl") return "imported";

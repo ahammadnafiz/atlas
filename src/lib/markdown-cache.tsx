@@ -13,6 +13,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import { isTypingHot } from "./input-activity";
+import { perfTime } from "@/features/artifacts/lib/perf";
 import { parseMarkdown } from "./markdown-render";
 import MarkdownWorker from "./markdown.worker?worker";
 import "highlight.js/styles/github-dark.css";
@@ -185,7 +186,8 @@ export function CachedMarkdown({ source, className }: CachedMarkdownProps) {
     if (hit !== undefined) return hit;
     // Small blocks parse synchronously (cheap, no flash); large blocks defer
     // to the worker via the effect below.
-    if (source.length <= SYNC_LIMIT) return renderToHtmlSync(source);
+    if (source.length <= SYNC_LIMIT)
+      return perfTime("markdown:sync", () => renderToHtmlSync(source));
     return null;
   });
   const ref = useRef<HTMLDivElement>(null);
@@ -197,7 +199,7 @@ export function CachedMarkdown({ source, className }: CachedMarkdownProps) {
       return;
     }
     if (source.length <= SYNC_LIMIT) {
-      const fresh = renderToHtmlSync(source);
+      const fresh = perfTime("markdown:sync", () => renderToHtmlSync(source));
       if (fresh !== html) setHtml(fresh);
       return;
     }
@@ -238,9 +240,7 @@ export function CachedMarkdown({ source, className }: CachedMarkdownProps) {
       if (anchor instanceof HTMLAnchorElement && anchor.href && /^https?:/i.test(anchor.href)) {
         e.preventDefault();
         const href = anchor.href;
-        void import("@tauri-apps/plugin-opener")
-          .then((m) => m.openUrl(href))
-          .catch(() => {});
+        void import("@tauri-apps/plugin-opener").then((m) => m.openUrl(href)).catch(() => {});
       }
     };
     node.addEventListener("click", onClick);

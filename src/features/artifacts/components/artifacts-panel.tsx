@@ -25,12 +25,14 @@ import {
   activeFacetCount,
   facetMatches,
   facets,
+  sessionState,
   NO_FACETS,
   type Facet,
   type FacetKey,
   type FacetSelection,
 } from "../lib/board";
 import { clearDetailCache, readCachedDetail, writeCachedDetail } from "../lib/detail-cache";
+import { PERF, perfBytes, perfTimeAsync } from "../lib/perf";
 import { CalendarView } from "./calendar-view";
 import { Divider, Segment, SegmentButton, SEGMENT_ACTIVE, SEGMENT_TRIGGER } from "./segment";
 import { CheckpointsPicker } from "./checkpoints-picker";
@@ -38,6 +40,23 @@ import { SessionChatPanel } from "./session-chat-panel";
 import { SessionDetail } from "./session-detail";
 import { SessionList } from "./session-list";
 import { SessionStats, STATS_HEIGHT } from "./session-stats";
+
+/**
+ * Is this re-read structurally the same Session we already have?
+ *
+ * Deliberately a *signature*, not a deep compare: the point is to avoid touching
+ * a megabyte of objects, so walking them to decide would defeat itself. The
+ * three fields below move whenever a Session gains anything — a message, a tool
+ * call, a Checkpoint — which is the only way its timeline can change.
+ */
+function sameDetail(a: Detail | null | undefined, b: Detail | null): boolean {
+  if (!a || !b) return false;
+  return (
+    a.summary.id === b.summary.id &&
+    a.summary.updatedAt === b.summary.updatedAt &&
+    a.entries.length === b.entries.length
+  );
+}
 
 /** The chat half of the split. Wide enough for a code block in an answer. */
 const CHAT_WIDTH = 420;
@@ -205,13 +224,26 @@ export function ArtifactsPanel() {
       if (!open) return;
       const seq = ++detailSeq.current;
       if (showLoading) setDetail(undefined);
-      invoke<Detail | null>("artifacts_session", {
-        projectPath: open.projectPath,
-        sessionId: open.sessionId,
-      })
+      perfTimeAsync("ipc:artifacts_session", () =>
+        invoke<Detail | null>("artifacts_session", {
+          projectPath: open.projectPath,
+          sessionId: open.sessionId,
+        }),
+      )
         .then((result) => {
+          // Stringify only when instrumenting: this is a megabyte of JSON and
+          // measuring it costs as much as the read did.
+          if (PERF && result) perfBytes("payload:artifacts_session", JSON.stringify(result).length);
           if (result) writeCachedDetail(open.projectPath, open.sessionId, result);
-          if (seq === detailSeq.current) setDetail(result);
+          if (seq !== detailSeq.current) return;
+          // Keep the previous object when nothing changed.
+          //
+          // This is the difference between a background refresh being free and
+          // being the single most expensive thing the panel does. `detail` flows
+          // into `visible` → `groups` → every `Row`'s `group` prop, so swapping
+          // in a structurally identical object invalidates every memo in the
+          // tree and re-renders every mounted row — hundreds of them, mid-scroll.
+          setDetail((current) => (sameDetail(current, result) ? current : result));
         })
         .catch((e) => {
           if (seq === detailSeq.current) {
@@ -249,8 +281,16 @@ export function ArtifactsPanel() {
   // A live Session keeps growing while it is open — piggyback the detail
   // re-read on the same signals that refresh the list, without flashing the
   // loading state over content that is already on screen.
+  //
+  // Gated on the Session actually being live. `sessions` changes on every board
+  // refresh — a 15 s poll plus git and capture events — and re-reading a
+  // *finished* Session on each of those costs a megabyte of IPC and a full
+  // deserialize to learn that nothing moved. A Session whose last update is
+  // older than the live window is not going to grow.
   useEffect(() => {
-    if (open && loaded) readDetail(false);
+    if (!open || !loaded || !detail) return;
+    if (sessionState(detail.summary) !== "live") return;
+    readDetail(false);
     // `sessions` is the freshest signal that a background refresh landed.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessions]);

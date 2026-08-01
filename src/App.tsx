@@ -6,24 +6,23 @@ import { CommandPalette } from "@/components/command-palette";
 import { NewTabPalette } from "@/components/new-tab-palette";
 import { LayoutSwitcher } from "@/features/layout/components/layout-switcher";
 import { SearchOverlay } from "@/components/search-overlay";
+import { PerfOverlay } from "@/features/artifacts/components/perf-overlay";
 import { useHotkeys } from "@/hooks/use-hotkey";
 import { useLayoutStore } from "@/features/layout/stores/layout-store";
-import {
-  useProjectStore,
-  type AppStateWire,
-} from "@/features/project/stores/project-store";
+import { useProjectStore, type AppStateWire } from "@/features/project/stores/project-store";
 import { useChatStore } from "@/features/chat/stores/chat-store";
-import {
-  listenAgents,
-  resetAgentByAgentId,
-} from "@/features/chat/lib/agents-api";
+import { listenAgents, resetAgentByAgentId } from "@/features/chat/lib/agents-api";
 import type { PendingPermission } from "@/types/acp";
 import type { AgentDelta } from "@/types/agents";
 import { SWITCHABLE_AGENTS } from "@/types/agent";
 import { FilePicker } from "@/features/file-picker/components/file-picker";
 import { HintOverlay } from "@/features/hint-nav/components/hint-overlay";
 import { BrowserOverlayWatcher } from "@/features/browser/components/browser-overlay-watcher";
-import { fileIndex, openFileIndex, markFileIndexClosed } from "@/features/file-picker/lib/file-picker-api";
+import {
+  fileIndex,
+  openFileIndex,
+  markFileIndexClosed,
+} from "@/features/file-picker/lib/file-picker-api";
 import { activeWorkspaceId } from "@/features/workspaces/lib/active-workspace";
 import { useWorkspaceStore } from "@/features/workspaces/stores/workspace-store";
 import { pickAndAddWorkspace } from "@/features/workspaces/lib/pick-workspace";
@@ -248,9 +247,7 @@ export function App() {
         const payload = await invoke<AppStateWire>("bootstrap_app_state");
         if (cancelled) return;
         startTransition(() => {
-          useProjectStore
-            .getState()
-            .actions.hydrate(payload, { skipActiveSwitch: !!cliPath });
+          useProjectStore.getState().actions.hydrate(payload, { skipActiveSwitch: !!cliPath });
           // Hydration replaces the org list wholesale, so re-apply any server
           // orgs from a snapshot that may have already arrived — otherwise a
           // sign-in that landed before this bootstrap would be overwritten.
@@ -604,8 +601,7 @@ export function App() {
     const isStaleAgentTurn = (sessionId: string, turnSeq?: number): boolean => {
       if (!turnSeq) return false;
       for (const sess of Object.values(useChatStore.getState().sessions)) {
-        if (sess.acpSessionId === sessionId)
-          return turnSeq < (sess.currentTurnSeq ?? 0);
+        if (sess.acpSessionId === sessionId) return turnSeq < (sess.currentTurnSeq ?? 0);
       }
       return false;
     };
@@ -918,8 +914,7 @@ export function App() {
   useEffect(() => {
     const projectPath = currentProject?.path ?? "";
     for (const t of tabs) {
-      if (t.type !== "editor" && t.type !== "media" && t.type !== "unsupported")
-        continue;
+      if (t.type !== "editor" && t.type !== "media" && t.type !== "unsupported") continue;
       const absPath = (t.data as Record<string, unknown> | undefined)?.filePath as
         | string
         | undefined;
@@ -929,7 +924,7 @@ export function App() {
       const rel =
         projectPath && absPath.startsWith(projectPath + "/")
           ? absPath.slice(projectPath.length + 1)
-          : absPath.split("/").pop() ?? absPath;
+          : (absPath.split("/").pop() ?? absPath);
       useRecentFilesStore.getState().actions.push({ absPath, rel });
     }
   }, [tabs, currentProject?.path]);
@@ -1081,9 +1076,7 @@ export function App() {
         // Open/focus Knowledge WITHIN the focused split column.
         const st = useLayoutStore.getState();
         const g = st.focusedGroupId;
-        const existing = st.tabs.find(
-          (t) => (t.groupId ?? "main") === g && t.type === "knowledge",
-        );
+        const existing = st.tabs.find((t) => (t.groupId ?? "main") === g && t.type === "knowledge");
         if (existing) {
           setActiveTab(existing.id);
           return;
@@ -1164,7 +1157,7 @@ export function App() {
         const chat = useChatStore.getState();
         const sess = chat.sessions[tab.id];
         const curIdx = SWITCHABLE_AGENTS.indexOf(
-          (sess?.agentType ?? "claude-code") as (typeof SWITCHABLE_AGENTS)[number]
+          (sess?.agentType ?? "claude-code") as (typeof SWITCHABLE_AGENTS)[number],
         );
         const next = SWITCHABLE_AGENTS[(Math.max(curIdx, 0) + 1) % SWITCHABLE_AGENTS.length];
         // Empty chat flips agent in place. A started chat always starts a fresh
@@ -1176,9 +1169,7 @@ export function App() {
         } else {
           chat.actions.clearSession(tab.id);
           chat.actions.switchChatAgent(tab.id, next);
-          window.dispatchEvent(
-            new CustomEvent("atlas:chat-focus", { detail: { tabId: tab.id } }),
-          );
+          window.dispatchEvent(new CustomEvent("atlas:chat-focus", { detail: { tabId: tab.id } }));
         }
       },
     },
@@ -1258,18 +1249,14 @@ export function App() {
           <AppLayout />
         </div>
       </AppContextMenu>
-      <CommandPalette
-        open={commandPaletteOpen}
-        onOpenChange={setCommandPaletteOpen}
-      />
-      <NewTabPalette
-        open={newTabPaletteOpen}
-        onOpenChange={setNewTabPaletteOpen}
-      />
-      <LayoutSwitcher
-        open={layoutSwitcherOpen}
-        onOpenChange={setLayoutSwitcherOpen}
-      />
+      <CommandPalette open={commandPaletteOpen} onOpenChange={setCommandPaletteOpen} />
+      <NewTabPalette open={newTabPaletteOpen} onOpenChange={setNewTabPaletteOpen} />
+      <LayoutSwitcher open={layoutSwitcherOpen} onOpenChange={setLayoutSwitcherOpen} />
+      {/* Dev-only Timeline perf readout (⌘⌥P). Renders `null` in a release
+          build — `PERF` folds to `false` — but is NOT tree-shaken, so it ships
+          inert. Temporary: delete this and `features/artifacts/lib/perf.ts`
+          when the work in docs/timeline-scroll-perf-handoff.md lands. */}
+      <PerfOverlay />
       <SearchOverlay open={searchOpen} onOpenChange={setSearchOpen} />
       <FilePicker open={filePickerOpen} onOpenChange={setFilePickerOpen} />
       <HintOverlay />

@@ -685,22 +685,28 @@
 
 /* One entry in a Session's timeline (the Artifacts detail).
  *
- * `content-visibility: auto` lets the engine skip layout, style and paint for
- * rows that are scrolled out of view — the single biggest lever on a Session
- * that runs to hundreds of entries, each carrying markdown or a highlighted
- * payload. Nothing about the rendered result changes; the work is deferred to
- * the moment a row is actually near the viewport.
+ * **`content-visibility: auto` was here and has been removed.** It was added on
+ * reasoning, not measurement, and measurement killed it: during a fast scroll it
+ * produced a *fully blank viewport*, because rows it had skipped could not be
+ * rendered fast enough to fill the screen at scroll speed. Skipping work for
+ * offscreen rows is worthless if the reader arrives before the work is done —
+ * a slow row beats an absent one.
  *
- * `contain-intrinsic-size: auto <fallback>` is what makes it safe: `auto` tells
- * the engine to remember each row's real height once measured, so the scrollbar
- * and the cached anchor offsets stay stable after first paint, and the fallback
- * is only the placeholder for a row that has never been on screen. Rows vary
- * from one line to a full call table, so the fallback is a deliberate
- * under-estimate — too tall leaves a gap on first reveal, too short only ever
- * corrects downward as the reader approaches. */
+ * `contain-intrinsic-size: auto 96px` made it worse. Real rows run 150–600px,
+ * so every unrendered row under-reported its height by 2–6×; scrolling a given
+ * distance therefore crossed several times more rows than the engine had budget
+ * to render, and the scroll geometry moved under the reader as they corrected.
+ *
+ * What is left is the half that costs nothing and cannot blank: `layout` and
+ * `style` containment scope reflow and style recalc to the row. Deliberately
+ * NOT `paint` — the `Clamp` "Show more" pill is positioned to overhang the
+ * row's bottom edge by half its height, and paint containment would clip it.
+ *
+ * The real fix for offscreen cost is virtualization (Phase 4 of
+ * docs/timeline-scroll-perf-handoff.md), which unmounts those rows outright
+ * rather than asking the engine to render them at the last moment. */
 .atlas-entry {
-  content-visibility: auto;
-  contain-intrinsic-size: auto 96px;
+  contain: layout style;
 }
 
 /* Brief highlight when jumping to a message (Cmd+F / links panel). */
