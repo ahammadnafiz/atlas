@@ -130,6 +130,26 @@ To use the Claude Code agent, install the `claude` CLI and put it on your `PATH`
 
 Requires **[Bun](https://bun.sh/)**, **Rust** (stable, via [rustup](https://rustup.rs/)), and **Xcode Command Line Tools**.
 
+### System Prerequisites
+* **Linux System Dependencies**: GTK 3, WebKit2GTK (4.1), and GLib headers:
+
+  * **Debian / Ubuntu / Linux Mint**:
+    ```bash
+    sudo apt install -y libglib2.0-dev libgtk-3-dev libwebkit2gtk-4.1-dev
+    ```
+  * **Fedora / RHEL**:
+    ```bash
+    sudo dnf install glib2-devel gtk3-devel webkit2gtk4.1-devel
+    ```
+  * **Arch Linux / Manjaro**:
+    ```bash
+    sudo pacman -S glib2 gtk3 webkit2gtk-4.1
+    ```
+  * **openSUSE**:
+    ```bash
+    sudo zypper install glib2-devel gtk3-devel webkit2gtk3-devel
+    ```
+---
 ```bash
 git clone https://github.com/pacifio/atlas
 cd atlas
