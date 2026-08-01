@@ -78,6 +78,9 @@ import { AgentGlyph } from "./session-list";
  */
 const WINDOW_CHUNK = 40;
 
+/** Half the tallest rail node — where the hairline starts and stops. */
+const NODE_CENTRE = 16;
+
 /**
  * The reading measure. Prose past ~90 characters is measurably harder to scan.
  *
@@ -119,6 +122,8 @@ export function SessionDetail({
   const [filtersOpen, setFiltersOpen] = useState(false);
   /** Keep every tool-call group open. Off by default — see `Calls`. */
   const [expandTools, setExpandTools] = useState(false);
+  /** Show every response, or only the last of each consecutive run. */
+  const [foldResponses, setFoldResponses] = useState(false);
   /** Free-text narrowing of the timeline. */
   const [search, setSearch] = useState("");
   const [renderCount, setRenderCount] = useState(WINDOW_CHUNK);
@@ -170,6 +175,13 @@ export function SessionDetail({
     [detail.entries, failedOnly, tools],
   );
 
+  /** Every Checkpoint, unfiltered — the jump list must reach a commit even when
+   *  the current filter hides Checkpoints from the timeline. */
+  const checkpoints = useMemo(
+    () => detail.entries.filter((entry) => entry.kind === "checkpoint"),
+    [detail.entries],
+  );
+
   const failedCount = useMemo(
     () =>
       detail.entries.filter((entry) => entry.kind === "tool_call" && entry.toolStatus === "failed")
@@ -184,7 +196,10 @@ export function SessionDetail({
    * drown the two sentences either side of them; as one node with a table, the
    * turn keeps its shape.
    */
-  const groups = useMemo(() => perfTime("groupEntries", () => groupEntries(visible)), [visible]);
+  const groups = useMemo(
+    () => perfTime("groupEntries", () => groupEntries(foldResponses ? foldRuns(visible) : visible)),
+    [visible, foldResponses],
+  );
 
   /**
    * The rail's ticks: one per prompt.
@@ -272,7 +287,7 @@ export function SessionDetail({
     // The list was swapped wholesale; a same-height replacement would not trip
     // the ResizeObserver and every cached offset would describe the old rows.
     invalidate();
-  }, [detail.summary.id, filters, failedOnly, tools, search, invalidate]);
+  }, [detail.summary.id, filters, failedOnly, tools, search, foldResponses, invalidate]);
 
   // Memoised, and load-bearing: this array is `Timeline`'s only changing prop,
   // so a fresh slice on every render would fail its memo comparison every time
@@ -555,7 +570,18 @@ export function SessionDetail({
           setTools={setTools}
           expandTools={expandTools}
           setExpandTools={setExpandTools}
+          foldResponses={foldResponses}
+          setFoldResponses={setFoldResponses}
           activeFilters={activeFilters}
+          checkpoints={checkpoints}
+          onJump={(entryId) => {
+            // The drawer closes on jump. It covers the right third of the
+            // measure, and landing behind it would mean the reader has to
+            // dismiss it to see what they asked for.
+            setFiltersOpen(false);
+            setTab("activity");
+            setPendingJump(entryId);
+          }}
           onClose={() => setFiltersOpen(false)}
         />
       )}
@@ -783,6 +809,31 @@ interface Group {
   entries: TimelineEntry[];
 }
 
+/**
+ * Keep only the last response of each consecutive run.
+ *
+ * An agent narrates as it works — "let me check X", "now Y", then the actual
+ * answer. Reading a finished Session, the narration is scaffolding and the last
+ * message of a run is the conclusion. Folding to it turns a forty-message
+ * transcript into the handful of statements that survived.
+ *
+ * Deliberately per *run*, not per turn: a run ends at the next prompt, tool call
+ * or Checkpoint, so a response that comes after real work is kept even if
+ * another response follows later. The alternative — one response per turn —
+ * would silently drop the conclusion of every turn that ended in a commit.
+ */
+function foldRuns(entries: TimelineEntry[]): TimelineEntry[] {
+  const out: TimelineEntry[] = [];
+  for (const entry of entries) {
+    if (entry.kind === "response" && out[out.length - 1]?.kind === "response") {
+      out[out.length - 1] = entry;
+      continue;
+    }
+    out.push(entry);
+  }
+  return out;
+}
+
 /** Fold runs of consecutive tool calls into one group; everything else is its own. */
 function groupEntries(entries: TimelineEntry[]): Group[] {
   const out: Group[] = [];
@@ -886,7 +937,7 @@ const Row = memo(function Row({
     <div
       ref={(node) => register(head.id, node)}
       className={cn(
-        "atlas-entry grid grid-cols-[26px_minmax(0,1fr)] gap-3.5 rounded-md transition-colors",
+        "atlas-entry grid grid-cols-[32px_minmax(0,1fr)] gap-3.5 rounded-md transition-colors",
         isLanded && "ring-1 ring-[var(--border-strong)]",
       )}
     >
@@ -894,7 +945,10 @@ const Row = memo(function Row({
         <span
           aria-hidden
           className="absolute left-1/2 -ml-px w-px bg-[var(--border-subtle)]"
-          style={{ top: first ? 12 : 0, bottom: last ? "calc(100% - 12px)" : 0 }}
+          style={{
+            top: first ? NODE_CENTRE : 0,
+            bottom: last ? `calc(100% - ${NODE_CENTRE}px)` : 0,
+          }}
         />
         <Node kind={group.kind} agent={agent} status={head.toolStatus} />
       </div>
@@ -972,6 +1026,17 @@ function kindLabel(group: Group): string {
 }
 
 /** The glyph on the rail. 20px, hairline stroke, generous inset. */
+/**
+ * The marker on the rail.
+ *
+ * 32px, which is the size the reference design uses and roughly what an avatar
+ * wants to be — the previous 20px read as a bullet point rather than as
+ * "someone did this". At this size the agent's own mark is legible, so a
+ * response is identifiable by its glyph rather than by reading the label.
+ *
+ * Opaque, not translucent: the rail hairline runs *behind* every node, and a
+ * see-through fill would show the line crossing the glyph.
+ */
 function Node({
   kind,
   agent,
@@ -988,28 +1053,37 @@ function Node({
       : failed
         ? "border-[var(--status-error)]/40 text-[var(--status-error)]"
         : kind === "prompt"
-          ? "border-[var(--border-default)] bg-[var(--bg-raised)] text-[var(--text-secondary)]"
-          : "border-[var(--border-default)] text-[var(--text-tertiary)]";
+          ? "border-[var(--border-strong)] bg-[var(--bg-elevated-2)] text-[var(--text-secondary)]"
+          : kind === "response"
+            ? "border-[var(--border-strong)] bg-[var(--bg-elevated-2)] text-[var(--text-secondary)]"
+            : "border-[var(--border-default)] bg-[var(--bg-raised)] text-[var(--text-tertiary)]";
+
+  // Tool calls and thinking stay small. They are punctuation between turns, not
+  // turns themselves, and giving them an avatar-sized marker would flatten the
+  // distinction the rail exists to draw.
+  const minor = kind === "tool_call" || kind === "thinking";
 
   return (
     <span
       className={cn(
-        "relative z-10 mt-0.5 flex size-5 shrink-0 items-center justify-center rounded-full border bg-[var(--bg-surface)]",
+        "relative z-10 flex shrink-0 items-center justify-center rounded-full border",
+        minor ? "size-5" : "size-8",
         tone,
       )}
+      style={{ marginTop: minor ? NODE_CENTRE - 10 : 0 }}
     >
       {kind === "prompt" ? (
-        <User size={11} strokeWidth={1.6} />
+        <User size={15} strokeWidth={1.6} />
       ) : kind === "checkpoint" ? (
-        <Check size={11} strokeWidth={2} />
+        <Check size={15} strokeWidth={2} />
       ) : kind === "tool_call" ? (
         <Terminal size={10} strokeWidth={1.7} />
       ) : kind === "thinking" ? (
         <Brain size={10} strokeWidth={1.7} />
       ) : agent ? (
-        <AgentGlyph agent={agent} />
+        <AgentGlyph agent={agent} size={16} />
       ) : (
-        <Sparkles size={10} strokeWidth={1.7} />
+        <Sparkles size={14} strokeWidth={1.7} />
       )}
     </span>
   );
@@ -1395,7 +1469,11 @@ function FilterDrawer({
   setTools,
   expandTools,
   setExpandTools,
+  foldResponses,
+  setFoldResponses,
   activeFilters,
+  checkpoints,
+  onJump,
   onClose,
 }: {
   detail: Detail;
@@ -1408,7 +1486,12 @@ function FilterDrawer({
   setTools: (fn: (current: Set<string>) => Set<string>) => void;
   expandTools: boolean;
   setExpandTools: (v: boolean) => void;
+  foldResponses: boolean;
+  setFoldResponses: (v: boolean) => void;
   activeFilters: number;
+  /** Every Checkpoint in the Session, in timeline order. */
+  checkpoints: TimelineEntry[];
+  onJump: (entryId: string) => void;
   onClose: () => void;
 }) {
   // Escape closes it, like every other overlay in Atlas. Bound to the window
@@ -1446,8 +1529,11 @@ function FilterDrawer({
         aria-label="Filters"
         className="animate-slide-in-right absolute bottom-0 right-0 top-0 z-50 flex w-[340px] flex-col border-l border-[var(--border-default)] bg-[var(--bg-elevated)]/60 shadow-[var(--shadow-overlay)] backdrop-blur-2xl"
       >
+        {/* No title. The panel slides in from the control that names it, and a
+         *  340px column has better uses for its first row than repeating the
+         *  word you just clicked. The count still earns its place — it is the
+         *  one thing you cannot see by looking at the sections below. */}
         <div className="flex h-9 shrink-0 items-center gap-2 border-b border-[var(--border-default)] pl-3.5 pr-2">
-          <span className="text-[12px] font-medium text-[var(--text-secondary)]">Filters</span>
           {activeFilters > 0 && (
             <span className="font-mono text-[10px] text-[var(--text-tertiary)]">
               {activeFilters} active
@@ -1478,6 +1564,12 @@ function FilterDrawer({
         </div>
 
         <div className="hide-scrollbar flex min-h-0 flex-1 flex-col gap-5 overflow-y-auto px-4 pb-8 pt-4">
+          {checkpoints.length > 0 && (
+            <Section label="Checkpoints" hint={`${checkpoints.length} commits`}>
+              <CheckpointJump checkpoints={checkpoints} onJump={onJump} />
+            </Section>
+          )}
+
           <Section label="Event types" hint={`${detail.entries.length} events`}>
             {kinds.map(([key, label, count]) => (
               <FilterChip
@@ -1523,6 +1615,13 @@ function FilterDrawer({
               enabled={detail.counts.toolCalls > 0}
               onClick={() => setExpandTools(!expandTools)}
             />
+            <FilterChip
+              label="Final response only"
+              count={detail.counts.responses}
+              on={foldResponses}
+              enabled={detail.counts.responses > 1}
+              onClick={() => setFoldResponses(!foldResponses)}
+            />
           </Section>
 
           <Section label="Outcome">
@@ -1567,6 +1666,125 @@ function FilterDrawer({
         </div>
       </aside>
     </>
+  );
+}
+
+/**
+ * Jump straight to any commit this Session produced.
+ *
+ * A searchable combo rather than a plain list: a long Session can produce a
+ * dozen Checkpoints, and by the time you are looking for one you usually know a
+ * word from its subject. Searching a subject beats scrolling a list of shas.
+ *
+ * The trigger keeps saying "Jump to" rather than showing the last selection —
+ * this is a *verb*, not a setting. Nothing here is part of the filter state,
+ * which is why Reset leaves it alone.
+ */
+function CheckpointJump({
+  checkpoints,
+  onJump,
+}: {
+  checkpoints: TimelineEntry[];
+  onJump: (entryId: string) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [query, setQuery] = useState("");
+
+  const matches = useMemo(() => {
+    const needle = query.trim().toLowerCase();
+    if (!needle) return checkpoints;
+    return checkpoints.filter(
+      (c) =>
+        c.commitSubject?.toLowerCase().includes(needle) ||
+        c.commitSha?.toLowerCase().includes(needle) ||
+        c.branch?.toLowerCase().includes(needle),
+    );
+  }, [checkpoints, query]);
+
+  return (
+    <Popover.Root
+      open={open}
+      onOpenChange={(v) => {
+        setOpen(v);
+        if (!v) setQuery("");
+      }}
+    >
+      <Popover.Trigger asChild>
+        <button
+          type="button"
+          className="flex h-9 w-full cursor-pointer items-center gap-2 rounded-lg border border-[var(--border-default)] bg-[var(--bg-raised)] px-3 text-left text-[12.5px] text-[var(--text-secondary)] transition-colors hover:border-[var(--border-strong)] hover:text-[var(--text-primary)]"
+        >
+          <span className="flex-1">Jump to</span>
+          <ChevronDown size={13} className="shrink-0 text-[var(--text-tertiary)]" />
+        </button>
+      </Popover.Trigger>
+      <Popover.Portal>
+        <Popover.Content
+          align="start"
+          sideOffset={6}
+          className="z-[var(--z-max)] flex max-h-[320px] w-[var(--radix-popover-trigger-width)] origin-[var(--radix-popover-content-transform-origin)] flex-col overflow-hidden rounded-lg border border-[var(--border-default)] bg-[var(--bg-elevated)]/95 shadow-[var(--shadow-overlay)] backdrop-blur-2xl data-[state=closed]:animate-scale-out data-[state=open]:animate-scale-in"
+        >
+          {/* The search only appears when there is enough to search. */}
+          {checkpoints.length > 4 && (
+            <div className="flex h-8 shrink-0 items-center gap-2 border-b border-[var(--border-default)] px-2.5">
+              <Search size={12} className="shrink-0 text-[var(--text-tertiary)]" />
+              <input
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                placeholder="Find a commit…"
+                spellCheck={false}
+                autoFocus
+                className="min-w-0 flex-1 border-0 bg-transparent p-0 text-[12px] text-[var(--text-primary)] outline-none placeholder:text-[var(--text-tertiary)]"
+              />
+            </div>
+          )}
+
+          <div className="hide-scrollbar min-h-0 flex-1 overflow-y-auto p-1">
+            {matches.length === 0 ? (
+              <p className="px-2 py-3 text-center text-[11.5px] text-[var(--text-tertiary)]">
+                No match.
+              </p>
+            ) : (
+              matches.map((checkpoint, i) => {
+                const sha = checkpoint.commitSha ?? "";
+                const changed = checkpoint.insertions + checkpoint.deletions;
+                return (
+                  <button
+                    key={checkpoint.id}
+                    type="button"
+                    onClick={() => {
+                      onJump(checkpoint.id);
+                      setOpen(false);
+                    }}
+                    className="flex w-full cursor-pointer flex-col gap-0.5 rounded-md px-2 py-1.5 text-left transition-colors hover:bg-[var(--bg-hover)]"
+                  >
+                    <span className="truncate text-[12.5px] text-[var(--text-secondary)]">
+                      {checkpoint.commitSubject ?? (
+                        <span className="text-[var(--text-tertiary)]">Subject unavailable</span>
+                      )}
+                    </span>
+                    <span className="flex items-center gap-1.5 font-mono text-[10.5px] text-[var(--text-ghost)]">
+                      <span>
+                        #{checkpoints.indexOf(checkpoint) + 1 || i + 1} · {sha.slice(0, 7)}
+                      </span>
+                      {changed > 0 && (
+                        <>
+                          <span>·</span>
+                          <span className="text-[var(--stat-added)]">+{checkpoint.insertions}</span>
+                          <span className="text-[var(--stat-removed)]">
+                            −{checkpoint.deletions}
+                          </span>
+                        </>
+                      )}
+                    </span>
+                  </button>
+                );
+              })
+            )}
+          </div>
+        </Popover.Content>
+      </Popover.Portal>
+    </Popover.Root>
   );
 }
 

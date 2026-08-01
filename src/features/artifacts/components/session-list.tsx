@@ -360,20 +360,35 @@ function AgentChip({ agent }: { agent: string | null }) {
  * `mono` drops the brand tint and inherits the surrounding colour, which is how
  * the chat composer badges its agent — the board's rows keep the tint, because
  * there the colour is what tells two adjacent rows apart at a glance.
+ *
+ * `size` is in pixels, because the two callers want genuinely different marks:
+ * an 11px chip glyph in a fixed column, and a 16px avatar on the detail's
+ * timeline rail where the mark is what identifies the turn.
  */
-export function AgentGlyph({ agent, mono }: { agent: string; mono?: boolean }) {
+export function AgentGlyph({
+  agent,
+  mono,
+  size = 11,
+}: {
+  agent: string;
+  mono?: boolean;
+  size?: number;
+}) {
+  const dim = { width: size, height: size };
   if (agent.includes("claude"))
     return (
-      <AgentIcons.Claude
-        className={cn("size-[11px]", !mono && "text-[var(--agent-claude-chip)]")}
-      />
+      <AgentIcons.Claude style={dim} className={cn(!mono && "text-[var(--agent-claude-chip)]")} />
     );
   if (agent.includes("codex"))
     return (
-      <AgentIcons.Codex className={cn("size-[11px]", !mono && "text-[var(--agent-codex-chip)]")} />
+      <AgentIcons.Codex style={dim} className={cn(!mono && "text-[var(--agent-codex-chip)]")} />
     );
-  if (agent.includes("cersei")) return <AtlasIcon size={10} className="rounded-[2px]" />;
-  return <span className="font-mono text-[9px]">{agent.slice(0, 1).toUpperCase()}</span>;
+  if (agent.includes("cersei")) return <AtlasIcon size={size} className="rounded-[3px]" />;
+  return (
+    <span className="font-mono" style={{ fontSize: size * 0.8 }}>
+      {agent.slice(0, 1).toUpperCase()}
+    </span>
+  );
 }
 
 // ── Clustering ──────────────────────────────────────────────────────────────
