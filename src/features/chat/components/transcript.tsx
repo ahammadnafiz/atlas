@@ -42,6 +42,7 @@ import { useTranscriptScroll } from "../lib/use-transcript-scroll";
 import { useChatStore } from "../stores/chat-store";
 import { saveThreadToKb, drawDiagram, canDrawDiagram } from "../lib/turn-actions";
 import { cn } from "@/lib/utils";
+import { GradualBlur } from "@/components/gradual-blur";
 import {
   UserRowView,
   ProseRowView,
@@ -101,6 +102,9 @@ interface TranscriptProps {
   messages: ChatMessage[];
   isStreaming: boolean;
   agentType?: string;
+  /** Vertical space (px) reserved at the top for the floating header, applied as
+   *  content padding so the first row clears it while still scrolling under. */
+  topInset?: number;
   onShowJumpChange?: (visible: boolean, newCount?: number) => void;
 }
 
@@ -135,7 +139,7 @@ function WorkingIndicator() {
 
 export const Transcript = forwardRef<TranscriptHandle, TranscriptProps>(
   function Transcript(
-    { tabId, acpSessionId, messages, isStreaming, agentType, onShowJumpChange },
+    { tabId, acpSessionId, messages, isStreaming, agentType, topInset = 0, onShowJumpChange },
     ref,
   ) {
     const scrollRef = useRef<HTMLDivElement>(null);
@@ -477,7 +481,7 @@ export const Transcript = forwardRef<TranscriptHandle, TranscriptProps>(
           onScroll={onScroll}
           className="atlas-transcript h-full overflow-y-auto hide-scrollbar [overflow-anchor:none]"
         >
-          <div ref={contentRef}>
+          <div ref={contentRef} style={topInset ? { paddingTop: topInset } : undefined}>
             {rows.length === 0 && !isStreaming && (
               <div className="flex h-full items-center justify-center text-[11px] text-[var(--text-tertiary)]">
                 No messages yet.
@@ -503,6 +507,26 @@ export const Transcript = forwardRef<TranscriptHandle, TranscriptProps>(
           </div>
         </div>
 
+        {/* Progressive blur behind the floating header. It starts at y=0 and
+            runs past the bar, so text scrolling underneath is blurred rather
+            than clipped by an opaque strip — which is only possible because the
+            header does not occupy a row of its own. Sized to the header inset
+            plus a short ramp below it. */}
+        <GradualBlur
+          position="top"
+          height={`${topInset + 34}px`}
+          strength={2.1}
+          layers={5}
+          // Mostly-opaque behind the bar itself, ramping to clear below it.
+          // Without a tint the header read as a transparent pane over live text;
+          // `color-mix` keeps it theme-correct rather than hardcoding black.
+          tint="color-mix(in srgb, var(--bg-surface) 90%, transparent)"
+          style={{ zIndex: 3 }}
+        />
+
+        {/* Bottom stays a plain colour fade. The blur was tried here and the
+            edge above the composer reads better as a clean dissolve — and it
+            avoids a second stack of live backdrop filters over the scroller. */}
         <div
           aria-hidden
           className={cn(

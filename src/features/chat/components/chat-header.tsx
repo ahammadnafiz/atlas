@@ -45,10 +45,20 @@ export type RoleFilter = "all" | "user" | "assistant";
  */
 const CONTROL_H = "h-[26px]";
 
-/** The single outline treatment, shared by the pill and all three circles. */
+/**
+ * The single control treatment, shared by the pill and all three circles.
+ *
+ * A faint fill carries the shape and the border only needs to finish the edge —
+ * so the border is deliberately softer than it was when it was doing the job
+ * alone (`#3a3a3a` ≈ 23% white; this is ~16%). Outline-only controls on a near
+ * black header read as wireframes; fill-plus-whisper reads as a surface.
+ *
+ * White alphas rather than hex so the controls track the active theme and sit
+ * correctly on the blurred band behind them, which is translucent.
+ */
 const OUTLINE = [
-  "border border-[#3a3a3a] bg-transparent text-[var(--text-tertiary)]",
-  "transition-colors hover:border-[#585858] hover:bg-white/[0.04] hover:text-[var(--text-primary)]",
+  "border border-white/[0.16] bg-white/[0.045] text-[var(--text-tertiary)]",
+  "transition-colors hover:border-white/[0.22] hover:bg-white/[0.09] hover:text-[var(--text-primary)]",
 ].join(" ");
 
 interface ChatHeaderProps {
@@ -80,14 +90,11 @@ export function ChatHeader({
   const [pickerOpen, setPickerOpen] = useState(false);
 
   return (
-    // No bottom border. The header is separated from the transcript by a soft
-    // fade instead — the same device the composer uses at the other end, so the
-    // thread reads as one surface that runs under both rather than a stack of
-    // bordered boxes.
-    // `z-10`: the fade below overflows this element, and the transcript is a
-    // LATER positioned sibling — with `z-index: auto` on both, DOM order wins
-    // and the thread would paint straight over the fade.
-    <div className="relative z-10 shrink-0">
+    // No border and NO BACKGROUND. The bar floats over the transcript (see the
+    // absolute wrapper in ChatPanel) and the transcript draws a progressive blur
+    // band behind it, so the thread stays visible-but-blurred underneath. Giving
+    // this element a fill would hide the very effect it sits on.
+    <div className="relative shrink-0">
       <div className="flex h-[46px] items-center gap-2 px-6">
         <HeaderCircleButton title="New session" onClick={onNewSession}>
           <Plus size={13} />
@@ -214,17 +221,10 @@ export function ChatHeader({
         </DropdownMenu.Root>
       </div>
 
-      {/* Soft edge between header and thread. Sits BELOW the bar (`top-full`)
-          and overlays the first rows, mirroring the fade above the composer, so
-          content dissolves into the chrome instead of meeting a hard rule.
-          Non-interactive, and above the transcript's own bottom fade (z-1). */}
-      <div
-        aria-hidden
-        className="pointer-events-none absolute left-0 right-0 top-full z-[2] h-6"
-        style={{
-          background: "linear-gradient(to bottom, var(--bg-surface), transparent)",
-        }}
-      />
+      {/* No fade element here: the blur behind this bar is drawn by the
+          transcript's top `GradualBlur`. A backdrop-filter can only blur what is
+          painted behind it, so it has to live in the scroller's stacking
+          context — not in a header that owns its own row. */}
     </div>
   );
 }

@@ -19,6 +19,10 @@ import { MessageInput } from "./message-input";
 import { SessionSidebar } from "./session-sidebar";
 import { ChatHeader } from "./chat-header";
 import { openNewAgentChat } from "../lib/open-agent-session";
+
+/** Height the floating header occupies — the transcript pads its content by
+ *  this much so the first row clears the bar. Must match `ChatHeader`'s bar. */
+const HEADER_INSET = 46;
 import { PermissionModal } from "./permission-modal";
 import { ClaudeSetupBanner } from "@/features/claude-setup/components/claude-setup-banner";
 import { NodeSetupBanner } from "@/features/node-setup/components/node-setup-banner";
@@ -701,28 +705,13 @@ export function ChatPanel({ tabId }: ChatPanelProps) {
       <SessionSidebar tabId={tabId} />
 
       <div className="flex-1 flex flex-col min-w-0">
-        {/* Header — session picker, find, and an overflow menu. */}
-        {session.messages.length > 0 && (
-          <ChatHeader
-            tabId={tabId}
-            title={headerTitle}
-            roleFilter={roleFilter}
-            onRoleFilterChange={setRoleFilter}
-            onOpenSearch={() => setSearchPaletteOpen(true)}
-            bashPanelOpen={bashPanelOpen}
-            onToggleBash={() => {
-              setBashPanelOpen((v) => !v);
-              setPlansPanelOpen(false);
-            }}
-            plansPanelOpen={plansPanelOpen}
-            onTogglePlans={() => {
-              setPlansPanelOpen((v) => !v);
-              setBashPanelOpen(false);
-            }}
-            onNewSession={openNewAgentChat}
-          />
-        )}
-
+        {/* The header FLOATS over the transcript rather than sitting above it in
+            the column. That is what lets the thread scroll underneath and be
+            progressively blurred by the band the transcript draws at its top
+            edge — a `backdrop-filter` can only blur what is painted behind it,
+            and a header that owns its own row has nothing behind it but the
+            panel background. The transcript reserves `HEADER_INSET` of top
+            padding so the first row still starts below the bar. */}
         {session.messages.length === 0 ? (
           <div className="flex-1 overflow-y-auto">
             {session.transcriptLoading ? (
@@ -732,17 +721,40 @@ export function ChatPanel({ tabId }: ChatPanelProps) {
             )}
           </div>
         ) : (
-          <Suspense fallback={<LoadingTranscriptState />}>
-            <Transcript
-              ref={messagesListRef}
-              tabId={tabId}
-              acpSessionId={acpSessionId}
-              messages={filteredMessages}
-              isStreaming={session.status === "running"}
-              agentType={session.agentType}
-              onShowJumpChange={onShowJumpChange}
-            />
-          </Suspense>
+          <div className="relative flex-1 min-h-0 flex flex-col">
+            <Suspense fallback={<LoadingTranscriptState />}>
+              <Transcript
+                ref={messagesListRef}
+                tabId={tabId}
+                acpSessionId={acpSessionId}
+                messages={filteredMessages}
+                isStreaming={session.status === "running"}
+                agentType={session.agentType}
+                topInset={HEADER_INSET}
+                onShowJumpChange={onShowJumpChange}
+              />
+            </Suspense>
+            <div className="absolute inset-x-0 top-0 z-20">
+              <ChatHeader
+                tabId={tabId}
+                title={headerTitle}
+                roleFilter={roleFilter}
+                onRoleFilterChange={setRoleFilter}
+                onOpenSearch={() => setSearchPaletteOpen(true)}
+                bashPanelOpen={bashPanelOpen}
+                onToggleBash={() => {
+                  setBashPanelOpen((v) => !v);
+                  setPlansPanelOpen(false);
+                }}
+                plansPanelOpen={plansPanelOpen}
+                onTogglePlans={() => {
+                  setPlansPanelOpen((v) => !v);
+                  setBashPanelOpen(false);
+                }}
+                onNewSession={openNewAgentChat}
+              />
+            </div>
+          </div>
         )}
 
         <div className="relative">
