@@ -27,11 +27,13 @@ const MarkdownBlock = memo(function MarkdownBlock({
   trailing,
   className,
   unstyled,
+  priority,
 }: {
   source: string;
   trailing: boolean;
   className?: string;
   unstyled?: boolean;
+  priority?: number;
 }) {
   // A still-open code fence renders as plain text (no per-frame re-highlight of a
   // growing block); it snaps to highlighted once the closing fence streams in.
@@ -52,6 +54,7 @@ const MarkdownBlock = memo(function MarkdownBlock({
     <CachedMarkdown
       source={source}
       unstyled={unstyled}
+      priority={priority}
       className={cn("[display:contents]", className)}
     />
   );
@@ -101,12 +104,15 @@ export function StreamingMarkdown({
   streaming,
   className,
   unstyled,
+  priority,
 }: {
   source: string;
   streaming: boolean;
   className?: string;
   /** See `CachedMarkdown.unstyled` — the new transcript pins its own metrics. */
   unstyled?: boolean;
+  /** See `CachedMarkdown.priority`. */
+  priority?: number;
 }) {
   // Reference-style link / footnote definitions need cross-block context, so
   // fall back to a single whole-message render — but only once SETTLED. During
@@ -118,7 +124,14 @@ export function StreamingMarkdown({
   const blocks = useBlocks(source, streaming, renderWhole);
 
   if (renderWhole) {
-    return <CachedMarkdown source={source} unstyled={unstyled} className={className} />;
+    return (
+      <CachedMarkdown
+        source={source}
+        unstyled={unstyled}
+        priority={priority}
+        className={className}
+      />
+    );
   }
 
   const lastIdx = blocks.length - 1;
@@ -134,6 +147,7 @@ export function StreamingMarkdown({
           trailing={streaming && i === lastIdx}
           className={className}
           unstyled={unstyled}
+          priority={priority}
         />
       ))}
       {/* Terminal-style caret after the last block while streaming — unless the

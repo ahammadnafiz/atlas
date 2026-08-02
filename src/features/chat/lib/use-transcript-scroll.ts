@@ -55,6 +55,7 @@ export function useTranscriptScroll({
   contentRef,
   canGrow,
   onGrow,
+  onContentResize,
 }: {
   scrollRef: RefObject<HTMLElement | null>;
   /** The scrolled content, watched for size changes. */
@@ -62,6 +63,9 @@ export function useTranscriptScroll({
   /** Whether there is any history left to reveal above. */
   canGrow: boolean;
   onGrow: () => void;
+  /** Content changed size — the caller may want to re-hold a scroll anchor.
+   *  Runs BEFORE the re-sample so the sample sees the corrected position. */
+  onContentResize?: () => void;
 }): TranscriptScroll {
   const [more, setMore] = useState(false);
 
@@ -79,6 +83,8 @@ export function useTranscriptScroll({
   growable.current = canGrow;
   const grow = useRef(onGrow);
   grow.current = onGrow;
+  const resized = useRef(onContentResize);
+  resized.current = onContentResize;
 
   const invalidate = useCallback(() => {
     dirty.current = true;
@@ -142,6 +148,11 @@ export function useTranscriptScroll({
     if (!content || !el) return;
     const observer = new ResizeObserver(() => {
       dirty.current = true;
+      // Give the caller a chance to re-hold its anchor before anything else
+      // looks at the geometry — a markdown block finishing its parse changes
+      // heights above the viewport, and without this the reader's position
+      // drifts every time one lands.
+      resized.current?.();
       // Re-sample rather than only marking dirty: growing the window makes the
       // page taller *without* a scroll event, and the fade would keep saying
       // "you are at the end" until the reader moved.

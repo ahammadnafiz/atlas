@@ -77,6 +77,15 @@ const IDLE_CHUNK = 120;
  *  renders happily. */
 const MAX_IDLE_FILL = 4000;
 
+/** Gap left above an anchored row, so it doesn't sit flush against the top. */
+const ANCHOR_GAP = 24;
+
+/** How long the sticky anchor keeps correcting after a load. Long enough for a
+ *  screenful of markdown to finish parsing, short enough that it can never be
+ *  mistaken for the transcript refusing to scroll. Any input releases it
+ *  immediately regardless. */
+const STICKY_SETTLE_MS = 4000;
+
 function switchable(agentType: string | undefined): SwitchableAgent {
   return agentType === "codex" || agentType === "cersei" ? agentType : "claude-code";
 }
@@ -195,7 +204,44 @@ export const Transcript = forwardRef<TranscriptHandle, TranscriptProps>(
     const canGrow = safeStart > 0;
 
     const onGrow = useCallback(() => {
+      growPendingRef.current = true;
       setStartIndex((i) => Math.max(0, i - WINDOW_CHUNK));
+    }, []);
+
+    // ── Sticky anchor: hold the reader's place while content settles ─────
+    //
+    // Loading a session mounts a screen of messages whose markdown is still
+    // being parsed. Each one swaps from its raw-text placeholder to formatted
+    // HTML at a slightly different height, and every swap above the viewport
+    // pushes everything below it — the thread visibly creeps while it settles.
+    // Priority parsing decides WHICH message formats first; this decides that it
+    // does not move the reader when it does.
+    //
+    // The anchor is a ROW, not a scroll offset: offsets are exactly what the
+    // reflow invalidates. Re-holding `offsetTop` (measured from the positioned
+    // ancestor, so independent of scroll) puts the row back where it was.
+    const stickyRef = useRef<{ rowId: string; offset: number } | null>(null);
+    const stickyUntil = useRef(0);
+    /** True between asking to grow and the re-anchor landing. */
+    const growPendingRef = useRef(false);
+
+    const onContentResize = useCallback(() => {
+      const sticky = stickyRef.current;
+      const el = scrollRef.current;
+      if (!sticky || !el) return;
+      // A prepend is in flight — its own re-anchor is authoritative and runs in
+      // a layout effect; two corrections in one frame fight each other.
+      if (growPendingRef.current) return;
+      if (performance.now() > stickyUntil.current) {
+        stickyRef.current = null;
+        return;
+      }
+      const node = el.querySelector<HTMLElement>(
+        `[data-row-id="${CSS.escape(sticky.rowId)}"]`,
+      );
+      if (!node) return;
+      const target = Math.max(0, node.offsetTop - sticky.offset);
+      if (Math.abs(el.scrollTop - target) > 1) el.scrollTop = target;
     }, []);
 
     const { more, onScroll, invalidate, atEndRef, growAnchor } = useTranscriptScroll({
@@ -203,6 +249,7 @@ export const Transcript = forwardRef<TranscriptHandle, TranscriptProps>(
       contentRef,
       canGrow,
       onGrow,
+      onContentResize,
     });
 
     // ── Fill the window during IDLE, not during scroll ───────────────────
@@ -243,6 +290,7 @@ export const Transcript = forwardRef<TranscriptHandle, TranscriptProps>(
         if (growAnchor.current !== null) return;
         const el = scrollRef.current;
         if (el) growAnchor.current = el.scrollHeight - el.scrollTop;
+        growPendingRef.current = true;
         setStartIndex((i) => Math.max(0, i - IDLE_CHUNK));
       };
 
@@ -271,6 +319,7 @@ export const Transcript = forwardRef<TranscriptHandle, TranscriptProps>(
       if (!el || anchor === null) return;
       el.scrollTop = el.scrollHeight - anchor;
       growAnchor.current = null;
+      growPendingRef.current = false;
       invalidate();
     }, [startIndex, growAnchor, invalidate]);
 
@@ -317,9 +366,34 @@ export const Transcript = forwardRef<TranscriptHandle, TranscriptProps>(
       pendingAnchorRef.current = null;
       // `offsetTop` is measured from the positioned ancestor, so it is
       // independent of the current scroll position.
-      el.scrollTop = Math.max(0, node.offsetTop - 24);
+      el.scrollTop = Math.max(0, node.offsetTop - ANCHOR_GAP);
+      // Hold this row in place while the screenful of markdown around it
+      // finishes parsing. Without this the reader watches the thread creep as
+      // each block swaps from placeholder to formatted.
+      stickyRef.current = { rowId: id, offset: ANCHOR_GAP };
+      stickyUntil.current = performance.now() + STICKY_SETTLE_MS;
       invalidate();
     });
+
+    // Any deliberate input means the reader has taken over — stop correcting
+    // their position. Same release rule the scroll contract uses everywhere.
+    useEffect(() => {
+      const el = scrollRef.current;
+      if (!el) return;
+      const release = () => {
+        stickyRef.current = null;
+      };
+      el.addEventListener("wheel", release, { passive: true });
+      el.addEventListener("touchstart", release, { passive: true });
+      el.addEventListener("keydown", release);
+      el.addEventListener("mousedown", release);
+      return () => {
+        el.removeEventListener("wheel", release);
+        el.removeEventListener("touchstart", release);
+        el.removeEventListener("keydown", release);
+        el.removeEventListener("mousedown", release);
+      };
+    }, []);
 
     // ── Follow the live edge ─────────────────────────────────────────────
     // One effect. `atEndRef` is maintained by the scroll loop, so this reads no
@@ -438,12 +512,16 @@ export const Transcript = forwardRef<TranscriptHandle, TranscriptProps>(
                 No messages yet.
               </div>
             )}
-            {visible.map((row) => (
+            {visible.map((row, i) => (
               <div key={row.id} className="atlas-row group" data-row-id={row.id}>
                 <RowView
                   row={row}
                   tabId={tabId}
                   agentLabel={agentLabel}
+                  // Absolute position in the thread, so the newest messages —
+                  // the ones on screen after a history load — are parsed first.
+                  // Index within `visible` would shift as the window grows.
+                  priority={safeStart + i}
                   onToggleExpand={toggleExpand}
                   onExpandTurn={expandTurn}
                   onSaveKb={onSaveKb}
@@ -475,6 +553,7 @@ function RowView({
   row,
   tabId,
   agentLabel,
+  priority,
   onToggleExpand,
   onExpandTurn,
   onSaveKb,
@@ -483,6 +562,7 @@ function RowView({
   row: Row;
   tabId: string;
   agentLabel: string;
+  priority: number;
   onToggleExpand: (id: string) => void;
   onExpandTurn: (turnId: string) => void;
   onSaveKb: () => void;
@@ -492,7 +572,7 @@ function RowView({
     case RowKind.User:
       return <UserRowView row={row} onToggleExpand={onToggleExpand} />;
     case RowKind.Prose:
-      return <ProseRowView row={row} agentLabel={agentLabel} />;
+      return <ProseRowView row={row} agentLabel={agentLabel} priority={priority} />;
     case RowKind.Thinking:
       return <ThinkingRowView row={row} onToggleExpand={onToggleExpand} />;
     case RowKind.Marker:

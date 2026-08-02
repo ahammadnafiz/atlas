@@ -103,13 +103,64 @@ export function warmMarkdownWorker(): void {
   }
 }
 
+// ── Priority queue ─────────────────────────────────────────────────────────
+//
+// Blocks used to be posted to the worker the moment they mounted. The worker
+// drains FIFO, and rows mount top-to-bottom, so the queue was strictly
+// OLDEST-FIRST — the exact reverse of what the reader needs. Loading a session
+// lands the viewport at the newest turns, and those were last in line behind
+// every historical message, each one popping from placeholder to formatted as it
+// arrived and reflowing everything below it. That is the "content pushing"
+// during history load.
+//
+// So the queue is ours, not the worker's: hold the work here, keep only a couple
+// of parses in flight, and always dispatch the highest priority next. Callers
+// pass the row's position, so the newest visible message is parsed first and the
+// reader's viewport settles before anything off-screen is touched.
+
+interface QueueItem {
+  source: string;
+  priority: number;
+  dispatch: () => void;
+}
+
+const queue: QueueItem[] = [];
+let inFlight = 0;
+/** Small, not 1: one keeps the worker idle for a round-trip between items, and
+ *  much more would let a burst of low-priority work overtake a late arrival. */
+const MAX_IN_FLIGHT = 2;
+
+function pump(): void {
+  while (inFlight < MAX_IN_FLIGHT && queue.length > 0) {
+    let best = 0;
+    for (let i = 1; i < queue.length; i++) {
+      if (queue[i].priority > queue[best].priority) best = i;
+    }
+    const item = queue.splice(best, 1)[0];
+    inFlight += 1;
+    item.dispatch();
+  }
+}
+
+/** Raise a queued item's priority — the same source can be requested again by a
+ *  row that matters more (e.g. it scrolled into view). */
+function bumpPriority(source: string, priority: number): void {
+  for (const item of queue) {
+    if (item.source === source && priority > item.priority) item.priority = priority;
+  }
+}
+
 /** Parse a large block off the main thread. Falls back to a gated-idle main-
- *  thread parse (the pre-worker behavior) if the worker is unavailable. */
-function parseLarge(source: string): Promise<string> {
+ *  thread parse (the pre-worker behavior) if the worker is unavailable.
+ *  `priority` orders the queue — higher goes first. */
+function parseLarge(source: string, priority: number): Promise<string> {
   const hit = cacheGet(source);
   if (hit !== undefined) return Promise.resolve(hit);
   const existing = pending.get(source);
-  if (existing) return existing;
+  if (existing) {
+    bumpPriority(source, priority);
+    return existing;
+  }
 
   const w = ensureWorker();
   let p: Promise<string>;
@@ -122,19 +173,29 @@ function parseLarge(source: string): Promise<string> {
         settled = true;
         waiters.delete(id);
         cacheSet(source, html);
+        inFlight = Math.max(0, inFlight - 1);
         resolve(html);
+        // Free slot — start the next-highest-priority block.
+        pump();
       };
-      waiters.set(id, finish);
-      // Watchdog: if the worker never answers (e.g. its script failed to load
-      // asynchronously), fall back to a main-thread parse so the message still
-      // renders instead of hanging blank.
-      window.setTimeout(() => {
-        if (!settled) {
-          workerBroken = true;
-          finish(renderToHtmlSync(source));
-        }
-      }, 3000);
-      w.postMessage({ id, source });
+      queue.push({
+        source,
+        priority,
+        dispatch: () => {
+          waiters.set(id, finish);
+          // Watchdog: if the worker never answers (e.g. its script failed to
+          // load asynchronously), fall back to a main-thread parse so the
+          // message still renders instead of hanging blank.
+          window.setTimeout(() => {
+            if (!settled) {
+              workerBroken = true;
+              finish(renderToHtmlSync(source));
+            }
+          }, 3000);
+          w.postMessage({ id, source });
+        },
+      });
+      pump();
     });
   } else {
     // Fallback: parse on the main thread but keep it out of typing bursts.
@@ -182,6 +243,13 @@ interface CachedMarkdownProps {
    * keep having.
    */
   unstyled?: boolean;
+  /**
+   * Parse-queue priority — higher parses sooner. Callers pass the row's position
+   * in the thread, so the newest messages (the ones on screen after a history
+   * load) format first and the viewport stops reflowing before off-screen work
+   * begins. Only affects blocks large enough to go to the worker.
+   */
+  priority?: number;
 }
 
 /**
@@ -191,7 +259,12 @@ interface CachedMarkdownProps {
  * the first parse to a `requestIdleCallback` so initial mount paint
  * isn't blocked; subsequent remounts hit the cache and skip the deferral.
  */
-export function CachedMarkdown({ source, className, unstyled }: CachedMarkdownProps) {
+export function CachedMarkdown({
+  source,
+  className,
+  unstyled,
+  priority = 0,
+}: CachedMarkdownProps) {
   const [html, setHtml] = useState<string | null>(() => {
     const hit = cacheGet(source);
     if (hit !== undefined) return hit;
@@ -215,7 +288,7 @@ export function CachedMarkdown({ source, className, unstyled }: CachedMarkdownPr
     }
     // Large block → parse off the main thread, then swap in the HTML.
     let cancelled = false;
-    void parseLarge(source).then((result) => {
+    void parseLarge(source, priority).then((result) => {
       if (!cancelled) setHtml(result);
     });
     return () => {
@@ -223,7 +296,7 @@ export function CachedMarkdown({ source, className, unstyled }: CachedMarkdownPr
     };
     // `html` intentionally omitted: re-running on our own setHtml would loop.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [source]);
+  }, [source, priority]);
 
   // One delegated click handler: copy-code buttons + safe external links.
   useEffect(() => {

@@ -132,9 +132,12 @@ function ExpandToggle({
 export const ProseRowView = memo(function ProseRowView({
   row,
   agentLabel,
+  priority,
 }: {
   row: ProseRow;
   agentLabel: string;
+  /** Position in the thread — newest parses first. See `CachedMarkdown`. */
+  priority: number;
 }) {
   return (
     <Column className="py-[3px]">
@@ -162,9 +165,20 @@ export const ProseRowView = memo(function ProseRowView({
           the block-splitting renderer, where only the trailing block re-parses
           per frame. */}
       {row.streaming ? (
-        <StreamingMarkdown source={row.text} streaming unstyled className="atlas-prose" />
+        <StreamingMarkdown
+          source={row.text}
+          streaming
+          unstyled
+          priority={priority}
+          className="atlas-prose"
+        />
       ) : (
-        <CachedMarkdown source={row.text} unstyled className="atlas-prose" />
+        <CachedMarkdown
+          source={row.text}
+          unstyled
+          priority={priority}
+          className="atlas-prose"
+        />
       )}
     </Column>
   );
