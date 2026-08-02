@@ -1,10 +1,14 @@
 // The chat header.
 //
 // Deliberately close to ChatGPT's: a session name with a chevron on the left,
-// and everything else folded behind two icon buttons on the right. The previous
-// header put a 280px search field, a role-filter pill, and three named toggles
-// (Bash / Plans / Zen) permanently on screen — five controls competing with the
+// and everything else folded behind icon buttons. The previous header put a
+// 280px search field, a role-filter pill, and three named toggles (Bash /
+// Plans / Zen) permanently on screen — five controls competing with the
 // transcript, most of them rarely used.
+//
+// Every control in the bar is CONTROL_H tall and shares one outline treatment,
+// so the row lines up on a single optical baseline. That is the whole design:
+// one height, one border.
 //
 // The session picker reuses `SessionSidebar` in its `dropdown` variant rather
 // than reimplementing the list. Building that list means merging live tabs with
@@ -12,7 +16,7 @@
 // a row carries a lot of resume edge-cases — a second implementation would drift
 // from the first within a release.
 
-import { useState } from "react";
+import { forwardRef, useState } from "react";
 import * as Popover from "@radix-ui/react-popover";
 import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
 import {
@@ -31,6 +35,21 @@ import { cn } from "@/lib/utils";
 import { SessionSidebar } from "./session-sidebar";
 
 export type RoleFilter = "all" | "user" | "assistant";
+
+/**
+ * One height for every control in the bar.
+ *
+ * Alignment here is not a matter of `items-center` — that centres boxes of
+ * different heights, which still reads as ragged because the borders don't line
+ * up. The pill and the circles have to be the SAME box.
+ */
+const CONTROL_H = "h-[26px]";
+
+/** The single outline treatment, shared by the pill and all three circles. */
+const OUTLINE = [
+  "border border-[#3a3a3a] bg-transparent text-[var(--text-tertiary)]",
+  "transition-colors hover:border-[#585858] hover:bg-white/[0.04] hover:text-[var(--text-primary)]",
+].join(" ");
 
 interface ChatHeaderProps {
   tabId: string;
@@ -69,26 +88,30 @@ export function ChatHeader({
     // LATER positioned sibling — with `z-index: auto` on both, DOM order wins
     // and the thread would paint straight over the fade.
     <div className="relative z-10 shrink-0">
-      <div className="flex h-[44px] items-center gap-1 px-4">
+      <div className="flex h-[46px] items-center gap-2 px-6">
+        <HeaderCircleButton title="New session" onClick={onNewSession}>
+          <Plus size={13} />
+        </HeaderCircleButton>
+
         {/* Session picker */}
         <Popover.Root open={pickerOpen} onOpenChange={setPickerOpen}>
           <Popover.Trigger asChild>
-            {/* The app's pill language (same as "Save to KB" / "Commit
-                changes"). Bare text on a bare header gave no hint that the
-                title was a control at all. */}
+            {/* Same outline as the circles, just pill-shaped. Bare text on a
+                bare header gave no hint that the title was a control at all. */}
             <button
               type="button"
               className={cn(
-                "flex min-w-0 max-w-[46%] items-center gap-1.5 rounded-full",
-                "border border-[var(--border-default)] bg-[var(--bg-elevated)] px-3 py-1.5",
+                "flex min-w-0 max-w-[46%] items-center gap-1.5 rounded-full px-3",
+                CONTROL_H,
+                OUTLINE,
                 "text-[12px] font-medium leading-none text-[var(--text-primary)]",
-                "cursor-pointer outline-none transition-colors hover:bg-[var(--bg-hover)]",
+                "cursor-pointer outline-none",
               )}
               title="Switch session"
             >
               <span className="truncate">{title}</span>
               <ChevronDown
-                size={13}
+                size={12}
                 className={cn(
                   "shrink-0 text-[var(--text-tertiary)] transition-transform",
                   pickerOpen && "rotate-180",
@@ -127,26 +150,20 @@ export function ChatHeader({
 
         <div className="flex-1" />
 
-        <HeaderIconButton title="Find in chat (⌘F)" onClick={onOpenSearch}>
-          <Search size={14} />
-        </HeaderIconButton>
-
-        <NewSessionButton onClick={onNewSession} />
+        <HeaderCircleButton title="Find in chat (⌘F)" onClick={onOpenSearch}>
+          <Search size={13} />
+        </HeaderCircleButton>
 
         <DropdownMenu.Root>
           <DropdownMenu.Trigger asChild>
-            <button
-              type="button"
-              title="More"
-              className="flex h-7 w-7 items-center justify-center rounded-md text-[var(--text-tertiary)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)] cursor-pointer outline-none transition-colors"
-            >
-              <MoreHorizontal size={15} />
-            </button>
+            <HeaderCircleButton title="More">
+              <MoreHorizontal size={14} />
+            </HeaderCircleButton>
           </DropdownMenu.Trigger>
           <DropdownMenu.Portal>
             <DropdownMenu.Content
               align="end"
-              sideOffset={4}
+              sideOffset={6}
               style={{ zIndex: 9999 }}
               className="min-w-[180px] rounded-md border border-[var(--border-default)] bg-[var(--bg-secondary)] py-1 shadow-[var(--shadow-overlay)]"
             >
@@ -213,59 +230,44 @@ export function ChatHeader({
 }
 
 /**
- * New session.
+ * A round icon button: thin border, flat fill. That is the whole treatment.
  *
- * The only affirmative action in the header, so it is the only thing given a
- * real edge: a hairline of light across the top arc, brightest at the centre and
- * fading out either side, over a flat black fill. Reads as lit from above rather
- * than as another grey chip, which is what lets it carry weight at 28px without
- * resorting to an accent colour the rest of the header deliberately avoids.
+ * It briefly carried a gradient hairline across the top, borrowed from a wide
+ * `px-10` pill where the top edge is a long straight run. A circle this small
+ * has no straight top edge at all, so the line overshot the arc at both ends and
+ * read as a bar floating above the button rather than as light on its rim. The
+ * effect does not survive the shape; it was removed rather than tuned.
  *
- * No `overflow-hidden` — the highlight sits one pixel ABOVE the border
- * (`-top-px`) and clipping would erase exactly the thing that makes it read.
+ * `forwardRef` is required: Radix's `asChild` triggers clone this element and
+ * hand it a ref, and without one the dropdown has nothing to anchor to.
  */
-function NewSessionButton({ onClick }: { onClick: () => void }) {
+const HeaderCircleButton = forwardRef<
+  HTMLButtonElement,
+  {
+    children: React.ReactNode;
+    title: string;
+    onClick?: () => void;
+  } & React.ButtonHTMLAttributes<HTMLButtonElement>
+>(function HeaderCircleButton({ children, title, onClick, className, ...rest }, ref) {
   return (
     <button
-      type="button"
-      onClick={onClick}
-      title="New session"
-      className={cn(
-        "relative grid h-7 w-7 shrink-0 place-items-center rounded-full",
-        "border border-[#505050] bg-black text-[var(--text-secondary)]",
-        "cursor-pointer transition duration-200",
-        "hover:text-[var(--text-primary)] hover:shadow-2xl hover:shadow-white/[0.1]",
-      )}
-    >
-      <span
-        aria-hidden
-        className="absolute inset-x-0 -top-px mx-auto h-px w-1/2 bg-gradient-to-r from-transparent via-white to-transparent shadow-2xl"
-      />
-      <Plus size={14} className="relative z-20" />
-    </button>
-  );
-}
-
-function HeaderIconButton({
-  children,
-  onClick,
-  title,
-}: {
-  children: React.ReactNode;
-  onClick: () => void;
-  title: string;
-}) {
-  return (
-    <button
+      {...rest}
+      ref={ref}
       type="button"
       onClick={onClick}
       title={title}
-      className="flex h-7 w-7 items-center justify-center rounded-md text-[var(--text-tertiary)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)] cursor-pointer outline-none transition-colors"
+      className={cn(
+        "grid w-[26px] shrink-0 place-items-center rounded-full",
+        CONTROL_H,
+        OUTLINE,
+        "cursor-pointer outline-none",
+        className,
+      )}
     >
       {children}
     </button>
   );
-}
+});
 
 function MenuLabel({ children }: { children: React.ReactNode }) {
   return (
