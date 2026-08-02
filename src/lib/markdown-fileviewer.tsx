@@ -5,7 +5,18 @@ import rehypeHighlight from "rehype-highlight";
 import rehypeRaw from "rehype-raw";
 import "highlight.js/styles/github-dark.css";
 
-
+function handleWheel(e: React.WheelEvent<HTMLElement>) {
+  const el = e.currentTarget;
+  if (Math.abs(e.deltaY) <= Math.abs(e.deltaX)) return;
+  e.preventDefault();
+  let parent = el.parentElement;
+  while (parent) {
+    const style = getComputedStyle(parent);
+    if (style.overflowY === "auto" || style.overflowY === "scroll") break;
+    parent = parent.parentElement;
+  }
+  parent?.scrollBy({ top: e.deltaY });
+}
 
 interface Props {
   children: string;
@@ -116,11 +127,12 @@ export const MarkdownFile = memo(function MarkdownFile({
 
           pre: (p) => (
             <pre
-              className="my-4 overflow-x-auto rounded-md border border-[var(--border-default)] bg-[var(--bg-secondary)] p-4 text-[12.5px]"
+              className="my-4 overflow-x-auto rounded-md border border-[var(--border-default)] bg-[var(--bg-secondary)] text-[12.5px]"
               style={{
                 whiteSpace: "pre",
                 wordBreak: "normal",
               }}
+              onWheel={handleWheel}
             >
               {p.children}
             </pre>
@@ -137,12 +149,15 @@ export const MarkdownFile = memo(function MarkdownFile({
           ),
 
           table: (p) => (
-            <div className="my-4 overflow-x-auto rounded-md border border-[var(--border-default)]">
-              <table className="min-w-max border-collapse text-[13px]">
+            <div
+                className="my-4 overflow-x-auto rounded-md border border-[var(--border-default)]"
+                onWheel={handleWheel}
+            >
+                <table className="min-w-max text-[13px] ">
                 {p.children}
-              </table>
+                </table>
             </div>
-          ),
+            ),
 
           thead: (p) => (
             <thead className="bg-[var(--bg-elevated)]">
