@@ -487,8 +487,24 @@ export function EditorPanel({ tabId, filePath, containerHeight }: EditorPanelPro
         {buffer.dirty && (
           <span className="w-1.5 h-1.5 rounded-full bg-accent shrink-0 ml-2" />
         )}
-        {isMarkdownFile && (
-          <div className="ml-2 inline-flex items-center h-[20px] rounded-full border border-border-default bg-bg-elevated p-[2px] text-[10px] font-medium shrink-0">
+        {/* Right-hand controls. `ml-auto` on the group (rather than on whichever
+            child happens to be present) keeps them pinned right no matter which
+            of them render — the reload pill is conditional, and hanging the
+            margin off it meant the layout changed shape when a file went stale
+            on disk. */}
+        <div className="ml-auto flex items-center gap-2 pl-2">
+          {buffer.externallyChanged && (
+            <button
+              type="button"
+              onClick={() => void forceReload()}
+              title="This file changed on disk. Reload discards your unsaved edits."
+              className="inline-flex items-center gap-1 h-[20px] px-2 rounded-full border border-border-default bg-bg-elevated text-[10px] font-medium text-text-secondary hover:text-text-primary hover:bg-bg-hover transition-colors shrink-0"
+            >
+              <RefreshCw size={10} /> Disk changed · Reload
+            </button>
+          )}
+          {isMarkdownFile && (
+            <div className="inline-flex items-center h-[20px] rounded-full border border-border-default bg-bg-elevated p-[2px] text-[10px] font-medium shrink-0">
               <button
                 type="button"
                 onClick={() => setRenderMode("editor")}
@@ -498,8 +514,8 @@ export function EditorPanel({ tabId, filePath, containerHeight }: EditorPanelPro
                     ? "bg-bg-hover text-text-primary"
                     : "text-text-secondary hover:text-text-primary"
                 )}
-                >
-                  Edit
+              >
+                Edit
               </button>
               <button
                 type="button"
@@ -513,18 +529,9 @@ export function EditorPanel({ tabId, filePath, containerHeight }: EditorPanelPro
               >
                 Preview
               </button>
-          </div>
-        )}
-        {buffer.externallyChanged && (
-          <button
-            type="button"
-            onClick={() => void forceReload()}
-            title="This file changed on disk. Reload discards your unsaved edits."
-            className="ml-auto inline-flex items-center gap-1 h-[20px] px-2 rounded-full border border-border-default bg-bg-elevated text-[10px] font-medium text-text-secondary hover:text-text-primary hover:bg-bg-hover transition-colors shrink-0"
-          >
-            <RefreshCw size={10} /> Disk changed · Reload
-          </button>
-        )}
+            </div>
+          )}
+        </div>
       </div>
 
       {/* CodeMirror container */}
