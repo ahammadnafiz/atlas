@@ -11,7 +11,7 @@ import {
   Loader2,
   Lock,
   Link2,
-  PanelLeftOpen,
+  PanelLeft,
   Search,
   Paperclip,
   X,
@@ -256,7 +256,7 @@ function Conversation({
             className="flex items-center justify-center w-6 h-6 rounded text-text-tertiary hover:text-text-primary hover:bg-bg-hover transition-colors"
             title="Show history (⌘⌥K)"
           >
-            <PanelLeftOpen size={13} />
+            <PanelLeft size={13} />
           </button>
         )}
         {messages.length > 0 && (

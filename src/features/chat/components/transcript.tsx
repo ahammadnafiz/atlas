@@ -101,8 +101,6 @@ interface TranscriptProps {
   messages: ChatMessage[];
   isStreaming: boolean;
   agentType?: string;
-  /** Hide markers + thinking, collapsing each turn to its outcome. */
-  zen: boolean;
   onShowJumpChange?: (visible: boolean, newCount?: number) => void;
 }
 
@@ -137,7 +135,7 @@ function WorkingIndicator() {
 
 export const Transcript = forwardRef<TranscriptHandle, TranscriptProps>(
   function Transcript(
-    { tabId, acpSessionId, messages, isStreaming, agentType, zen, onShowJumpChange },
+    { tabId, acpSessionId, messages, isStreaming, agentType, onShowJumpChange },
     ref,
   ) {
     const scrollRef = useRef<HTMLDivElement>(null);
@@ -146,10 +144,6 @@ export const Transcript = forwardRef<TranscriptHandle, TranscriptProps>(
     const agentLabel = AGENT_LABEL[switchable(agentType)];
 
     const [expanded, setExpanded] = useState<ReadonlySet<string>>(() => new Set());
-    const [expandedTurns, setExpandedTurns] = useState<ReadonlySet<string>>(
-      () => new Set(),
-    );
-
     const toggleExpand = useCallback((id: string) => {
       setExpanded((prev) => {
         const next = new Set(prev);
@@ -159,34 +153,11 @@ export const Transcript = forwardRef<TranscriptHandle, TranscriptProps>(
       });
     }, []);
 
-    const expandTurn = useCallback((turnId: string) => {
-      setExpandedTurns((prev) => {
-        const next = new Set(prev);
-        next.add(turnId);
-        return next;
-      });
-    }, []);
-
     const projection = useMemo(
-      () => projectRows(messages, { expanded, streaming: isStreaming, zen }),
-      [messages, expanded, isStreaming, zen],
+      () => projectRows(messages, { expanded, streaming: isStreaming }),
+      [messages, expanded, isStreaming],
     );
-
-    // Zen with per-turn opt-out: re-project un-zenned for turns the reader
-    // expanded. Only runs when that set is non-empty.
-    const rows: Row[] = useMemo(() => {
-      if (!zen || expandedTurns.size === 0) return projection.rows;
-      const full = projectRows(messages, { expanded, streaming: isStreaming, zen: false });
-      const out: Row[] = [];
-      for (const r of projection.rows) {
-        if (!expandedTurns.has(r.turnId)) out.push(r);
-      }
-      for (const r of full.rows) {
-        if (expandedTurns.has(r.turnId)) out.push(r);
-      }
-      const order = new Map(projection.turns.map((t, i) => [t.id, i]));
-      return out.sort((a, b) => (order.get(a.turnId) ?? 0) - (order.get(b.turnId) ?? 0));
-    }, [zen, expandedTurns, projection, messages, expanded, isStreaming]);
+    const rows: Row[] = projection.rows;
 
     // ── The window ───────────────────────────────────────────────────────
     // Anchored by START INDEX, not by a count back from the end. A count would
@@ -196,7 +167,7 @@ export const Transcript = forwardRef<TranscriptHandle, TranscriptProps>(
       Math.max(0, rows.length - WINDOW_INITIAL),
     );
 
-    // Clamp: a projection that SHRINKS (zen toggle, role filter, session reset)
+    // Clamp: a projection that SHRINKS (role filter, session reset)
     // can leave `startIndex` past the end, and `slice` past the end returns []
     // — an empty transcript with no error anywhere.
     const safeStart = Math.min(startIndex, Math.max(0, rows.length - 1));
@@ -523,7 +494,6 @@ export const Transcript = forwardRef<TranscriptHandle, TranscriptProps>(
                   // Index within `visible` would shift as the window grows.
                   priority={safeStart + i}
                   onToggleExpand={toggleExpand}
-                  onExpandTurn={expandTurn}
                   onSaveKb={onSaveKb}
                   onDiagram={onDiagram}
                 />
@@ -555,7 +525,6 @@ function RowView({
   agentLabel,
   priority,
   onToggleExpand,
-  onExpandTurn,
   onSaveKb,
   onDiagram,
 }: {
@@ -564,7 +533,6 @@ function RowView({
   agentLabel: string;
   priority: number;
   onToggleExpand: (id: string) => void;
-  onExpandTurn: (turnId: string) => void;
   onSaveKb: () => void;
   onDiagram: (messageId: string) => void;
 }) {
@@ -580,7 +548,7 @@ function RowView({
     case RowKind.MarkerGroup:
       return <MarkerGroupRowView row={row} onExpandGroup={onToggleExpand} />;
     case RowKind.Separator:
-      return <SeparatorRowView row={row} onExpandTurn={onExpandTurn} />;
+      return <SeparatorRowView row={row} />;
     case RowKind.TurnFooter:
       return (
         <TurnFooterRowView

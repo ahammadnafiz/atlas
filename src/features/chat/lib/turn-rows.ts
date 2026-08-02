@@ -7,13 +7,11 @@
 // representation, and grouping was O(n) work repeated per frame.
 //
 // Here the thread is projected ONCE into a closed set of row kinds. Everything
-// a row needs to render (and to have its height predicted before layout) is
-// baked into the row record at projection time. The rendering layer never looks
-// at a neighbour.
+// a row needs to render is baked into the row record at projection time. The
+// rendering layer never looks at a neighbour.
 //
-// The closed set matters: every row kind must have a documented height function
-// in `row-height.ts`. Adding a kind without one is a bug, not a shortcut —
-// unpredictable height is exactly what made the old list slow.
+// The closed set matters: a new row kind is a deliberate addition to the
+// vocabulary of the transcript, not an ad-hoc branch in a render function.
 
 import type { ChatMessage, ToolCallDisplay, TurnFile } from "@/types/agent";
 import { isBashToolCall, bashCommandOf } from "./tool-calls";
@@ -112,8 +110,6 @@ export interface MarkerGroupRow extends RowBase {
 export interface SeparatorRow extends RowBase {
   kind: typeof RowKind.Separator;
   label: string;
-  /** Clickable when it stands in for hidden marker rows (zen mode). */
-  expandable: boolean;
 }
 
 export interface TurnFooterRow extends RowBase {
@@ -167,9 +163,9 @@ export interface Projection {
   rows: Row[];
   turns: Turn[];
   /** Parallel typed arrays over `rows`. 8 bytes/row: at 50k rows that is 400KB
-   *  with zero GC pressure, and the zen filter becomes a tight typed-array loop
-   *  instead of an allocation per pass. Struct-of-arrays is much harder to
-   *  retrofit than to adopt, so it goes in from the start. */
+   *  with zero GC pressure, so any pass over the whole index is a tight loop
+   *  rather than an allocation. Struct-of-arrays is much harder to retrofit
+   *  than to adopt, so it goes in from the start. */
   kinds: Uint8Array;
   turnIdx: Uint32Array;
   /** Filled in by the height pass, not here. */
@@ -296,8 +292,6 @@ export interface ProjectOptions {
   expanded: ReadonlySet<string>;
   /** The trailing assistant message is live. */
   streaming: boolean;
-  /** Hide marker + thinking rows, collapsing each turn to its outcome. */
-  zen: boolean;
 }
 
 /**
@@ -393,7 +387,7 @@ export function projectRows(
         continue;
       }
 
-      if (msg.thinking && msg.thinking.trim() && !opts.zen) {
+      if (msg.thinking && msg.thinking.trim()) {
         rows.push({
           kind: RowKind.Thinking,
           id: `th:${msg.id}`,
@@ -410,7 +404,7 @@ export function projectRows(
         const mk = markerFor(tc, turnId, false);
         markers.push(mk);
         if (tc.status === "failed") sawError = true;
-        if (!opts.zen) rows.push(mk);
+        rows.push(mk);
       }
 
       const prose = stripNextSteps(msg.content ?? "").trim();
@@ -434,33 +428,17 @@ export function projectRows(
       i += 1;
     }
 
-    // Zen: one separator standing in for everything hidden.
-    if (opts.zen && (toolCount > 0 || markers.length > 0)) {
-      const files = footerMsg?.turnSummary?.files.length ?? 0;
-      const bits = [`${toolCount} ${toolCount === 1 ? "tool" : "tools"}`];
-      if (files > 0) bits.push(`${files} ${files === 1 ? "file" : "files"} changed`);
-      rows.splice(rowStart, 0, {
-        kind: RowKind.Separator,
-        id: `zs:${turnId}`,
-        turnId,
-        firstInTurn: false,
-        label: bits.join(" · "),
-        expandable: true,
-      });
-    }
-
     // Duration separator, when we can derive one from the turn's span.
     const startTs = new Date(messages[turnFirstIdx].timestamp).getTime();
     const endTs = new Date(messages[Math.max(turnFirstIdx, i - 1)].timestamp).getTime();
     const span = endTs - startTs;
-    if (!opts.zen && span > 5000 && toolCount > 0) {
+    if (span > 5000 && toolCount > 0) {
       rows.push({
         kind: RowKind.Separator,
         id: `ds:${turnId}`,
         turnId,
         firstInTurn: false,
         label: `Worked for ${fmtDuration(span)}`,
-        expandable: false,
       });
     }
 
@@ -534,6 +512,5 @@ function maybeGapSeparator(
     turnId,
     firstInTurn: false,
     label: `${formatGap(gap)} ago`,
-    expandable: false,
   });
 }

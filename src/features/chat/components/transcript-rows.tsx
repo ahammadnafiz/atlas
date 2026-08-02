@@ -318,31 +318,16 @@ export const MarkerGroupRowView = memo(function MarkerGroupRowView({
 
 export const SeparatorRowView = memo(function SeparatorRowView({
   row,
-  onExpandTurn,
 }: {
   row: SeparatorRow;
-  onExpandTurn: (turnId: string) => void;
 }) {
-  const inner = (
-    <>
-      <span className="h-px flex-1 bg-[var(--border-subtle)]" />
-      <span className="shrink-0 text-[10px] text-[var(--text-tertiary)]">{row.label}</span>
-      <span className="h-px flex-1 bg-[var(--border-subtle)]" />
-    </>
-  );
   return (
     <Column className="flex h-[34px] items-center">
-      {row.expandable ? (
-        <button
-          type="button"
-          onClick={() => onExpandTurn(row.turnId)}
-          className="flex w-full items-center gap-2 cursor-pointer text-[var(--text-tertiary)] hover:text-[var(--text-secondary)] transition-colors"
-        >
-          {inner}
-        </button>
-      ) : (
-        <div className="flex w-full select-none items-center gap-2">{inner}</div>
-      )}
+      <div className="flex w-full select-none items-center gap-2">
+        <span className="h-px flex-1 bg-[var(--border-subtle)]" />
+        <span className="shrink-0 text-[10px] text-[var(--text-tertiary)]">{row.label}</span>
+        <span className="h-px flex-1 bg-[var(--border-subtle)]" />
+      </div>
     </Column>
   );
 });

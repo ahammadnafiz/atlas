@@ -1,5 +1,5 @@
 import { useMemo, useState } from "react";
-import { Plus, Search, Trash2, PanelLeftClose, MessageSquare } from "lucide-react";
+import { Plus, Search, Trash2, PanelLeft, MessageSquare } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { timeAgo } from "@/lib/time-ago";
 import { ProviderLogo, hasProviderLogo } from "@/components/provider-logo";
@@ -111,7 +111,7 @@ export function ModelChatSidebar({ onNew }: { onNew: () => void }) {
           className="flex items-center justify-center w-6 h-6 rounded text-text-tertiary hover:text-text-primary hover:bg-bg-hover transition-colors cursor-pointer"
           title="Hide sidebar (⌘⌥K)"
         >
-          <PanelLeftClose size={12} />
+          <PanelLeft size={12} />
         </button>
         <button
           onClick={onNew}

@@ -2,6 +2,7 @@ import { lazy, Suspense, memo, useCallback, useEffect, useMemo, useRef, useState
 import { useChatStore } from "../stores/chat-store";
 import { useDetailPanelStore } from "../stores/detail-panel-store";
 import { appendNextStepsDirective } from "../lib/next-steps";
+import { stripInjectedContext } from "../lib/atlas-context";
 import { agents, ensureAgent, CODEX_PLUGIN_ID, CERSEI_PLUGIN_ID, DEFAULT_PLUGIN_ID, codexStatus } from "../lib/agents-api";
 import { loadCachedAcpModes } from "../lib/acp-modes-cache";
 import { warmAcpModels, otherAcpAgent } from "../lib/warm-acp-models";
@@ -16,6 +17,8 @@ import { sharedMemory } from "@/features/memory/lib/shared-memory-api";
 import { usePaneFind } from "../lib/use-pane-find";
 import { MessageInput } from "./message-input";
 import { SessionSidebar } from "./session-sidebar";
+import { ChatHeader } from "./chat-header";
+import { openNewAgentChat } from "../lib/open-agent-session";
 import { PermissionModal } from "./permission-modal";
 import { ClaudeSetupBanner } from "@/features/claude-setup/components/claude-setup-banner";
 import { NodeSetupBanner } from "@/features/node-setup/components/node-setup-banner";
@@ -52,10 +55,6 @@ const DetailPanel = lazy(() =>
 );
 import {
   Sparkles,
-  User,
-  TerminalSquare,
-  ClipboardList,
-  ListFilter,
   Search,
   Loader2,
   ChevronDown,
@@ -66,9 +65,7 @@ import {
 } from "lucide-react";
 import { AtlasIcon } from "@/components/atlas-icon";
 import { PanelSkeleton } from "@/components/panel-skeleton";
-import { Kbd, KbdGroup } from "@/ui/kbd";
 import { logEvent } from "@/features/log/lib/log";
-import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
 import { cn } from "@/lib/utils";
 import { useProjectStore } from "@/features/project/stores/project-store";
 import { loadCachedAcpModels } from "../lib/acp-models-cache";
@@ -136,11 +133,6 @@ export function ChatPanel({ tabId }: ChatPanelProps) {
   );
   const [bashPanelOpen, setBashPanelOpen] = useState(false);
   const [plansPanelOpen, setPlansPanelOpen] = useState(false);
-  // Zen: collapse each turn to its outcome (prose + footer), hiding the
-  // per-tool marker rows. A filter over the projected row set — never a
-  // render-time condition — so toggling it costs one projection, not a
-  // per-frame branch. Off by default: the marker rows ARE the Codex register.
-  const [zen, setZen] = useState(false);
   // Narrow boolean — changes only when the detail panel opens or closes.
   const detailOpen = useDetailPanelStore((s) => !!s.targets[tabId]);
   // Cmd+F find — scoped to this pane + tab (see usePaneFind).
@@ -166,6 +158,18 @@ export function ChatPanel({ tabId }: ChatPanelProps) {
   // pre-filtered list keeps that pass single-purpose. Identity is preserved in
   // the (overwhelmingly common) "all" case so the projection memo isn't
   // invalidated on every render.
+  // Header label. Prefer the session's own title; fall back to the first user
+  // message (what the history list shows) so a chat that hasn't been titled yet
+  // still reads as itself rather than "New Chat".
+  const headerTitle = useMemo(() => {
+    const t = stripInjectedContext(session?.title ?? "").trim();
+    if (t && t !== "New Chat") return t;
+    const first = stripInjectedContext(session?.firstUserContent ?? "")
+      .replace(/\s+/g, " ")
+      .trim();
+    return first.slice(0, 60) || "New chat";
+  }, [session?.title, session?.firstUserContent]);
+
   const filteredMessages = useMemo(
     () =>
       roleFilter === "all"
@@ -697,115 +701,26 @@ export function ChatPanel({ tabId }: ChatPanelProps) {
       <SessionSidebar tabId={tabId} />
 
       <div className="flex-1 flex flex-col min-w-0">
-        {/* Chat toolbar */}
+        {/* Header — session picker, find, and an overflow menu. */}
         {session.messages.length > 0 && (
-          <div className="flex items-center gap-2 px-3 h-[32px] border-b border-[var(--border-default)] shrink-0">
-            <button
-              onClick={() => setSearchPaletteOpen(true)}
-              className="flex items-center gap-2 h-6.5 pl-2.5 pr-1 rounded-md border border-[var(--border-default)] bg-[var(--bg-elevated)] text-[11px] text-[var(--text-tertiary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] cursor-pointer outline-none transition-colors min-w-[280px]"
-              title="Search messages (⌘F)"
-            >
-              <Search size={11} />
-              <span>Find in chat…</span>
-              <span className="ml-auto">
-                <KbdGroup>
-                  <Kbd className="h-[16px] w-fit min-w-[16px]">⌘</Kbd>
-                  <Kbd className="h-[16px] w-fit min-w-[16px]">F</Kbd>
-                </KbdGroup>
-              </span>
-            </button>
-            <div className="flex-1" />
-            <DropdownMenu.Root>
-              <DropdownMenu.Trigger asChild>
-                <button
-                  className="flex items-center gap-1 px-2 h-6 rounded text-[10px] text-[var(--text-tertiary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] cursor-pointer outline-none transition-colors"
-                  title="Filter messages"
-                >
-                  <ListFilter size={11} />
-                  <span className="capitalize">{roleFilter}</span>
-                </button>
-              </DropdownMenu.Trigger>
-              <DropdownMenu.Portal>
-                <DropdownMenu.Content
-                  align="end"
-                  sideOffset={4}
-                  className="rounded-md border border-[var(--border-default)] bg-[var(--bg-secondary)] shadow-[var(--shadow-overlay)] py-1 min-w-[140px]"
-                  style={{ zIndex: 9999 }}
-                >
-                  {(["all", "user", "assistant"] as const).map((f) => (
-                    <DropdownMenu.Item
-                      key={f}
-                      onClick={() => setRoleFilter(f)}
-                      className={cn(
-                        "flex items-center gap-2 px-3 h-[26px] text-[11px] cursor-default outline-none capitalize",
-                        roleFilter === f
-                          ? "text-[var(--text-primary)] bg-[var(--bg-selected)]"
-                          : "text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]",
-                      )}
-                    >
-                      {f === "user" ? (
-                        <User size={10} />
-                      ) : f === "assistant" ? (
-                        <Sparkles size={10} />
-                      ) : (
-                        <ListFilter size={10} />
-                      )}
-                      <span>{f}</span>
-                    </DropdownMenu.Item>
-                  ))}
-                </DropdownMenu.Content>
-              </DropdownMenu.Portal>
-            </DropdownMenu.Root>
-            <button
-              onClick={() => {
-                setBashPanelOpen((v) => !v);
-                setPlansPanelOpen(false);
-              }}
-              className={cn(
-                "flex items-center gap-1 px-2 h-6 rounded text-[10px] cursor-pointer outline-none transition-colors",
-                bashPanelOpen
-                  ? "text-[var(--text-primary)] bg-[var(--bg-selected)]"
-                  : "text-[var(--text-tertiary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)]",
-              )}
-              title="Toggle bash call history"
-            >
-              <TerminalSquare size={11} />
-              Bash
-            </button>
-            <button
-              onClick={() => {
-                setPlansPanelOpen((v) => !v);
-                setBashPanelOpen(false);
-              }}
-              className={cn(
-                "flex items-center gap-1 px-2 h-6 rounded text-[10px] cursor-pointer outline-none transition-colors",
-                plansPanelOpen
-                  ? "text-[var(--text-primary)] bg-[var(--bg-selected)]"
-                  : "text-[var(--text-tertiary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)]",
-              )}
-              title="Toggle plans history"
-            >
-              <ClipboardList size={11} />
-              Plans
-            </button>
-            <button
-              onClick={() => setZen((v) => !v)}
-              className={cn(
-                "flex items-center gap-1 px-2 h-6 rounded text-[10px] cursor-pointer outline-none transition-colors",
-                zen
-                  ? "text-[var(--text-primary)] bg-[var(--bg-selected)]"
-                  : "text-[var(--text-tertiary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)]",
-              )}
-              title={
-                zen
-                  ? "Show every tool call"
-                  : "Zen — collapse each turn to its result"
-              }
-            >
-              <Sparkles size={11} />
-              Zen
-            </button>
-          </div>
+          <ChatHeader
+            tabId={tabId}
+            title={headerTitle}
+            roleFilter={roleFilter}
+            onRoleFilterChange={setRoleFilter}
+            onOpenSearch={() => setSearchPaletteOpen(true)}
+            bashPanelOpen={bashPanelOpen}
+            onToggleBash={() => {
+              setBashPanelOpen((v) => !v);
+              setPlansPanelOpen(false);
+            }}
+            plansPanelOpen={plansPanelOpen}
+            onTogglePlans={() => {
+              setPlansPanelOpen((v) => !v);
+              setBashPanelOpen(false);
+            }}
+            onNewSession={openNewAgentChat}
+          />
         )}
 
         {session.messages.length === 0 ? (
@@ -825,7 +740,6 @@ export function ChatPanel({ tabId }: ChatPanelProps) {
               messages={filteredMessages}
               isStreaming={session.status === "running"}
               agentType={session.agentType}
-              zen={zen}
               onShowJumpChange={onShowJumpChange}
             />
           </Suspense>

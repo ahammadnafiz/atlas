@@ -4,7 +4,7 @@ import {
   X,
   MessageSquare,
   Search,
-  PanelLeftClose,
+  PanelLeft,
   Plus,
 } from "lucide-react";
 import { listen } from "@tauri-apps/api/event";
@@ -69,9 +69,34 @@ interface SidebarItem {
 
 interface SessionSidebarProps {
   tabId: string;
+  /**
+   * Where this list is being rendered.
+   *
+   * `"sidebar"` (default) — the resizable left column inside the chat panel,
+   * gated on `chatSidebar.visible`.
+   *
+   * `"dropdown"` — the body of the header's session picker. Same data, same
+   * handlers, different chrome: no fixed width, no resize handle, no border,
+   * and NOT gated on the sidebar's visibility (the picker exists precisely so
+   * history is reachable with the sidebar closed).
+   *
+   * This is a variant rather than a second component on purpose. Building the
+   * list means merging live tabs with three agents' on-disk listings and
+   * suppressing twins, and OPENING a row is ~180 lines of resume logic with
+   * several hard-won edge cases (orphan tabs, Codex rows with no JSONL, stale
+   * clicks). Duplicating either would guarantee they drift.
+   */
+  variant?: "sidebar" | "dropdown";
+  /** Called after a row is opened — lets the picker close itself. */
+  onOpened?: () => void;
 }
 
-export function SessionSidebar({ tabId }: SessionSidebarProps) {
+export function SessionSidebar({
+  tabId,
+  variant = "sidebar",
+  onOpened,
+}: SessionSidebarProps) {
+  const asDropdown = variant === "dropdown";
   const queryClient = useQueryClient();
   const project = useProjectStore.use.currentProject();
   // `currentProject` is a legacy field that's transiently null during boot and
@@ -841,7 +866,7 @@ export function SessionSidebar({ tabId }: SessionSidebarProps) {
     [chatSidebar.width, setChatSidebarWidth]
   );
 
-  if (!chatSidebar.visible) {
+  if (!asDropdown && !chatSidebar.visible) {
     return null;
   }
 
@@ -862,11 +887,25 @@ export function SessionSidebar({ tabId }: SessionSidebarProps) {
   return (
     <div
       ref={containerRef}
-      style={{ width: chatSidebar.width }}
-      className="relative shrink-0 h-full flex flex-col border-r border-[var(--border-default)] bg-[var(--bg-sidebar)]"
+      style={asDropdown ? undefined : { width: chatSidebar.width }}
+      className={cn(
+        "relative flex flex-col",
+        asDropdown
+          ? "h-[min(420px,60vh)] w-[340px]"
+          : "shrink-0 h-full border-r border-[var(--border-default)] bg-[var(--bg-sidebar)]",
+      )}
     >
       {/* Search — full-width row matching the GitHub panel's search */}
-      <div className="flex items-center gap-1.5 h-[32px] shrink-0 border-b border-border-default bg-bg-primary px-3">
+      <div
+        className={cn(
+          "flex items-center gap-1.5 h-[32px] shrink-0 px-3",
+          // The dropdown sits on a blurred, translucent panel — an opaque fill
+          // here would punch a solid rectangle through the blur.
+          asDropdown
+            ? "border-b border-white/5"
+            : "border-b border-border-default bg-bg-primary",
+        )}
+      >
         <Search size={11} className="text-text-tertiary shrink-0" />
         <input
           value={search}
@@ -896,9 +935,12 @@ export function SessionSidebar({ tabId }: SessionSidebarProps) {
           return (
             <div
               key={`${item.kind}-${item.id}`}
-              onClick={() =>
-                item.kind === "agent" ? handleOpenAgent(item) : undefined
-              }
+              onClick={() => {
+                if (item.kind !== "agent") return;
+                handleOpenAgent(item);
+                // Dismiss the picker; the sidebar variant stays put.
+                onOpened?.();
+              }}
               className={cn(
                 "group relative w-full text-left px-3 py-3 transition-colors flex flex-col gap-1 cursor-pointer select-none",
                 active
@@ -976,13 +1018,22 @@ export function SessionSidebar({ tabId }: SessionSidebarProps) {
       {/* Bottom mini-bar. Height matches the left panel's collapsed Git
           strip (a 28px button + its 1px top border = 29px) so this
           footer's top border lines up horizontally with the Git strip's. */}
-      <div className="flex items-center justify-between px-1.5 h-[29px] border-t border-[var(--border-default)] bg-[var(--bg-sidebar)]">
+      <div
+        className={cn(
+          "flex items-center justify-between px-1.5 h-[29px]",
+          // Same rule as the search row above: an opaque fill would punch a
+          // solid strip through the picker's blurred panel.
+          asDropdown
+            ? "border-t border-white/5"
+            : "border-t border-[var(--border-default)] bg-[var(--bg-sidebar)]",
+        )}
+      >
         <button
           onClick={toggleChatSidebar}
           className="flex items-center justify-center w-6 h-6 rounded text-[var(--text-tertiary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors cursor-pointer"
           title="Hide sidebar (⌘⌥J)"
         >
-          <PanelLeftClose size={12} />
+          <PanelLeft size={12} />
         </button>
         <button
           onClick={handleNewChat}
@@ -993,12 +1044,15 @@ export function SessionSidebar({ tabId }: SessionSidebarProps) {
         </button>
       </div>
 
-      {/* Resize handle — subtle, matches main panel handles */}
-      <div
-        onMouseDown={onResizeStart}
-        className="absolute top-0 -right-px w-px h-full bg-border-default hover:bg-accent transition-colors cursor-col-resize"
-        title="Drag to resize"
-      />
+      {/* Resize handle — subtle, matches main panel handles. The dropdown has
+          its own fixed size, so it has nothing to resize. */}
+      {!asDropdown && (
+        <div
+          onMouseDown={onResizeStart}
+          className="absolute top-0 -right-px w-px h-full bg-border-default hover:bg-accent transition-colors cursor-col-resize"
+          title="Drag to resize"
+        />
+      )}
     </div>
   );
 }
