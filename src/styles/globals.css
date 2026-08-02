@@ -1270,3 +1270,17 @@
   50% { opacity: 1; }
 }
 .atlas-marker-running { animation: atlas-marker-shimmer 1.4s ease-in-out infinite; }
+
+/* Markdown that has not finished parsing yet — see `CachedMarkdown`.
+   Rendered as the raw source at the same size as the formatted result, so an
+   unparsed block occupies roughly its final height instead of collapsing to
+   zero. A screen of zero-height blocks is what made the transcript flash blank
+   at the moment its window grew. */
+.atlas-md-pending {
+  margin: 0;
+  font: inherit;
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-wrap: anywhere;
+  color: inherit;
+}

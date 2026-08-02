@@ -28,9 +28,10 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState, type RefObject } from "react";
 
-/** How close to the top (px) the window grows at. Generous: growing early is
- *  invisible, growing late is a stall the reader watches. */
-const GROW_MARGIN = 800;
+/** How close to the top (px) the window grows at. Generous on purpose: growing
+ *  early happens off-screen and is invisible, growing late is a hitch the reader
+ *  is looking straight at. */
+const GROW_MARGIN = 1400;
 
 /** Slack (px) within which "there is more below" reads as "you are at the end". */
 const AT_END = 80;
@@ -104,8 +105,20 @@ export function useTranscriptScroll({
     // Grow upward well before the reader reaches the top. Capture the invariant
     // first: prepending rows changes `scrollHeight` but leaves the distance from
     // the bottom alone, so that is what the caller restores against.
-    if (growable.current && top <= GROW_MARGIN) {
-      growAnchor.current = scrollHeight - top;
+    //
+    // Read `scrollHeight` LIVE here rather than trusting the cache. Everywhere
+    // else the cached value is fine — being a frame stale only misjudges a fade
+    // — but this number is what the scroll position is rebuilt from, and a stale
+    // one lands the reader somewhere they weren't. Growing is rare, so the one
+    // forced layout costs nothing measurable.
+    //
+    // `growAnchor === null` also acts as "no grow in flight". Without it a fast
+    // scroll fires grow again on the next frame — before React has committed the
+    // previous one — each call overwriting the anchor with a position measured
+    // against rows that are about to change, so the re-anchor restores against a
+    // number that was never true.
+    if (growable.current && top <= GROW_MARGIN && growAnchor.current === null) {
+      growAnchor.current = el.scrollHeight - top;
       grow.current();
     }
 

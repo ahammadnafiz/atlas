@@ -287,17 +287,39 @@ export function CachedMarkdown({ source, className, unstyled }: CachedMarkdownPr
     });
   }, [html]);
 
+  const cls = cn(
+    unstyled
+      ? "select-text"
+      : "prose-chat text-[var(--text-primary)] leading-relaxed break-words select-text",
+    className,
+  );
+
+  // Not yet parsed (a large block waiting on the worker) — render the RAW
+  // SOURCE rather than nothing.
+  //
+  // This matters far more than it looks. Rendering `__html: ""` gives an empty
+  // element of ZERO height, so a screen's worth of unparsed messages collapses
+  // the document to nothing; in the windowed transcript that showed up as the
+  // whole viewport going blank at the moment the window grew, and it persisted
+  // until the worker replied — up to the 3s watchdog if the worker was cold.
+  //
+  // The placeholder is the same text at the same size, so the height is about
+  // right and the reader can read it immediately; it swaps to formatted HTML
+  // when the parse lands. Unformatted beats absent, exactly as with rows.
+  if (html === null) {
+    return (
+      <div ref={ref} className={cls}>
+        <pre className="atlas-md-pending">{source}</pre>
+      </div>
+    );
+  }
+
   return (
     <div
       ref={ref}
-      className={cn(
-        unstyled
-          ? "select-text"
-          : "prose-chat text-[var(--text-primary)] leading-relaxed break-words select-text",
-        className,
-      )}
+      className={cls}
       // eslint-disable-next-line react/no-danger
-      dangerouslySetInnerHTML={{ __html: html ?? "" }}
+      dangerouslySetInnerHTML={{ __html: html }}
     />
   );
 }

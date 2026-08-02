@@ -54,14 +54,28 @@ import {
 } from "./transcript-rows";
 
 /**
- * How many rows render before the window has to grow.
+ * How many rows are added each time the window grows.
  *
- * Small on purpose, and sized in ROWS not turns: a tool-heavy turn is a dozen
- * 24px markers, so 80 rows is roughly a handful of turns — enough to overfill a
- * viewport that holds about thirty, without paying to build history the reader
- * has not asked for. The rest arrive on scroll, well ahead of the fold.
+ * Sized in ROWS, not turns: a tool-heavy turn is a dozen 24px markers, so 40
+ * rows is a couple of turns — enough to stay ahead of the reader, small enough
+ * that mounting them (and parsing whatever markdown they carry) is not a hitch.
+ * Bursting 80 at once was visibly worse even after the blank was fixed.
  */
-const WINDOW_CHUNK = 80;
+const WINDOW_CHUNK = 40;
+
+/** The window starts larger than it grows: the first paint must overfill the
+ *  viewport or the reader lands on a short document and can't scroll. */
+const WINDOW_INITIAL = 80;
+
+/** Rows added per idle slice while filling the window in the background.
+ *  Larger than the scroll-triggered chunk — idle time is the cheap time. */
+const IDLE_CHUNK = 120;
+
+/** Above this many rows the window is filled on demand rather than eagerly.
+ *  Mounting tens of thousands of rows to avoid a rare prepend is a bad trade;
+ *  below it, a whole thread is comparable to what the Session timeline already
+ *  renders happily. */
+const MAX_IDLE_FILL = 4000;
 
 function switchable(agentType: string | undefined): SwitchableAgent {
   return agentType === "codex" || agentType === "cersei" ? agentType : "claude-code";
@@ -170,11 +184,15 @@ export const Transcript = forwardRef<TranscriptHandle, TranscriptProps>(
     // slide the window forward as the agent streams, dropping rows off the top
     // and shifting the content under a reader who is scrolled up in history.
     const [startIndex, setStartIndex] = useState(() =>
-      Math.max(0, rows.length - WINDOW_CHUNK),
+      Math.max(0, rows.length - WINDOW_INITIAL),
     );
 
-    const visible = useMemo(() => rows.slice(startIndex), [rows, startIndex]);
-    const canGrow = startIndex > 0;
+    // Clamp: a projection that SHRINKS (zen toggle, role filter, session reset)
+    // can leave `startIndex` past the end, and `slice` past the end returns []
+    // — an empty transcript with no error anywhere.
+    const safeStart = Math.min(startIndex, Math.max(0, rows.length - 1));
+    const visible = useMemo(() => rows.slice(safeStart), [rows, safeStart]);
+    const canGrow = safeStart > 0;
 
     const onGrow = useCallback(() => {
       setStartIndex((i) => Math.max(0, i - WINDOW_CHUNK));
@@ -186,6 +204,62 @@ export const Transcript = forwardRef<TranscriptHandle, TranscriptProps>(
       canGrow,
       onGrow,
     });
+
+    // ── Fill the window during IDLE, not during scroll ───────────────────
+    //
+    // This is the difference between this list and the Session timeline, and it
+    // is why the timeline never flickers. The timeline only ever APPENDS, below
+    // the fold, where nothing the reader is looking at moves. A chat window
+    // grows at the top, so every growth PREPENDS — the document gets taller
+    // above the viewport and the scroll position has to be rebuilt to
+    // compensate. Doing that on the frame the reader is mid-flick is what
+    // produced the blanks: for one frame the rows exist but the scroll position
+    // still refers to the old geometry.
+    //
+    // So don't grow on scroll if we can avoid it. Expand the window in the gaps
+    // between frames instead, until the whole thread is mounted; by the time the
+    // reader scrolls up, the rows are already there and no prepend happens at
+    // all. `requestIdleCallback` yields to scrolling by construction, so this
+    // cannot compete with the gesture. The scroll-triggered growth stays as a
+    // fallback for a reader who outruns it.
+    useEffect(() => {
+      if (startIndex === 0) return;
+      // Very long threads keep the on-demand path: mounting tens of thousands of
+      // rows to save a rare prepend is a bad trade.
+      if (rows.length > MAX_IDLE_FILL) return;
+
+      const w = window as Window & {
+        requestIdleCallback?: (cb: () => void, o?: { timeout?: number }) => number;
+        cancelIdleCallback?: (h: number) => void;
+      };
+      let idle: number | null = null;
+      let timer: number | null = null;
+
+      const step = () => {
+        idle = null;
+        timer = null;
+        // A scroll-triggered grow is already in flight — let it land first, or
+        // the two overwrite each other's anchor.
+        if (growAnchor.current !== null) return;
+        const el = scrollRef.current;
+        if (el) growAnchor.current = el.scrollHeight - el.scrollTop;
+        setStartIndex((i) => Math.max(0, i - IDLE_CHUNK));
+      };
+
+      if (typeof w.requestIdleCallback === "function") {
+        idle = w.requestIdleCallback(step, { timeout: 400 });
+      } else {
+        timer = window.setTimeout(step, 100);
+      }
+      return () => {
+        if (idle !== null && typeof w.cancelIdleCallback === "function") {
+          w.cancelIdleCallback(idle);
+        }
+        if (timer !== null) window.clearTimeout(timer);
+      };
+      // Re-runs on each `startIndex` change, which is what drives the loop
+      // forward one chunk per idle slice until the window covers everything.
+    }, [startIndex, rows.length, growAnchor]);
     // Re-anchor after growing upward. Prepended rows push everything below them
     // down by their combined height, so a reader who was mid-history would jump.
     // Distance from the BOTTOM is the invariant a prepend leaves untouched, so
@@ -229,7 +303,7 @@ export const Transcript = forwardRef<TranscriptHandle, TranscriptProps>(
           break;
         }
       }
-      const start = Math.max(0, Math.min(lastUser, rows.length - WINDOW_CHUNK));
+      const start = Math.max(0, Math.min(lastUser, rows.length - WINDOW_INITIAL));
       setStartIndex(start);
       pendingAnchorRef.current = lastUser >= 0 ? rows[lastUser].id : null;
     }, [cacheKey, rows]);
