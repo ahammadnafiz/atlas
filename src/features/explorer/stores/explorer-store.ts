@@ -364,13 +364,44 @@ function reconcileChildren(
   });
 }
 
+/**
+ * Cache keyed by the tree array's identity.
+ *
+ * Immer gives the store structural sharing: `tree` only gets a new reference
+ * when something actually mutated, so a hit here means "nothing changed" and the
+ * previous flatten is still exactly right. This is the frontend version of what
+ * Zed's project panel does with `visible_entries` — keep one derived list and
+ * rebuild it on change, never per render or per mount.
+ *
+ * Weak, so a discarded tree (project switch) is collected with its flatten.
+ */
+const flatCache = new WeakMap<TreeNode[], TreeNode[]>();
+
+/**
+ * Depth-first pre-order flatten of the expanded tree.
+ *
+ * Iterative rather than recursive: the old version did
+ * `result.push(...flattenTree(children))`, which allocates an array per
+ * directory and then spreads it — and spreading a large subtree passes every
+ * element as an argument, which is both slow and stack-limited on a deep or wide
+ * expansion (`node_modules` expanded is enough to matter).
+ */
 export function flattenTree(nodes: TreeNode[]): TreeNode[] {
+  const cached = flatCache.get(nodes);
+  if (cached) return cached;
+
   const result: TreeNode[] = [];
-  for (const node of nodes) {
+  // Reverse-push so siblings pop back off in their original order.
+  const stack: TreeNode[] = [];
+  for (let i = nodes.length - 1; i >= 0; i--) stack.push(nodes[i]);
+  while (stack.length > 0) {
+    const node = stack.pop()!;
     result.push(node);
     if (node.expanded && node.children) {
-      result.push(...flattenTree(node.children));
+      for (let i = node.children.length - 1; i >= 0; i--) stack.push(node.children[i]);
     }
   }
+
+  flatCache.set(nodes, result);
   return result;
 }
