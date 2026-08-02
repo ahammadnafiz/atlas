@@ -170,6 +170,18 @@ function parseLarge(source: string): Promise<string> {
 interface CachedMarkdownProps {
   source: string;
   className?: string;
+  /**
+   * Drop the default `prose-chat` typography classes and style the output
+   * purely from `className`.
+   *
+   * The new transcript needs this: its heights are PREDICTED from the metrics
+   * pinned in `.atlas-prose`, and `prose-chat`'s element rules (`.prose-chat p`,
+   * specificity 0,1,1) would win over `.atlas-prose > *` (0,1,0) and silently
+   * change the real margins out from under the prediction. Opting out is
+   * cleaner than escalating specificity in a fight the two stylesheets would
+   * keep having.
+   */
+  unstyled?: boolean;
 }
 
 /**
@@ -179,7 +191,7 @@ interface CachedMarkdownProps {
  * the first parse to a `requestIdleCallback` so initial mount paint
  * isn't blocked; subsequent remounts hit the cache and skip the deferral.
  */
-export function CachedMarkdown({ source, className }: CachedMarkdownProps) {
+export function CachedMarkdown({ source, className, unstyled }: CachedMarkdownProps) {
   const [html, setHtml] = useState<string | null>(() => {
     const hit = cacheGet(source);
     if (hit !== undefined) return hit;
@@ -279,7 +291,9 @@ export function CachedMarkdown({ source, className }: CachedMarkdownProps) {
     <div
       ref={ref}
       className={cn(
-        "prose-chat text-[var(--text-primary)] leading-relaxed break-words select-text",
+        unstyled
+          ? "select-text"
+          : "prose-chat text-[var(--text-primary)] leading-relaxed break-words select-text",
         className,
       )}
       // eslint-disable-next-line react/no-danger

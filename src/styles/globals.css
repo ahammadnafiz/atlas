@@ -1127,3 +1127,146 @@
   }
 }
 
+
+/* ── New transcript (agent chat rework) ─────────────────────────────────────
+   EVERY value in this block is mirrored by a constant in
+   `src/features/chat/lib/row-height.ts`. They are a contract: row heights are
+   predicted from these numbers before layout, so the virtualizer never measures
+   and never corrects. Change one, change the other — in the same commit.
+   `assert-height.ts` warns in dev when they drift.
+
+   Two rules do the heavy lifting:
+     - every block element has an explicit `line-height` in px (never a unitless
+       `leading-*`, which resolves against font-size and rounds unpredictably);
+     - code blocks DO NOT WRAP. `white-space: pre` + horizontal scroll makes a
+       fenced block's height a function of its line count alone, independent of
+       the container width. Wrapping code is what made prose height
+       width-dependent and unpredictable.                                     */
+
+.atlas-prose {
+  font-size: 14px;
+  line-height: 22px;
+  color: var(--text-primary);
+  word-break: break-word;
+  overflow-wrap: anywhere;
+}
+/* Uniform 8px inter-block gap via margin-top only — no bottom margins, so
+   there is no margin collapsing to reason about (M.blockGap). */
+.atlas-prose > * { margin: 8px 0 0; }
+.atlas-prose > :first-child { margin-top: 0; }
+
+.atlas-prose p { line-height: 22px; }
+.atlas-prose h1 { font-size: 16px; line-height: 24px; font-weight: 600; margin-top: 12px; }
+.atlas-prose h2,
+.atlas-prose h3,
+.atlas-prose h4,
+.atlas-prose h5,
+.atlas-prose h6 { font-size: 14px; line-height: 20px; font-weight: 600; margin-top: 12px; }
+
+.atlas-prose ul { list-style-type: disc; padding-left: 20px; }
+.atlas-prose ol { list-style-type: decimal; padding-left: 20px; }
+.atlas-prose li { line-height: 22px; }
+.atlas-prose li + li { margin-top: 2px; }
+
+.atlas-prose blockquote {
+  border-left: 2px solid var(--border-default);
+  padding: 4px 0 4px 12px;
+  color: var(--text-secondary);
+}
+
+.atlas-prose pre {
+  position: relative;
+  border: 1px solid var(--border-default);
+  background: var(--bg-secondary);
+  border-radius: 6px;
+  padding: 12px;
+  font-size: 12px;
+  line-height: 18px;
+  /* Width-independent height — the whole point. */
+  white-space: pre;
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+.atlas-prose pre code {
+  padding: 0;
+  background: transparent;
+  border-radius: 0;
+  color: inherit;
+  font-size: inherit;
+  line-height: inherit;
+  white-space: inherit;
+}
+.atlas-prose code {
+  padding: 0.125rem 0.25rem;
+  border-radius: 4px;
+  background: var(--bg-elevated);
+  color: var(--text-primary);
+  font-size: 12px;
+  font-family: var(--font-mono);
+}
+
+.atlas-prose hr {
+  border: none;
+  border-top: 1px solid var(--border-default);
+  margin: 6px 0;
+}
+
+.atlas-prose a { color: var(--accent-primary); text-decoration: underline; }
+.atlas-prose a:hover { opacity: 0.8; }
+.atlas-prose strong { font-weight: 600; }
+.atlas-prose em { font-style: italic; }
+
+/* Tables are capped and scroll internally so a wide/tall table can never blow
+   a row's predicted height (M.tableHeader / M.tableRow / M.tableMaxRows). */
+.atlas-prose table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+  border: 1px solid var(--border-default);
+  border-radius: 6px;
+  display: block;
+  max-height: 381px; /* tableHeader + tableMaxRows * tableRow */
+  overflow: auto;
+}
+.atlas-prose thead { background: var(--bg-elevated); }
+.atlas-prose th {
+  height: 33px;
+  padding: 0 12px;
+  text-align: left;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  border-bottom: 1px solid var(--border-default);
+}
+.atlas-prose td {
+  height: 29px;
+  padding: 0 12px;
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+/* Row containment scopes reflow + style recalc to the row.
+   `layout style` only — deliberately NOT `paint` (it would clip the hover
+   action bar that sits at a row's top edge), and deliberately NOT
+   `content-visibility: auto`: that blanks the viewport on fast scrolls, which
+   the timeline already learned the hard way (see the `.atlas-entry` note).
+   Also no `will-change`/`translateZ` — promoting hundreds of virtualized rows
+   to layers makes WKWebView worse, not better. */
+.atlas-row { contain: layout style; }
+
+/* Marker rows: one line, muted, never wraps. */
+.atlas-marker {
+  height: 24px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+/* Running-state shimmer for in-flight markers. Opacity only — no transform, no
+   layout, so it cannot affect a predicted height. */
+@keyframes atlas-marker-shimmer {
+  0%, 100% { opacity: 0.45; }
+  50% { opacity: 1; }
+}
+.atlas-marker-running { animation: atlas-marker-shimmer 1.4s ease-in-out infinite; }

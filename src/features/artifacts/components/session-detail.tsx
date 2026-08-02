@@ -13,7 +13,6 @@ import {
   Loader2,
   Search,
   Sparkles,
-  Terminal,
   TriangleAlert,
   User,
   X,
@@ -1035,38 +1034,54 @@ function Node({
   status: TimelineEntry["toolStatus"];
 }) {
   const failed = kind === "tool_call" && status === "failed";
+
+  // A tool call is a solid dot — no glyph and no outline. It marks a position on
+  // the rail and nothing more; the row beside it carries the meaning. Every
+  // other kind keeps its ring, which is what makes turns stand out from the
+  // punctuation between them.
+  const bare = kind === "tool_call";
+
   const tone =
     kind === "checkpoint"
       ? "border-[var(--capture-live)]/35 bg-[var(--capture-live)]/10 text-[var(--capture-live)]"
       : failed
-        ? "border-[var(--status-error)]/40 text-[var(--status-error)]"
-        : kind === "prompt"
-          ? "border-[var(--border-strong)] bg-[var(--bg-elevated-2)] text-[var(--text-secondary)]"
-          : kind === "response"
-            ? "border-[var(--border-strong)] bg-[var(--bg-elevated-2)] text-[var(--text-secondary)]"
-            : "border-[var(--border-default)] bg-[var(--bg-raised)] text-[var(--text-tertiary)]";
+        ? // Still legible as a failure without a ring: the fill carries it.
+          "bg-[var(--status-error)]/70"
+        : bare
+          ? "bg-[var(--border-strong)]"
+          : // Prompt + response rings at half strength. At full `--border-strong`
+            // the outline competed with the glyph inside it, so the rail read as
+            // a column of buttons rather than a quiet index of who did what.
+            kind === "prompt"
+            ? "border-[var(--border-strong)]/50 bg-[var(--bg-elevated-2)] text-[var(--text-secondary)]"
+            : kind === "response"
+              ? "border-[var(--border-strong)]/50 bg-[var(--bg-elevated-2)] text-[var(--text-secondary)]"
+              : "border-[var(--border-default)] bg-[var(--bg-raised)] text-[var(--text-tertiary)]";
 
   // Tool calls and thinking stay small. They are punctuation between turns, not
   // turns themselves, and giving them an avatar-sized marker would flatten the
-  // distinction the rail exists to draw.
+  // distinction the rail exists to draw. A bare dot goes smaller still — at 20px
+  // an empty circle reads as a missing icon rather than as a mark.
   const minor = kind === "tool_call" || kind === "thinking";
 
   return (
     <span
       className={cn(
-        "relative z-10 flex shrink-0 items-center justify-center rounded-full border",
-        minor ? "size-5" : "size-8",
+        "relative z-10 flex shrink-0 items-center justify-center rounded-full",
+        !bare && "border",
+        bare ? "size-2" : minor ? "size-5" : "size-8",
         tone,
       )}
-      style={{ marginTop: minor ? NODE_CENTRE - 10 : 0 }}
+      style={{ marginTop: bare ? NODE_CENTRE - 4 : minor ? NODE_CENTRE - 10 : 0 }}
     >
+      {/* Tool calls render a bare ring. A terminal glyph at 10px added ink
+          without adding information — the row beside it already says what ran —
+          and the empty ring still marks the position on the rail. */}
       {kind === "prompt" ? (
         <User size={15} strokeWidth={1.6} />
       ) : kind === "checkpoint" ? (
         <Check size={15} strokeWidth={2} />
-      ) : kind === "tool_call" ? (
-        <Terminal size={10} strokeWidth={1.7} />
-      ) : kind === "thinking" ? (
+      ) : kind === "tool_call" ? null : kind === "thinking" ? (
         <Brain size={10} strokeWidth={1.7} />
       ) : agent ? (
         <AgentGlyph agent={agent} size={16} />

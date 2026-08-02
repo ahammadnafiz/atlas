@@ -1,0 +1,445 @@
+// The transcript: a windowed list of real DOM rows.
+//
+// **Not virtualized, on purpose.** A virtualizer was tried here first and lost
+// to the Session timeline on the only test that matters — scrolling it — despite
+// the timeline rendering far heavier rows. Two reasons, both measured rather
+// than reasoned:
+//
+//  1. **Blanking.** Unmounting offscreen rows means a fast flick outruns React's
+//     ability to mount the ones arriving, and the reader watches empty space.
+//     Raising overscan only moves the speed at which it happens. A row that is
+//     already in the DOM cannot blank.
+//  2. **Scroll cost.** A virtualizer has to know where everything is on every
+//     scroll. The windowed approach asks nothing on scroll: the browser scrolls
+//     a plain document, which is the operation it is most optimized for.
+//
+// So this mirrors `session-detail.tsx`: render a window of real rows and grow it
+// as the reader approaches its edge, with `use-transcript-scroll.ts` keeping the
+// scroll loop free of forced layout.
+//
+// The window grows UPWARD (chat is read newest-first), which the timeline never
+// has to handle — see the re-anchoring in `useLayoutEffect` below.
+//
+// Because rows are real DOM, nothing here predicts heights. The whole
+// predicted-height apparatus the virtualized version needed — a height
+// function, canvas text measurement, a dev drift assertion — is gone.
+
+import {
+  forwardRef,
+  useCallback,
+  useEffect,
+  useImperativeHandle,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import { Sparkles } from "lucide-react";
+import type { ChatMessage } from "@/types/agent";
+import { AGENT_LABEL, type SwitchableAgent } from "@/types/agent";
+import { projectRows, RowKind, type Row } from "../lib/turn-rows";
+import { useTranscriptScroll } from "../lib/use-transcript-scroll";
+import { useChatStore } from "../stores/chat-store";
+import { saveThreadToKb, drawDiagram, canDrawDiagram } from "../lib/turn-actions";
+import { cn } from "@/lib/utils";
+import {
+  UserRowView,
+  ProseRowView,
+  ThinkingRowView,
+  MarkerRowView,
+  MarkerGroupRowView,
+  SeparatorRowView,
+  TurnFooterRowView,
+  NoticeRowView,
+} from "./transcript-rows";
+
+/**
+ * How many rows render before the window has to grow.
+ *
+ * Small on purpose, and sized in ROWS not turns: a tool-heavy turn is a dozen
+ * 24px markers, so 80 rows is roughly a handful of turns — enough to overfill a
+ * viewport that holds about thirty, without paying to build history the reader
+ * has not asked for. The rest arrive on scroll, well ahead of the fold.
+ */
+const WINDOW_CHUNK = 80;
+
+function switchable(agentType: string | undefined): SwitchableAgent {
+  return agentType === "codex" || agentType === "cersei" ? agentType : "claude-code";
+}
+
+export interface TranscriptHandle {
+  scrollToBottom: () => void;
+  scrollToMessage: (messageIndex: number) => void;
+}
+
+interface TranscriptProps {
+  tabId: string;
+  acpSessionId: string;
+  messages: ChatMessage[];
+  isStreaming: boolean;
+  agentType?: string;
+  /** Hide markers + thinking, collapsing each turn to its outcome. */
+  zen: boolean;
+  onShowJumpChange?: (visible: boolean, newCount?: number) => void;
+}
+
+/** Per (tab, session) scroll position, so switching away and back returns the
+ *  reader where they were. Stores the window start too — a scrollTop means
+ *  nothing without the window it was measured in. */
+interface Saved {
+  startIndex: number;
+  scrollTop: number;
+  atEnd: boolean;
+}
+const savedScroll = new Map<string, Saved>();
+
+/** Shown while the turn is running but nothing has been emitted yet. */
+function WorkingIndicator() {
+  return (
+    <div className="mx-auto flex w-full max-w-[760px] items-center gap-2 px-6 py-3">
+      <Sparkles size={13} className="animate-pulse text-[var(--text-secondary)]" />
+      <span className="text-[12px] text-[var(--text-secondary)]">Thinking</span>
+      <span className="flex items-center gap-0.5">
+        {[0, 1, 2].map((i) => (
+          <span
+            key={i}
+            className="h-1 w-1 animate-bounce rounded-full bg-[var(--text-tertiary)]"
+            style={{ animationDelay: `${i * 150}ms` }}
+          />
+        ))}
+      </span>
+    </div>
+  );
+}
+
+export const Transcript = forwardRef<TranscriptHandle, TranscriptProps>(
+  function Transcript(
+    { tabId, acpSessionId, messages, isStreaming, agentType, zen, onShowJumpChange },
+    ref,
+  ) {
+    const scrollRef = useRef<HTMLDivElement>(null);
+    const contentRef = useRef<HTMLDivElement>(null);
+    const cacheKey = `${tabId}:${acpSessionId}`;
+    const agentLabel = AGENT_LABEL[switchable(agentType)];
+
+    const [expanded, setExpanded] = useState<ReadonlySet<string>>(() => new Set());
+    const [expandedTurns, setExpandedTurns] = useState<ReadonlySet<string>>(
+      () => new Set(),
+    );
+
+    const toggleExpand = useCallback((id: string) => {
+      setExpanded((prev) => {
+        const next = new Set(prev);
+        if (next.has(id)) next.delete(id);
+        else next.add(id);
+        return next;
+      });
+    }, []);
+
+    const expandTurn = useCallback((turnId: string) => {
+      setExpandedTurns((prev) => {
+        const next = new Set(prev);
+        next.add(turnId);
+        return next;
+      });
+    }, []);
+
+    const projection = useMemo(
+      () => projectRows(messages, { expanded, streaming: isStreaming, zen }),
+      [messages, expanded, isStreaming, zen],
+    );
+
+    // Zen with per-turn opt-out: re-project un-zenned for turns the reader
+    // expanded. Only runs when that set is non-empty.
+    const rows: Row[] = useMemo(() => {
+      if (!zen || expandedTurns.size === 0) return projection.rows;
+      const full = projectRows(messages, { expanded, streaming: isStreaming, zen: false });
+      const out: Row[] = [];
+      for (const r of projection.rows) {
+        if (!expandedTurns.has(r.turnId)) out.push(r);
+      }
+      for (const r of full.rows) {
+        if (expandedTurns.has(r.turnId)) out.push(r);
+      }
+      const order = new Map(projection.turns.map((t, i) => [t.id, i]));
+      return out.sort((a, b) => (order.get(a.turnId) ?? 0) - (order.get(b.turnId) ?? 0));
+    }, [zen, expandedTurns, projection, messages, expanded, isStreaming]);
+
+    // ── The window ───────────────────────────────────────────────────────
+    // Anchored by START INDEX, not by a count back from the end. A count would
+    // slide the window forward as the agent streams, dropping rows off the top
+    // and shifting the content under a reader who is scrolled up in history.
+    const [startIndex, setStartIndex] = useState(() =>
+      Math.max(0, rows.length - WINDOW_CHUNK),
+    );
+
+    const visible = useMemo(() => rows.slice(startIndex), [rows, startIndex]);
+    const canGrow = startIndex > 0;
+
+    const onGrow = useCallback(() => {
+      setStartIndex((i) => Math.max(0, i - WINDOW_CHUNK));
+    }, []);
+
+    const { more, onScroll, invalidate, atEndRef, growAnchor } = useTranscriptScroll({
+      scrollRef,
+      contentRef,
+      canGrow,
+      onGrow,
+    });
+    // Re-anchor after growing upward. Prepended rows push everything below them
+    // down by their combined height, so a reader who was mid-history would jump.
+    // Distance from the BOTTOM is the invariant a prepend leaves untouched, so
+    // restoring against it puts them back exactly. Layout effect, so the
+    // correction lands in the same frame and is never seen.
+    useLayoutEffect(() => {
+      const el = scrollRef.current;
+      const anchor = growAnchor.current;
+      if (!el || anchor === null) return;
+      el.scrollTop = el.scrollHeight - anchor;
+      growAnchor.current = null;
+      invalidate();
+    }, [startIndex, growAnchor, invalidate]);
+
+    // ── Session switch: reset the window, land on the last user turn ─────
+    /** A row id to bring to the top of the viewport once it has rendered. */
+    const pendingAnchorRef = useRef<string | null>(null);
+    const settledFor = useRef<string | null>(null);
+    useLayoutEffect(() => {
+      if (settledFor.current === cacheKey) return;
+      if (rows.length === 0) return;
+      settledFor.current = cacheKey;
+
+      const saved = savedScroll.get(cacheKey);
+      if (saved && !saved.atEnd) {
+        setStartIndex(saved.startIndex);
+        requestAnimationFrame(() => {
+          const el = scrollRef.current;
+          if (el) el.scrollTop = saved.scrollTop;
+        });
+        return;
+      }
+
+      // Reopening lands on the LAST USER TURN, not the absolute bottom: the
+      // reader needs to see what they asked with the answer starting below it.
+      // Widen the window if that turn falls outside it.
+      let lastUser = -1;
+      for (let i = rows.length - 1; i >= 0; i--) {
+        if (rows[i].kind === RowKind.User) {
+          lastUser = i;
+          break;
+        }
+      }
+      const start = Math.max(0, Math.min(lastUser, rows.length - WINDOW_CHUNK));
+      setStartIndex(start);
+      pendingAnchorRef.current = lastUser >= 0 ? rows[lastUser].id : null;
+    }, [cacheKey, rows]);
+
+    useLayoutEffect(() => {
+      const id = pendingAnchorRef.current;
+      if (!id) return;
+      const el = scrollRef.current;
+      const node = el?.querySelector<HTMLElement>(`[data-row-id="${CSS.escape(id)}"]`);
+      if (!el || !node) return;
+      pendingAnchorRef.current = null;
+      // `offsetTop` is measured from the positioned ancestor, so it is
+      // independent of the current scroll position.
+      el.scrollTop = Math.max(0, node.offsetTop - 24);
+      invalidate();
+    });
+
+    // ── Follow the live edge ─────────────────────────────────────────────
+    // One effect. `atEndRef` is maintained by the scroll loop, so this reads no
+    // layout to decide, and appends land inside the window by construction
+    // (the window is anchored at its start, so it always extends to the end).
+    const [newCount, setNewCount] = useState(0);
+    const lastSeenLen = useRef(rows.length);
+    const tail = rows[rows.length - 1];
+    const tailLen =
+      tail && (tail.kind === RowKind.Prose || tail.kind === RowKind.Thinking)
+        ? tail.text.length
+        : 0;
+
+    useEffect(() => {
+      const el = scrollRef.current;
+      if (!el) return;
+      if (atEndRef.current) {
+        el.scrollTop = el.scrollHeight;
+        lastSeenLen.current = rows.length;
+        setNewCount((c) => (c === 0 ? c : 0));
+      } else {
+        setNewCount(Math.max(0, rows.length - lastSeenLen.current));
+      }
+    }, [rows.length, tailLen, atEndRef]);
+
+    // Clear the unseen count once the reader catches up.
+    useEffect(() => {
+      if (!more) {
+        lastSeenLen.current = rows.length;
+        setNewCount((c) => (c === 0 ? c : 0));
+      }
+    }, [more, rows.length]);
+
+    useEffect(() => {
+      onShowJumpChange?.(more, more ? newCount : 0);
+    }, [more, newCount, onShowJumpChange]);
+
+    useEffect(() => () => onShowJumpChange?.(false), [onShowJumpChange]);
+
+    // Persist position on unmount so a tab switch returns the reader.
+    useEffect(() => {
+      return () => {
+        const el = scrollRef.current;
+        if (!el) return;
+        savedScroll.set(cacheKey, {
+          startIndex,
+          scrollTop: el.scrollTop,
+          atEnd: atEndRef.current,
+        });
+      };
+    }, [cacheKey, startIndex, atEndRef]);
+
+    // ── Imperative handle + external jumps ───────────────────────────────
+    const rowsRef = useRef(rows);
+    rowsRef.current = rows;
+
+    const scrollToBottom = useCallback(() => {
+      const el = scrollRef.current;
+      if (!el) return;
+      el.scrollTop = el.scrollHeight;
+      lastSeenLen.current = rowsRef.current.length;
+      setNewCount(0);
+    }, []);
+
+    const scrollToMessage = useCallback(
+      (messageIndex: number) => {
+        const turn = projection.turns.find((t) => t.messageIndex === messageIndex);
+        const rowId = turn ? projection.rows[turn.rowStart]?.id : undefined;
+        if (!rowId) return;
+        const target = rowsRef.current.findIndex((r) => r.id === rowId);
+        if (target < 0) return;
+        // Widen the window first if the target is above it, then anchor once the
+        // row exists. Same settle-over-renders shape the timeline uses for
+        // jump-to-Checkpoint.
+        setStartIndex((i) => (target < i ? Math.max(0, target - 10) : i));
+        pendingAnchorRef.current = rowId;
+      },
+      [projection],
+    );
+
+    useImperativeHandle(ref, () => ({ scrollToBottom, scrollToMessage }), [
+      scrollToBottom,
+      scrollToMessage,
+    ]);
+
+    useEffect(() => {
+      const handler = (e: Event) => {
+        const detail = (e as CustomEvent<{ index: number }>).detail;
+        if (typeof detail?.index === "number") scrollToMessage(detail.index);
+      };
+      window.addEventListener("atlas:chat-jump", handler);
+      return () => window.removeEventListener("atlas:chat-jump", handler);
+    }, [scrollToMessage]);
+
+    // ── Turn-footer actions ──────────────────────────────────────────────
+    const onSaveKb = useCallback(() => void saveThreadToKb(tabId), [tabId]);
+    const onDiagram = useCallback(
+      (messageId: string) => {
+        const session = useChatStore.getState().sessions[tabId];
+        const msg = session?.messages.find((m) => m.id === messageId);
+        if (msg) drawDiagram(msg, msg.turnSummary?.files ?? []);
+      },
+      [tabId],
+    );
+
+    return (
+      <div className="relative min-h-0 flex-1">
+        <div
+          ref={scrollRef}
+          onScroll={onScroll}
+          className="atlas-transcript h-full overflow-y-auto hide-scrollbar [overflow-anchor:none]"
+        >
+          <div ref={contentRef}>
+            {rows.length === 0 && !isStreaming && (
+              <div className="flex h-full items-center justify-center text-[11px] text-[var(--text-tertiary)]">
+                No messages yet.
+              </div>
+            )}
+            {visible.map((row) => (
+              <div key={row.id} className="atlas-row group" data-row-id={row.id}>
+                <RowView
+                  row={row}
+                  tabId={tabId}
+                  agentLabel={agentLabel}
+                  onToggleExpand={toggleExpand}
+                  onExpandTurn={expandTurn}
+                  onSaveKb={onSaveKb}
+                  onDiagram={onDiagram}
+                />
+              </div>
+            ))}
+            {isStreaming && rows.length === 0 && <WorkingIndicator />}
+          </div>
+        </div>
+
+        <div
+          aria-hidden
+          className={cn(
+            "pointer-events-none absolute bottom-0 left-0 right-0 z-[1] h-16 transition-opacity duration-200",
+            more ? "opacity-100" : "opacity-0",
+          )}
+          style={{
+            background: "linear-gradient(to bottom, transparent, var(--bg-surface))",
+          }}
+        />
+      </div>
+    );
+  },
+);
+
+/** Row dispatch. Kept out of the list body so the map stays flat. */
+function RowView({
+  row,
+  tabId,
+  agentLabel,
+  onToggleExpand,
+  onExpandTurn,
+  onSaveKb,
+  onDiagram,
+}: {
+  row: Row;
+  tabId: string;
+  agentLabel: string;
+  onToggleExpand: (id: string) => void;
+  onExpandTurn: (turnId: string) => void;
+  onSaveKb: () => void;
+  onDiagram: (messageId: string) => void;
+}) {
+  switch (row.kind) {
+    case RowKind.User:
+      return <UserRowView row={row} onToggleExpand={onToggleExpand} />;
+    case RowKind.Prose:
+      return <ProseRowView row={row} agentLabel={agentLabel} />;
+    case RowKind.Thinking:
+      return <ThinkingRowView row={row} onToggleExpand={onToggleExpand} />;
+    case RowKind.Marker:
+      return <MarkerRowView row={row} tabId={tabId} />;
+    case RowKind.MarkerGroup:
+      return <MarkerGroupRowView row={row} onExpandGroup={onToggleExpand} />;
+    case RowKind.Separator:
+      return <SeparatorRowView row={row} onExpandTurn={onExpandTurn} />;
+    case RowKind.TurnFooter:
+      return (
+        <TurnFooterRowView
+          row={row}
+          tabId={tabId}
+          onSaveKb={onSaveKb}
+          onDrawDiagram={() => onDiagram(row.messageId)}
+          canDiagram={canDrawDiagram(row.files)}
+        />
+      );
+    case RowKind.Notice:
+      return <NoticeRowView row={row} />;
+    default:
+      return null;
+  }
+}

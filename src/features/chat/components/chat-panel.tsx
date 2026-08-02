@@ -1,5 +1,6 @@
-import { lazy, Suspense, memo, useCallback, useEffect, useRef, useState } from "react";
+import { lazy, Suspense, memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useChatStore } from "../stores/chat-store";
+import { useDetailPanelStore } from "../stores/detail-panel-store";
 import { appendNextStepsDirective } from "../lib/next-steps";
 import { agents, ensureAgent, CODEX_PLUGIN_ID, CERSEI_PLUGIN_ID, DEFAULT_PLUGIN_ID, codexStatus } from "../lib/agents-api";
 import { loadCachedAcpModes } from "../lib/acp-modes-cache";
@@ -36,14 +37,19 @@ const ChatSearchPalette = lazy(() =>
   })),
 );
 
-// `MessagesList` transitively imports `react-markdown` + `rehype-highlight` +
-// `remark-gfm` (~330 KB raw / 101 KB gzip) via `message-item.tsx`. Lazy so
-// an empty-chat first paint doesn't preload the markdown vendor chunk;
-// loads on demand the first time messages exist for this tab.
-const MessagesList = lazy(() =>
-  import("./messages-list").then((m) => ({ default: m.MessagesList })),
+// The transcript transitively imports the markdown vendor chunk
+// (`remark-gfm` + `rehype-highlight`, ~330 KB raw / 101 KB gzip). Lazy so an
+// empty-chat first paint doesn't preload it; loads the first time this tab has
+// messages.
+const Transcript = lazy(() =>
+  import("./transcript").then((m) => ({ default: m.Transcript })),
 );
-import type { MessagesListHandle } from "./messages-list";
+import type { TranscriptHandle } from "./transcript";
+// Diffs + tool output live here rather than inline in the thread — see the
+// module header for why that's a perf decision as much as a UX one.
+const DetailPanel = lazy(() =>
+  import("./detail-panel").then((m) => ({ default: m.DetailPanel })),
+);
 import {
   Sparkles,
   User,
@@ -130,23 +136,43 @@ export function ChatPanel({ tabId }: ChatPanelProps) {
   );
   const [bashPanelOpen, setBashPanelOpen] = useState(false);
   const [plansPanelOpen, setPlansPanelOpen] = useState(false);
+  // Zen: collapse each turn to its outcome (prose + footer), hiding the
+  // per-tool marker rows. A filter over the projected row set — never a
+  // render-time condition — so toggling it costs one projection, not a
+  // per-frame branch. Off by default: the marker rows ARE the Codex register.
+  const [zen, setZen] = useState(false);
+  // Narrow boolean — changes only when the detail panel opens or closes.
+  const detailOpen = useDetailPanelStore((s) => !!s.targets[tabId]);
   // Cmd+F find — scoped to this pane + tab (see usePaneFind).
   const [searchPaletteOpen, setSearchPaletteOpen] = usePaneFind(tabId);
   const rootRef = useRef<HTMLDivElement>(null);
 
   // Scroll-to-bottom state is owned here so the floating button can live
   // next to the Claude-setup pill above the input (instead of inside
-  // MessagesList). MessagesList publishes the "scrolled up" bit via
+  // the transcript). Transcript publishes the "scrolled up" bit via
   // `onShowJumpChange` and exposes `scrollToBottom` via its ref.
-  const messagesListRef = useRef<MessagesListHandle>(null);
+  const messagesListRef = useRef<TranscriptHandle>(null);
   const [showJumpToBottom, setShowJumpToBottom] = useState(false);
   const [jumpCount, setJumpCount] = useState(0);
-  // Stable so MessagesList's `[showJumpToBottom, newCount, onShowJumpChange]`
+  // Stable so the transcript's `[showJump, newCount, onShowJumpChange]`
   // effect doesn't re-fire on every ChatPanel render (i.e. every stream chunk).
   const onShowJumpChange = useCallback((visible: boolean, count?: number) => {
     setShowJumpToBottom(visible);
     setJumpCount(count ?? 0);
   }, []);
+
+  // The role filter is applied here rather than inside the transcript: the
+  // projection turns a message list into turns and rows, so handing it a
+  // pre-filtered list keeps that pass single-purpose. Identity is preserved in
+  // the (overwhelmingly common) "all" case so the projection memo isn't
+  // invalidated on every render.
+  const filteredMessages = useMemo(
+    () =>
+      roleFilter === "all"
+        ? session?.messages ?? []
+        : (session?.messages ?? []).filter((m) => m.role === roleFilter),
+    [session?.messages, roleFilter],
+  );
 
   const acpSessionId = session?.acpSessionId ?? "";
 
@@ -762,6 +788,23 @@ export function ChatPanel({ tabId }: ChatPanelProps) {
               <ClipboardList size={11} />
               Plans
             </button>
+            <button
+              onClick={() => setZen((v) => !v)}
+              className={cn(
+                "flex items-center gap-1 px-2 h-6 rounded text-[10px] cursor-pointer outline-none transition-colors",
+                zen
+                  ? "text-[var(--text-primary)] bg-[var(--bg-selected)]"
+                  : "text-[var(--text-tertiary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)]",
+              )}
+              title={
+                zen
+                  ? "Show every tool call"
+                  : "Zen — collapse each turn to its result"
+              }
+            >
+              <Sparkles size={11} />
+              Zen
+            </button>
           </div>
         )}
 
@@ -775,14 +818,14 @@ export function ChatPanel({ tabId }: ChatPanelProps) {
           </div>
         ) : (
           <Suspense fallback={<LoadingTranscriptState />}>
-            <MessagesList
+            <Transcript
               ref={messagesListRef}
               tabId={tabId}
               acpSessionId={acpSessionId}
-              messages={session.messages}
-              roleFilter={roleFilter}
+              messages={filteredMessages}
               isStreaming={session.status === "running"}
               agentType={session.agentType}
+              zen={zen}
               onShowJumpChange={onShowJumpChange}
             />
           </Suspense>
@@ -795,7 +838,7 @@ export function ChatPanel({ tabId }: ChatPanelProps) {
             tabId={tabId}
             onSendMessage={(t) => handleSend(t, [])}
           />
-          {/* Bottom fade lives in MessagesList; the centered floating
+          {/* Bottom fade lives in the transcript; the centered floating
               row (setup pill + scroll-to-bottom) lives inside
               ChatComposer below. */}
           <ChatComposer
@@ -829,6 +872,17 @@ export function ChatPanel({ tabId }: ChatPanelProps) {
       {plansPanelOpen && (
         <Suspense fallback={null}>
           <PlansPanel onClose={() => setPlansPanelOpen(false)} />
+        </Suspense>
+      )}
+
+      {/* Diff / tool-output detail. Gated on a narrow boolean selector so the
+          chunk isn't fetched until the reader first opens it, and so this
+          subscription only fires on open/close — never on a streaming chunk.
+          The panel's own store owns the target, so toggling it re-renders zero
+          transcript rows. */}
+      {detailOpen && (
+        <Suspense fallback={null}>
+          <DetailPanel tabId={tabId} messages={session.messages} />
         </Suspense>
       )}
 
