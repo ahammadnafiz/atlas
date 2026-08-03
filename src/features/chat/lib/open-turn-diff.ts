@@ -6,35 +6,30 @@
 //
 // ── What the viewer actually shows ────────────────────────────────────────
 //
-// The WORKING TREE diff for each file, straight from git — not a reconstruction
-// from the tool call's arguments. That is a deliberate trade:
+// The TURN's own before/after text, from the tool call arguments — never git.
+// This was tried the other way first and it does not work: git answers for the
+// CURRENT working tree, while a file created in turn 1, edited in turn 2 and
+// deleted in turn 3 has one git answer and three different correct diffs. Once
+// the edits are committed git reports nothing at all, so every past turn went
+// blank.
 //
-//   * it gets the real viewer for free (word-level spans, syntax highlighting,
-//     minimap, changed-files tree) instead of a second diff implementation;
-//   * it shows true line numbers, which tool arguments cannot provide — they
-//     carry only before/after text with no file offsets.
-//
-// The cost: if the turn's edits have since been committed or reverted, the
-// working tree no longer differs and the viewer will show nothing for that
-// file. Right after a turn — the case this exists for — they are uncommitted.
+// The viewer itself is still the repository one (`GitDiffPanel`) — it just gets
+// handed text instead of a repo path. See its `textSources` prop.
 
 /** Payload of the `atlas:open-turn-diff` event. */
 export interface TurnDiffRequest {
-  /**
-   * The files THIS TURN touched. The viewer's tree is filtered to them, so the
-   * modal answers "what did this turn change" rather than "what is dirty in the
-   * repo" — which is a different question with a much longer answer.
-   */
-  files: string[];
+  /** The turn to show. `ChatPanel` resolves its edits from the message log. */
+  turnId: string;
+  /** Optional single file to open on; empty opens the turn's first. */
+  file?: string;
 }
 
 export const OPEN_TURN_DIFF_EVENT = "atlas:open-turn-diff";
 
-export function openTurnDiff(files: string[]): void {
-  const clean = files.filter(Boolean);
-  if (clean.length === 0) return;
+export function openTurnDiff(turnId: string, file?: string): void {
+  if (!turnId) return;
   window.dispatchEvent(
-    new CustomEvent<TurnDiffRequest>(OPEN_TURN_DIFF_EVENT, { detail: { files: clean } }),
+    new CustomEvent<TurnDiffRequest>(OPEN_TURN_DIFF_EVENT, { detail: { turnId, file } }),
   );
 }
 

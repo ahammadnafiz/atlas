@@ -53,7 +53,6 @@ import {
   MarkerGroupRowView,
   SeparatorRowView,
   TurnFooterRowView,
-  NoticeRowView,
 } from "./transcript-rows";
 
 /**
@@ -660,8 +659,6 @@ function RowView({
           canDiagram={canDrawDiagram(row.files)}
         />
       );
-    case RowKind.Notice:
-      return <NoticeRowView row={row} />;
     default:
       return null;
   }

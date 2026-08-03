@@ -19,7 +19,13 @@ import {
   warmDiffHighlightWorker,
   type LineTokens,
 } from "../lib/diff-highlight-cache";
-import { gitDiffStructured, type DiffSide, type DiffRow } from "../lib/git-diff-api";
+import {
+  gitDiffStructured,
+  diffStructuredText,
+  diffQueryKey,
+  type DiffSide,
+  type DiffRow,
+} from "../lib/git-diff-api";
 import {
   Panel,
   PanelGroup,
@@ -82,6 +88,19 @@ interface GitDiffPanelProps {
   /** Restrict the tree to these repo-relative paths — see
    *  `ChangedFilesTree.only`. */
   only?: string[];
+  /**
+   * Before/after text per path, bypassing git entirely.
+   *
+   * The agent chat needs this. A turn's diff is not a question git can answer:
+   * the working tree holds the CURRENT state, while a file created in turn 1,
+   * edited in turn 2 and deleted in turn 3 has three different correct diffs and
+   * only the tool arguments know which. When a path appears here, its diff is
+   * computed from these strings instead of from the repository.
+   */
+  textSources?: Record<string, { old: string; new: string }>;
+  /** Handle tree clicks instead of opening the Git Diff module tab — see
+   *  `ChangedFilesTree.onSelect`. */
+  onSelectFile?: (path: string) => void;
 }
 
 function sideBg(side: DiffSide | null, isLeft: boolean): string | undefined {
@@ -290,6 +309,8 @@ export function GitDiffPanel({
   commit = null,
   hidePicker = false,
   only,
+  textSources,
+  onSelectFile,
 }: GitDiffPanelProps) {
   const storeRepo = useGitStore.use.repoPath();
   const repoPath = repoPathProp || storeRepo || "";
@@ -305,11 +326,17 @@ export function GitDiffPanel({
   const toggleTree = () =>
     treeCollapsed ? treePanelRef.current?.expand() : treePanelRef.current?.collapse();
 
-  const queryKey = ["git-diff", repoPath, file, staged, commit] as const;
+  // A supplied text source wins over the repository — see `textSources`.
+  const textSource = textSources?.[file];
+  const queryKey = diffQueryKey(repoPath, file, staged, commit, textSource);
   const { data, isLoading, refetch } = useQuery({
     queryKey,
-    queryFn: () => gitDiffStructured(repoPath, file, staged, commit),
-    enabled: !!repoPath && !!file,
+    queryFn: () =>
+      textSource
+        ? diffStructuredText(textSource.old, textSource.new, file)
+        : gitDiffStructured(repoPath, file, staged, commit),
+    // Text-sourced diffs need no repo, so they must not be gated on one.
+    enabled: !!file && (!!textSource || !!repoPath),
     staleTime: 10_000,
   });
 
@@ -448,6 +475,7 @@ export function GitDiffPanel({
           commit={commit}
           hidePicker={hidePicker}
           only={only}
+          onSelect={onSelectFile}
         />
       </Panel>
       <PanelResizeHandle className="w-px bg-border-default hover:bg-accent data-[resize-handle-active]:bg-accent transition-colors cursor-col-resize" />

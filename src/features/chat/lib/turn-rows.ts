@@ -34,9 +34,7 @@ export const RowKind = {
   MarkerGroup: 4,
   Separator: 5,
   TurnFooter: 6,
-  Notice: 7,
 } as const;
-export type RowKindValue = (typeof RowKind)[keyof typeof RowKind];
 
 /** Marker execution state — drives the leading glyph, nothing else. */
 export type MarkerState = "pending" | "running" | "done" | "failed";
@@ -134,12 +132,6 @@ export interface TurnFooterRow extends RowBase {
   contextChip: boolean;
 }
 
-export interface NoticeRow extends RowBase {
-  kind: typeof RowKind.Notice;
-  variant: "error" | "interrupted" | "permission";
-  text: string;
-}
-
 export type Row =
   | UserRow
   | ProseRow
@@ -147,8 +139,7 @@ export type Row =
   | MarkerRow
   | MarkerGroupRow
   | SeparatorRow
-  | TurnFooterRow
-  | NoticeRow;
+  | TurnFooterRow;
 
 // ── Turns ──────────────────────────────────────────────────────────────────
 
@@ -172,14 +163,6 @@ export interface Turn {
 export interface Projection {
   rows: Row[];
   turns: Turn[];
-  /** Parallel typed arrays over `rows`. 8 bytes/row: at 50k rows that is 400KB
-   *  with zero GC pressure, so any pass over the whole index is a tight loop
-   *  rather than an allocation. Struct-of-arrays is much harder to retrofit
-   *  than to adopt, so it goes in from the start. */
-  kinds: Uint8Array;
-  turnIdx: Uint32Array;
-  /** Filled in by the height pass, not here. */
-  heights: Uint16Array;
 }
 
 /**
@@ -548,18 +531,7 @@ export function projectRows(
     if (rows[t.rowStart]) rows[t.rowStart].firstInTurn = true;
   }
 
-  const n = rows.length;
-  const kinds = new Uint8Array(n);
-  const turnIdx = new Uint32Array(n);
-  const heights = new Uint16Array(n);
-  const turnPos = new Map<string, number>();
-  turns.forEach((t, idx) => turnPos.set(t.id, idx));
-  for (let r = 0; r < n; r++) {
-    kinds[r] = rows[r].kind;
-    turnIdx[r] = turnPos.get(rows[r].turnId) ?? 0;
-  }
-
-  return { rows, turns, kinds, turnIdx, heights };
+  return { rows, turns };
 }
 
 /** Faint "N ago" divider marking a real pause between turns. */

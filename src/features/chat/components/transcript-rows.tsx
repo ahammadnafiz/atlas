@@ -21,16 +21,12 @@ import {
   ChevronRight,
   Paperclip,
   Brain,
-  FileText,
   Bookmark,
   Workflow,
   Code2,
-  Copy,
-  CornerUpLeft,
   ChevronDown,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
-import { copyText } from "@/lib/clipboard";
 import { CachedMarkdown } from "@/lib/markdown-cache";
 import { StreamingMarkdown } from "./streaming-markdown";
 import { openDetail } from "../stores/detail-panel-store";
@@ -44,7 +40,6 @@ import type {
   MarkerGroupRow,
   SeparatorRow,
   TurnFooterRow,
-  NoticeRow,
   MarkerState,
 } from "../lib/turn-rows";
 import { M } from "../lib/row-metrics";
@@ -269,8 +264,9 @@ export const MarkerRowView = memo(function MarkerRowView({
   const clickable = row.opens !== "none";
   const onClick = useCallback(() => {
     if (row.opens === "diff") {
-      // Changes get the real viewer, not the sidebar.
-      openTurnDiff(row.path ? [row.path] : []);
+      // Changes get the real viewer, not the sidebar. The turn id is what the
+      // diff is scoped by; the path just says which file to land on.
+      openTurnDiff(row.turnId, row.path);
     } else if (row.opens === "output") {
       openDetail(tabId, { kind: "output", toolCallId: row.toolCallId });
     }
@@ -447,9 +443,8 @@ export const TurnFooterRowView = memo(function TurnFooterRowView({
               <FooterPill
                 icon={<Code2 size={11} />}
                 label="Show changes"
-                // Every file this turn edited — the tree is scoped to them and
-                // the first opens straight away.
-                onClick={() => openTurnDiff(edits.map((f) => f.path))}
+                // The whole turn: its files fill the tree and the first opens.
+                onClick={() => openTurnDiff(row.turnId)}
               />
             )}
           </div>
@@ -536,69 +531,6 @@ function FooterPill({
       {icon}
       {label}
     </button>
-  );
-}
-
-function FooterAction({
-  children,
-  onClick,
-  title,
-}: {
-  children: React.ReactNode;
-  onClick: () => void;
-  title: string;
-}) {
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      title={title}
-      className="flex h-6 w-6 items-center justify-center rounded text-[var(--text-tertiary)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)] cursor-pointer transition-colors"
-    >
-      {children}
-    </button>
-  );
-}
-
-// ── Notice ─────────────────────────────────────────────────────────────────
-
-export const NoticeRowView = memo(function NoticeRowView({ row }: { row: NoticeRow }) {
-  return (
-    <Column className="py-1">
-      <div
-        className={cn(
-          "flex h-[32px] items-center gap-2 rounded-md border px-3 text-[11px]",
-          row.variant === "error"
-            ? "border-[var(--status-error)]/30 bg-[var(--status-error)]/5 text-[var(--status-error)]"
-            : "border-[var(--border-default)] bg-[var(--bg-secondary)] text-[var(--text-tertiary)]",
-        )}
-      >
-        <FileText size={11} className="shrink-0" />
-        <span className="min-w-0 flex-1 truncate">{row.text}</span>
-      </div>
-    </Column>
-  );
-});
-
-// ── Hover actions (prose rows) ─────────────────────────────────────────────
-
-export function ProseHoverActions({ text }: { text: string }) {
-  return (
-    <div className="absolute right-6 top-0 z-10 flex items-center gap-0.5 rounded-md border border-[var(--border-default)] bg-[var(--bg-elevated)] p-0.5 opacity-0 shadow-[var(--shadow-sm)] transition-opacity duration-150 group-hover:opacity-100 focus-within:opacity-100">
-      <FooterAction title="Copy markdown" onClick={() => void copyText(text)}>
-        <Copy size={11} />
-      </FooterAction>
-      <FooterAction
-        title="Reply with this as reference"
-        onClick={() =>
-          window.dispatchEvent(
-            new CustomEvent("atlas:chat-reply", { detail: { content: text } }),
-          )
-        }
-      >
-        <CornerUpLeft size={11} />
-      </FooterAction>
-    </div>
   );
 }
 

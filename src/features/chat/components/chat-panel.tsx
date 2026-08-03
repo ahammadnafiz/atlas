@@ -7,6 +7,7 @@ import { agents, ensureAgent, CODEX_PLUGIN_ID, CERSEI_PLUGIN_ID, DEFAULT_PLUGIN_
 import { loadCachedAcpModes } from "../lib/acp-modes-cache";
 import { warmAcpModels, otherAcpAgent } from "../lib/warm-acp-models";
 import type { ImageAttachment, SessionKey } from "@/types/agents";
+import type { ChatMessage } from "@/types/agent";
 import { hasInFlightToolCalls, isBusyAgentStatus, agentTypeFromPluginId } from "@/types/agent";
 import {
   composePrompt,
@@ -19,6 +20,9 @@ import { MessageInput } from "./message-input";
 import { SessionSidebar } from "./session-sidebar";
 import { ChatHeader } from "./chat-header";
 import { openNewAgentChat } from "../lib/open-agent-session";
+import { useQueryClient } from "@tanstack/react-query";
+import { prefetchTextDiff } from "@/features/git/lib/git-diff-api";
+import { getEditParts, getFilePathFromInput } from "../lib/tool-files";
 import {
   OPEN_TURN_DIFF_EVENT,
   toRepoRelative,
@@ -136,6 +140,66 @@ async function rebindDisconnectedSession(tabId: string): Promise<boolean> {
   }
 }
 
+/**
+ * The before/after text a single turn produced, per file.
+ *
+ * Walks the turn's assistant run — `turnId` is `t:<first assistant message id>`,
+ * the same formula the row projection uses — and folds every edit tool call into
+ * one before/after pair per path. Multiple edits to the same file concatenate in
+ * order, so a turn that touched a file three times reads as one diff rather than
+ * three competing ones.
+ *
+ * A `Write` carries whole content (`old` empty), which is why a file CREATED by
+ * the turn renders in full. An `Edit` carries only the replaced fragment, so its
+ * diff covers that fragment — honest about what the record holds. A file the
+ * turn only deleted contributes no edit parts and simply does not appear, which
+ * is the correct answer: there is nothing to browse.
+ */
+function collectTurnEdits(
+  messages: ChatMessage[],
+  turnId: string,
+  repoPath: string,
+  preferredFile?: string,
+): {
+  files: string[];
+  initial: string;
+  sources: Record<string, { old: string; new: string }>;
+} {
+  const firstId = turnId.startsWith("t:") ? turnId.slice(2) : turnId;
+  const start = messages.findIndex((m) => m.id === firstId);
+  const sources: Record<string, { old: string; new: string }> = {};
+  const order: string[] = [];
+
+  if (start >= 0) {
+    // The turn is the consecutive assistant run beginning at that message.
+    for (let i = start; i < messages.length && messages[i].role === "assistant"; i++) {
+      for (const tc of messages[i].toolCalls) {
+        const args = tc.arguments ?? {};
+        const parts = getEditParts(tc.toolName, args);
+        if (parts.length === 0) continue;
+        const abs = getFilePathFromInput(args);
+        if (!abs) continue;
+        const path = toRepoRelative(abs, repoPath);
+        if (!sources[path]) {
+          sources[path] = { old: "", new: "" };
+          order.push(path);
+        }
+        for (const p of parts) {
+          sources[path].old += p.old;
+          sources[path].new += p.neu;
+        }
+      }
+    }
+  }
+
+  const wanted = preferredFile ? toRepoRelative(preferredFile, repoPath) : "";
+  return {
+    files: order,
+    initial: wanted && sources[wanted] ? wanted : (order[0] ?? ""),
+    sources,
+  };
+}
+
 export function ChatPanel({ tabId }: ChatPanelProps) {
   // Subscribe to ONLY this tab's session. Streaming chunks on other tabs
   // shouldn't repaint this panel — immer preserves reference equality for
@@ -154,17 +218,30 @@ export function ChatPanel({ tabId }: ChatPanelProps) {
 
   // Full-screen diff. Driven by a window event rather than a prop chain so a row
   // opening it re-renders nothing in the transcript.
-  const [diffFiles, setDiffFiles] = useState<string[] | null>(null);
+  const [turnDiff, setTurnDiff] = useState<{
+    files: string[];
+    initial: string;
+    sources: Record<string, { old: string; new: string }>;
+  } | null>(null);
+
+  const queryClient = useQueryClient();
   useEffect(() => {
     const onOpen = (e: Event) => {
       const detail = (e as CustomEvent<TurnDiffRequest>).detail;
+      if (!detail?.turnId) return;
       const repo = useProjectStore.getState().currentProject?.path ?? "";
-      // Tool calls report absolute paths; git speaks repo-relative ones.
-      setDiffFiles((detail?.files ?? []).map((f) => toRepoRelative(f, repo)));
+      const messages = useChatStore.getState().sessions[tabId]?.messages ?? [];
+      const next = collectTurnEdits(messages, detail.turnId, repo, detail.file);
+      // Start the diff BEFORE the modal exists. The viewer would otherwise wait
+      // for its own mount to fire the same request, putting an IPC round trip
+      // after the open animation rather than underneath it.
+      const src = next.sources[next.initial];
+      if (src) prefetchTextDiff(queryClient, repo, next.initial, src);
+      setTurnDiff(next);
     };
     window.addEventListener(OPEN_TURN_DIFF_EVENT, onOpen);
     return () => window.removeEventListener(OPEN_TURN_DIFF_EVENT, onOpen);
-  }, []);
+  }, [tabId, queryClient]);
 
   // Warm everything the diff modal needs while the reader is idle, so opening
   // it is a paint rather than a fetch: the chunk itself (which now pulls the
@@ -862,17 +939,19 @@ export function ChatPanel({ tabId }: ChatPanelProps) {
         </Suspense>
       )}
 
-      {diffFiles !== null && diffFiles.length > 0 && (
+      {turnDiff !== null && turnDiff.files.length > 0 && (
         <Suspense fallback={null}>
           <GitDiffModal
             open
-            onOpenChange={(o) => !o && setDiffFiles(null)}
+            onOpenChange={(o) => !o && setTurnDiff(null)}
             repoPath={useProjectStore.getState().currentProject?.path ?? ""}
-            files={diffFiles}
+            files={turnDiff.files}
+            initialFile={turnDiff.initial}
+            textSources={turnDiff.sources}
             title={
-              diffFiles.length === 1
-                ? (diffFiles[0].split("/").pop() ?? "Changes")
-                : `${diffFiles.length} files changed`
+              turnDiff.files.length === 1
+                ? (turnDiff.files[0].split("/").pop() ?? "Changes")
+                : `${turnDiff.files.length} files changed`
             }
           />
         </Suspense>
