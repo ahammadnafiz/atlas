@@ -20,6 +20,12 @@
 export interface FlushCtx {
   workspaceId: string | null;
   path: string | null;
+  /** Why the flush is running. A `"switch"` stays on screen — a registrant
+   *  holding non-user data (app-state metadata) may fire-and-forget to keep
+   *  the switch's critical path short. Anything terminal (`"quit"`, close)
+   *  must await everything. Defaults to `"quit"` semantics when absent so an
+   *  unaware caller gets the safe behavior. */
+  reason?: "switch" | "quit";
 }
 
 export type FlushFn = (ctx: FlushCtx) => Promise<void>;

@@ -21,21 +21,17 @@ import {
   ChevronRight,
   Paperclip,
   Brain,
-  FileText,
   Bookmark,
   Workflow,
   Code2,
-  Copy,
-  CornerUpLeft,
   ChevronDown,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
-import { copyText } from "@/lib/clipboard";
 import { CachedMarkdown } from "@/lib/markdown-cache";
 import { StreamingMarkdown } from "./streaming-markdown";
 import { openDetail } from "../stores/detail-panel-store";
 import { openTurnDiff } from "../lib/open-turn-diff";
-import { RowKind } from "../lib/turn-rows";
+import { canDrawDiagram } from "../lib/turn-actions";
 import type {
   UserRow,
   ProseRow,
@@ -44,7 +40,6 @@ import type {
   MarkerGroupRow,
   SeparatorRow,
   TurnFooterRow,
-  NoticeRow,
   MarkerState,
 } from "../lib/turn-rows";
 import { M } from "../lib/row-metrics";
@@ -66,9 +61,12 @@ function Column({
 
 export const UserRowView = memo(function UserRowView({
   row,
+  priority,
   onToggleExpand,
 }: {
   row: UserRow;
+  /** Position in the thread — newest parses first. See `CachedMarkdown`. */
+  priority: number;
   onToggleExpand: (id: string) => void;
 }) {
   return (
@@ -76,21 +74,31 @@ export const UserRowView = memo(function UserRowView({
     // from the next, and a tight one made the agent's reply read as a
     // continuation of the user's own message.
     <Column className="flex justify-end pt-6 pb-5">
-      <div className="flex max-w-[80%] flex-col items-end">
+      {/* `min-w-0` on both flex levels, `max-w-full` on the bubble: a pasted
+          code block is `white-space: pre` (unwrappable), and a flex item's
+          automatic minimum size floors at that intrinsic width — the pre's own
+          `overflow-x: auto` cannot save an ancestor that refuses to shrink, so
+          a long paste dragged the whole bubble past the viewport edge. With
+          the chain capped, the fence scrolls horizontally INSIDE the bubble. */}
+      <div className="flex min-w-0 max-w-[80%] flex-col items-end">
+        {/* The prompt is markdown too. It is written in the same composer that
+            accepts fences and lists, and rendering it as flat text collapsed
+            every newline — a pasted snippet came back as one run-on paragraph.
+            Same renderer as the agent's prose so a quoted block looks identical
+            on both sides of the thread; only the type scale differs.
+
+            Clamped by HEIGHT rather than `-webkit-line-clamp`: line-clamp needs
+            inline content, and the moment the bubble holds block elements
+            (paragraphs, a list, a fence) it stops clamping at all. */}
         <div
-          className="rounded-2xl rounded-br-md bg-[var(--accent-primary-muted)] px-3.5 py-2 text-[14px] leading-[22px] text-[var(--text-primary)] select-text"
+          className="atlas-prose atlas-prose--user min-w-0 max-w-full rounded-2xl rounded-br-md bg-[var(--accent-primary-muted)] px-3.5 py-2 select-text"
           style={
             row.expanded
               ? undefined
-              : {
-                  display: "-webkit-box",
-                  WebkitBoxOrient: "vertical",
-                  WebkitLineClamp: M.userMaxLines,
-                  overflow: "hidden",
-                }
+              : { maxHeight: M.userMaxLines * M.userLineHeight, overflow: "hidden" }
           }
         >
-          {row.text}
+          <CachedMarkdown source={row.text} unstyled priority={priority} />
         </div>
         {row.contextBlocks > 0 && (
           <button
@@ -269,8 +277,9 @@ export const MarkerRowView = memo(function MarkerRowView({
   const clickable = row.opens !== "none";
   const onClick = useCallback(() => {
     if (row.opens === "diff") {
-      // Changes get the real viewer, not the sidebar.
-      openTurnDiff(row.path ? [row.path] : []);
+      // Changes get the real viewer, not the sidebar. The turn id is what the
+      // diff is scoped by; the path just says which file to land on.
+      openTurnDiff(row.turnId, row.path);
     } else if (row.opens === "output") {
       openDetail(tabId, { kind: "output", toolCallId: row.toolCallId });
     }
@@ -393,14 +402,15 @@ export const SeparatorRowView = memo(function SeparatorRowView({
 export const TurnFooterRowView = memo(function TurnFooterRowView({
   row,
   onSaveKb,
-  onDrawDiagram,
-  canDiagram,
+  onDiagram,
 }: {
   row: TurnFooterRow;
   onSaveKb: () => void;
-  onDrawDiagram: () => void;
-  canDiagram: boolean;
+  /** Stable across renders; the messageId binding happens in here so the memo
+   *  holds (an inline `() => onDiagram(id)` prop defeated it). */
+  onDiagram: (messageId: string) => void;
 }) {
+  const canDiagram = canDrawDiagram(row.files);
   // `row.files` is the first three; `row.allFiles` is everything. The overflow
   // line is a disclosure, not a dead count.
   const [showAll, setShowAll] = useState(false);
@@ -440,16 +450,15 @@ export const TurnFooterRowView = memo(function TurnFooterRowView({
                 icon={<Workflow size={11} />}
                 label="Diagram"
                 title="Draw a diagram of these changes"
-                onClick={onDrawDiagram}
+                onClick={() => onDiagram(row.messageId)}
               />
             )}
             {edits.length > 0 && (
               <FooterPill
                 icon={<Code2 size={11} />}
                 label="Show changes"
-                // Every file this turn edited — the tree is scoped to them and
-                // the first opens straight away.
-                onClick={() => openTurnDiff(edits.map((f) => f.path))}
+                // The whole turn: its files fill the tree and the first opens.
+                onClick={() => openTurnDiff(row.turnId)}
               />
             )}
           </div>
@@ -539,67 +548,3 @@ function FooterPill({
   );
 }
 
-function FooterAction({
-  children,
-  onClick,
-  title,
-}: {
-  children: React.ReactNode;
-  onClick: () => void;
-  title: string;
-}) {
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      title={title}
-      className="flex h-6 w-6 items-center justify-center rounded text-[var(--text-tertiary)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)] cursor-pointer transition-colors"
-    >
-      {children}
-    </button>
-  );
-}
-
-// ── Notice ─────────────────────────────────────────────────────────────────
-
-export const NoticeRowView = memo(function NoticeRowView({ row }: { row: NoticeRow }) {
-  return (
-    <Column className="py-1">
-      <div
-        className={cn(
-          "flex h-[32px] items-center gap-2 rounded-md border px-3 text-[11px]",
-          row.variant === "error"
-            ? "border-[var(--status-error)]/30 bg-[var(--status-error)]/5 text-[var(--status-error)]"
-            : "border-[var(--border-default)] bg-[var(--bg-secondary)] text-[var(--text-tertiary)]",
-        )}
-      >
-        <FileText size={11} className="shrink-0" />
-        <span className="min-w-0 flex-1 truncate">{row.text}</span>
-      </div>
-    </Column>
-  );
-});
-
-// ── Hover actions (prose rows) ─────────────────────────────────────────────
-
-export function ProseHoverActions({ text }: { text: string }) {
-  return (
-    <div className="absolute right-6 top-0 z-10 flex items-center gap-0.5 rounded-md border border-[var(--border-default)] bg-[var(--bg-elevated)] p-0.5 opacity-0 shadow-[var(--shadow-sm)] transition-opacity duration-150 group-hover:opacity-100 focus-within:opacity-100">
-      <FooterAction title="Copy markdown" onClick={() => void copyText(text)}>
-        <Copy size={11} />
-      </FooterAction>
-      <FooterAction
-        title="Reply with this as reference"
-        onClick={() =>
-          window.dispatchEvent(
-            new CustomEvent("atlas:chat-reply", { detail: { content: text } }),
-          )
-        }
-      >
-        <CornerUpLeft size={11} />
-      </FooterAction>
-    </div>
-  );
-}
-
-export { RowKind };

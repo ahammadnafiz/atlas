@@ -421,6 +421,8 @@ export function App() {
     const pendingDeltas: AgentDelta[] = [];
     const toolDeltaPos = new Map<string, number>(); // dedup key → index in pendingDeltas
     let rafId: number | null = null;
+    /** Timer drain that survives RAF being paused — see `schedule` below. */
+    let backstopId: ReturnType<typeof setTimeout> | null = null;
 
     // "Is Atlas actually in front of the user?" — tracked via the NATIVE window
     // focus, NOT web focus/blur. The web events keep reporting "focused" when
@@ -555,12 +557,29 @@ export function App() {
     };
 
     const flush = () => {
-      rafId = null;
+      if (rafId !== null) {
+        cancelAnimationFrame(rafId);
+        rafId = null;
+      }
+      if (backstopId !== null) {
+        clearTimeout(backstopId);
+        backstopId = null;
+      }
       if (pendingDeltas.length === 0) return;
       const deltas = pendingDeltas.slice();
       pendingDeltas.length = 0;
       toolDeltaPos.clear();
-      useChatStore.getState().actions.applyAgentBatch({ texts: [], thoughts: [], deltas });
+      try {
+        useChatStore.getState().actions.applyAgentBatch({ texts: [], thoughts: [], deltas });
+      } catch (e) {
+        // The batch is already out of the buffer, so it is lost either way —
+        // re-queueing a batch that throws would just loop on it forever. What
+        // must NOT happen is the exception escaping into the RAF/timer callback
+        // and taking the scheduler down with it: every later delta would then
+        // buffer against a drain that never runs again, which presents as the
+        // thread freezing mid-turn.
+        console.error("applyAgentBatch failed; dropped", deltas.length, "deltas:", e);
+      }
     };
     // Coalesce a streaming text/thinking chunk into the trailing pendingDeltas
     // entry when it's the same kind + session; otherwise append in order. Keeps
@@ -581,9 +600,26 @@ export function App() {
         pendingDeltas.push(env);
       }
     };
+    // Two independent drains, because RAF alone is not a guarantee that the
+    // buffer is ever emptied.
+    //
+    // WebKit pauses `requestAnimationFrame` whenever the WKWebView isn't
+    // frontmost — not just when it's hidden. A user who leaves Atlas on screen
+    // while working in another app is watching a window whose RAF queue is
+    // stopped: deltas keep arriving over IPC and keep buffering, and NOTHING
+    // renders. The whole turn then lands in one batch the instant something
+    // wakes the webview, which reads as "it was stuck, then it caught up".
+    // `atlas:window-active` covered part of this, but only on a focus/visibility
+    // edge — it can't help a reader watching an unfocused window.
+    //
+    // `setTimeout` is throttled in that state (to roughly a second) but never
+    // paused, so it is the drain that always eventually fires. When RAF is
+    // healthy it wins every race and clears the backstop, so this costs one
+    // cancelled timer per frame and changes nothing about normal streaming.
+    const BACKSTOP_MS = 250;
     const schedule = () => {
-      if (rafId !== null) return;
-      rafId = requestAnimationFrame(flush);
+      if (rafId === null) rafId = requestAnimationFrame(flush);
+      if (backstopId === null) backstopId = setTimeout(flush, BACKSTOP_MS);
     };
 
     // When the webview is hidden/throttled, requestAnimationFrame is paused, so
@@ -749,11 +785,7 @@ export function App() {
         case "agent_disconnected":
           // Flush whatever's buffered before tearing the agent down
           // so we don't lose a final chunk to the post-disconnect
-          // discard.
-          if (rafId !== null) {
-            cancelAnimationFrame(rafId);
-            rafId = null;
-          }
+          // discard. `flush` cancels both pending drains itself.
           flush();
           actions.clearPermissionsForAgent(env.agent_id);
           // Reset the spawn cache for the plugin that actually died — the old
@@ -845,6 +877,7 @@ export function App() {
     return () => {
       cancelled = true;
       if (rafId !== null) cancelAnimationFrame(rafId);
+      if (backstopId !== null) clearTimeout(backstopId);
       window.removeEventListener("atlas:window-active", flushOnWake);
       unlistenFocus?.();
       document.removeEventListener("visibilitychange", onVisible);
@@ -947,7 +980,12 @@ export function App() {
       void invoke("mention_cache_clear").catch(() => {});
       return;
     }
-    markFileIndexClosed();
+    // Deliberately NOT `markFileIndexClosed()` here: switching projects keeps
+    // every hot workspace's Rust index resident (`fileindex_open_project` is
+    // idempotent for a live one), so previously-confirmed roots stay valid —
+    // clearing them made the first Cmd+P/@ after every switch pay a status
+    // round-trip. Roots are forgotten where indexes actually die: project
+    // close (above) and workspace teardown (`markFileIndexClosedFor`).
     const workspaceId = activeWorkspaceId();
     void openFileIndex(currentProject.path);
     // Git watcher: emits `atlas:git-changed` on commit / checkout /

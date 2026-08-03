@@ -140,6 +140,15 @@ interface ChangedFilesTreeProps {
    *  the tree to what a single turn touched; without it the tree answers a
    *  different question — everything dirty in the repo. */
   only?: string[];
+  /**
+   * Take over what a click does.
+   *
+   * Without it a click calls `openGitDiff`, which opens the standalone Git Diff
+   * MODULE TAB — correct when the tree IS that tab, wrong everywhere else. The
+   * chat's modal passes this so a click retargets the modal in place instead of
+   * spawning a workbench tab behind it.
+   */
+  onSelect?: (path: string) => void;
 }
 
 interface DirNode {
@@ -259,6 +268,7 @@ export const ChangedFilesTree = memo(function ChangedFilesTree({
   commit = null,
   hidePicker = false,
   only,
+  onSelect,
 }: ChangedFilesTreeProps) {
   const onlySet = useMemo(() => (only ? new Set(only) : null), [only]);
   const files = useGitStore.use.files();
@@ -280,7 +290,8 @@ export const ChangedFilesTree = memo(function ChangedFilesTree({
     staleTime: 30_000,
   });
 
-  const openFile = (path: string) => openGitDiff(repoPath, path, staged, commit);
+  const openFile = (path: string) =>
+    onSelect ? onSelect(path) : openGitDiff(repoPath, path, staged, commit);
 
   // Switch the whole diff tab to a different commit (or the working tree) for
   // the currently-open file.
@@ -298,6 +309,21 @@ export const ChangedFilesTree = memo(function ChangedFilesTree({
       // Turn scope, when the caller supplied one.
       .filter((f) => !onlySet || onlySet.has(f.path))
       .filter((f) => (seen.has(f.path) ? false : (seen.add(f.path), true)));
+
+    // `only` SEEDS the list, it does not merely filter it. The store lists what
+    // git currently reports as changed, and a scoped path can legitimately be
+    // missing from that: a newly created file the store has not picked up yet,
+    // one already staged, or one whose change was committed since. Filtering
+    // alone silently dropped those — the caller asked for these paths, so they
+    // are shown whether or not git is currently calling them dirty.
+    if (onlySet) {
+      for (const path of onlySet) {
+        if (seen.has(path)) continue;
+        seen.add(path);
+        scoped.push({ path, status: "A" });
+      }
+    }
+
     // Ensure the open file is present even if the store hasn't caught up.
     if (currentFile && !seen.has(currentFile)) {
       scoped.push({ path: currentFile, status: "M" });

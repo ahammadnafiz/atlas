@@ -1,4 +1,13 @@
-import { memo, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import {
+  memo,
+  useCallback,
+  useDeferredValue,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
 import * as Popover from "@radix-ui/react-popover";
 import { invoke } from "@tauri-apps/api/core";
 import {
@@ -154,37 +163,77 @@ export function SessionDetail({
 
   const s = detail.summary;
 
+  /**
+   * Entries with identity carried across detail re-reads.
+   *
+   * A LIVE Session re-reads its detail on every board refresh (a 15 s poll plus
+   * git/capture events), and each read deserializes a brand-new object for every
+   * entry — so every memo downstream rebuilt and every rendered `Row` re-rendered
+   * to display an unchanged record. The capture log is append-only: an entry with
+   * the same id is the same entry unless one of the few mutable facts about it
+   * moved (a tool completing, a body growing past its preview). Those are cheap
+   * to check, so a poll that appended one turn re-renders one row.
+   */
+  const prevEntries = useRef(new Map<string, TimelineEntry>());
+  const entries = useMemo(() => {
+    const prev = prevEntries.current;
+    const next = new Map<string, TimelineEntry>();
+    const shared = detail.entries.map((entry) => {
+      const old = prev.get(entry.id);
+      const reuse =
+        old &&
+        old.kind === entry.kind &&
+        old.toolStatus === entry.toolStatus &&
+        old.truncated === entry.truncated &&
+        old.linkState === entry.linkState &&
+        old.commitSubject === entry.commitSubject &&
+        (old.text?.length ?? 0) === (entry.text?.length ?? 0) &&
+        (old.arguments?.length ?? 0) === (entry.arguments?.length ?? 0) &&
+        (old.result?.length ?? 0) === (entry.result?.length ?? 0);
+      const kept = reuse ? old : entry;
+      next.set(entry.id, kept);
+      return kept;
+    });
+    prevEntries.current = next;
+    return shared;
+  }, [detail.entries]);
+
+  // Deferred, not raw: filtering runs over every entry's payload, and doing
+  // that synchronously per keystroke made typing in the search field pay for
+  // the whole scan. The input stays controlled by `search` (echoes instantly);
+  // the scan follows a beat behind.
+  const deferredSearch = useDeferredValue(search);
+
   const visible = useMemo(() => {
-    const needle = search.trim().toLowerCase();
-    return detail.entries.filter(
+    const needle = deferredSearch.trim().toLowerCase();
+    return entries.filter(
       (entry) => passes(entry, filters, failedOnly, tools) && matches(entry, needle),
     );
-  }, [detail.entries, filters, failedOnly, tools, search]);
+  }, [entries, filters, failedOnly, tools, deferredSearch]);
 
   /** Every tool call, unfiltered by kind — the Tool calls tab's own list. */
   const allCalls = useMemo(
     () =>
-      detail.entries.filter(
+      entries.filter(
         (entry) =>
           entry.kind === "tool_call" &&
           (!failedOnly || entry.toolStatus === "failed") &&
           (tools.size === 0 || tools.has(entry.toolName ?? "Other")),
       ),
-    [detail.entries, failedOnly, tools],
+    [entries, failedOnly, tools],
   );
 
   /** Every Checkpoint, unfiltered — the jump list must reach a commit even when
    *  the current filter hides Checkpoints from the timeline. */
   const checkpoints = useMemo(
-    () => detail.entries.filter((entry) => entry.kind === "checkpoint"),
-    [detail.entries],
+    () => entries.filter((entry) => entry.kind === "checkpoint"),
+    [entries],
   );
 
   const failedCount = useMemo(
     () =>
-      detail.entries.filter((entry) => entry.kind === "tool_call" && entry.toolStatus === "failed")
-        .length,
-    [detail.entries],
+      entries.filter((entry) => entry.kind === "tool_call" && entry.toolStatus === "failed").length,
+    [entries],
   );
 
   /**
@@ -193,11 +242,31 @@ export function SessionDetail({
    * A turn routinely fires twenty calls in a row. As twenty timeline nodes they
    * drown the two sentences either side of them; as one node with a table, the
    * turn keeps its shape.
+   *
+   * Groups get the same identity-sharing as entries: a rebuilt group whose
+   * member entries are the SAME objects as last time is returned as the
+   * previous object, so `Row`'s memo holds across live-session polls and
+   * unrelated state changes.
    */
-  const groups = useMemo(
-    () => groupEntries(foldResponses ? foldRuns(visible) : visible),
-    [visible, foldResponses],
-  );
+  const prevGroups = useRef(new Map<string, Group>());
+  const groups = useMemo(() => {
+    const built = groupEntries(foldResponses ? foldRuns(visible) : visible);
+    const prev = prevGroups.current;
+    const next = new Map<string, Group>();
+    const out = built.map((group) => {
+      const old = prev.get(group.id);
+      const reuse =
+        old &&
+        old.kind === group.kind &&
+        old.entries.length === group.entries.length &&
+        old.entries.every((e, i) => e === group.entries[i]);
+      const kept = reuse ? old : group;
+      next.set(group.id, kept);
+      return kept;
+    });
+    prevGroups.current = next;
+    return out;
+  }, [visible, foldResponses]);
 
   /**
    * The rail's ticks: one per prompt.
@@ -279,13 +348,16 @@ export function SessionDetail({
   );
 
   // A new Session or a filter change restarts the window from the top.
+  // Keyed to the DEFERRED search so the reset lands with the results it belongs
+  // to — resetting on the raw keystroke scrolled to top a beat before the list
+  // changed.
   useEffect(() => {
     setRenderCount(WINDOW_CHUNK);
     scrollRef.current?.scrollTo({ top: 0 });
     // The list was swapped wholesale; a same-height replacement would not trip
     // the ResizeObserver and every cached offset would describe the old rows.
     invalidate();
-  }, [detail.summary.id, filters, failedOnly, tools, search, foldResponses, invalidate]);
+  }, [detail.summary.id, filters, failedOnly, tools, deferredSearch, foldResponses, invalidate]);
 
   // Memoised, and load-bearing: this array is `Timeline`'s only changing prop,
   // so a fresh slice on every render would fail its memo comparison every time
@@ -386,7 +458,12 @@ export function SessionDetail({
       {tab === "activity" && anchors.length > 1 && (
         <div className="pointer-events-none absolute left-0 top-1/2 z-[35] -translate-y-1/2">
           <div className="pointer-events-none absolute inset-y-[-12px] left-0 w-10 bg-gradient-to-r from-[var(--bg-surface)] via-[var(--bg-surface)]/70 to-transparent" />
-          {/* No `overflow` here: it would clip the tooltip extending right. */}
+          {/* Ticks only — no hover tooltip. The previews kept one mounted
+           *  `backdrop-filter` element PER PROMPT stacked over the scroller
+           *  (opacity-0 still composites), which is exactly the blur cost this
+           *  codebase keeps relearning. The tick jumps; the prompt itself is
+           *  one click away, and `aria-label` keeps the preview for assistive
+           *  tech where it costs nothing. */}
           <div className="relative flex flex-col justify-center gap-1.5 py-2 pl-2 pr-4">
             {anchors.map((anchor, i) => (
               <button
@@ -404,12 +481,6 @@ export function SessionDetail({
                       : "w-2 bg-[var(--text-tertiary)]/40 group-hover:w-3 group-hover:bg-[var(--text-tertiary)]",
                   )}
                 />
-                <span
-                  className="pointer-events-none absolute left-5 top-1/2 z-[50] max-w-[260px] -translate-y-1/2 translate-x-[-4px] truncate rounded-md border border-[var(--border-default)] bg-[var(--bg-elevated)] px-2 py-1 text-[10px] text-[var(--text-secondary)] opacity-0 shadow-[var(--shadow-overlay)] transition-all duration-150 group-hover:translate-x-0 group-hover:opacity-100"
-                  style={{ backdropFilter: "blur(8px)" }}
-                >
-                  {anchor.preview || "(prompt)"}
-                </span>
               </button>
             ))}
           </div>
@@ -1245,6 +1316,14 @@ function lineDelta(args: string | null): { added: number; removed: number } {
   return { added, removed };
 }
 
+/** Calls mounted before the table asks to grow. Generous for the inline group
+ *  (a turn rarely fires this many) so the control only ever appears on the Tool
+ *  calls tab — which was the one unwindowed list in the feature: a tool-heavy
+ *  Session mounted every call as a row in a single commit. */
+const CALL_WINDOW = 120;
+/** How many more each click reveals. */
+const CALL_WINDOW_GROW = 400;
+
 /** The compact call table, shared by the inline group and the Tool calls tab. */
 function CallTable({
   calls,
@@ -1256,6 +1335,13 @@ function CallTable({
   compact?: boolean;
 }) {
   const [open, setOpen] = useState<string | null>(null);
+  const [shown, setShown] = useState(CALL_WINDOW);
+  // One stable handler for every row — the per-row closure was what forced the
+  // whole table to re-render on a single expand.
+  const toggle = useCallback((id: string) => setOpen((cur) => (cur === id ? null : id)), []);
+
+  // A different call list is a different table — restart the window.
+  useEffect(() => setShown(CALL_WINDOW), [calls]);
 
   if (calls.length === 0) {
     return (
@@ -1265,6 +1351,9 @@ function CallTable({
     );
   }
 
+  const visibleCalls = calls.length > shown ? calls.slice(0, shown) : calls;
+  const hidden = calls.length - visibleCalls.length;
+
   return (
     <div
       className={cn(
@@ -1272,91 +1361,127 @@ function CallTable({
         dense ? "mt-2.5" : "mt-5",
       )}
     >
-      {calls.map((call, i) => {
-        const expanded = open === call.id;
-        const failed = call.toolStatus === "failed";
-        return (
-          <div key={call.id}>
-            <button
-              type="button"
-              onClick={() => setOpen(expanded ? null : call.id)}
-              className={cn(
-                "grid w-full cursor-pointer items-center gap-3 bg-[var(--bg-raised)] px-3 text-left transition-colors hover:bg-[var(--bg-hover)]",
-                dense
-                  ? "h-8 grid-cols-[76px_minmax(0,1fr)_16px]"
-                  : "h-9 grid-cols-[64px_76px_minmax(0,1fr)_16px]",
-                i < calls.length - 1 && "border-b border-[var(--border-subtle)]",
-              )}
-            >
-              {!dense && (
-                <span className="font-mono text-[10.5px] text-[var(--text-ghost)]">
-                  {time(call.at)}
-                </span>
-              )}
-              <span
-                className={cn(
-                  "truncate font-mono text-[11px]",
-                  failed ? "text-[var(--status-error)]" : "text-[var(--status-info)]",
-                )}
-              >
-                {call.toolName ?? "Other"}
-              </span>
-              <span className="min-w-0 truncate font-mono text-[11px] text-[var(--text-tertiary)]">
-                {call.paths[0] ?? call.toolTitle ?? ""}
-              </span>
-              <ChevronRight
-                size={12}
-                className={cn(
-                  "text-[var(--border-strong)] transition-transform",
-                  expanded && "rotate-90",
-                )}
-              />
-            </button>
-
-            {expanded && (
-              <div className="space-y-2.5 border-b border-[var(--border-subtle)] bg-[var(--bg-base)] px-3 py-3">
-                {call.paths.length > 0 && (
-                  <p className="font-mono text-[11px] text-[var(--text-tertiary)]">
-                    {call.paths.join("  ·  ")}
-                  </p>
-                )}
-                {call.arguments && (
-                  <Pre
-                    label="Arguments"
-                    text={call.arguments}
-                    json
-                    projectPath={projectPath}
-                    blobRef={spilledRef(call.argumentsRef, call.arguments)}
-                  />
-                )}
-                {call.resultBinary ? (
-                  <p className="font-mono text-[11px] text-[var(--text-tertiary)]">
-                    The result is binary and is not shown.
-                  </p>
-                ) : (
-                  call.result && (
-                    <Pre
-                      label="Result"
-                      text={call.result}
-                      path={call.paths[0]}
-                      projectPath={projectPath}
-                      blobRef={spilledRef(call.resultRef, call.result)}
-                    />
-                  )
-                )}
-                {!call.arguments && !call.result && !call.resultBinary && (
-                  <p className="font-mono text-[11px] text-[var(--text-ghost)]">
-                    Nothing else was recorded for this call.
-                  </p>
-                )}
-              </div>
-            )}
-          </div>
-        );
-      })}
+      {visibleCalls.map((call, i) => (
+        <CallRow
+          key={call.id}
+          call={call}
+          dense={dense}
+          expanded={open === call.id}
+          divider={i < visibleCalls.length - 1 || hidden > 0}
+          onToggle={toggle}
+          projectPath={projectPath}
+        />
+      ))}
+      {hidden > 0 && (
+        <button
+          type="button"
+          onClick={() => setShown((cur) => cur + CALL_WINDOW_GROW)}
+          className="flex h-9 w-full cursor-pointer items-center justify-center bg-[var(--bg-raised)] font-mono text-[11px] text-[var(--text-tertiary)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
+        >
+          Show {Math.min(CALL_WINDOW_GROW, hidden)} more of {hidden}…
+        </button>
+      )}
     </div>
   );
 }
+
+/**
+ * One call: the summary row, and the recorded payloads when expanded.
+ *
+ * Memoised so the table's own state changes touch only the rows they concern:
+ * expanding a call re-renders that row and the one it closed, not every row in
+ * a table that can hold a Session's entire call history.
+ */
+const CallRow = memo(function CallRow({
+  call,
+  dense,
+  expanded,
+  divider,
+  onToggle,
+  projectPath,
+}: {
+  call: TimelineEntry;
+  dense?: boolean;
+  expanded: boolean;
+  divider: boolean;
+  onToggle: (id: string) => void;
+  projectPath: string;
+}) {
+  const failed = call.toolStatus === "failed";
+  return (
+    <div>
+      <button
+        type="button"
+        onClick={() => onToggle(call.id)}
+        className={cn(
+          "grid w-full cursor-pointer items-center gap-3 bg-[var(--bg-raised)] px-3 text-left transition-colors hover:bg-[var(--bg-hover)]",
+          dense
+            ? "h-8 grid-cols-[76px_minmax(0,1fr)_16px]"
+            : "h-9 grid-cols-[64px_76px_minmax(0,1fr)_16px]",
+          divider && "border-b border-[var(--border-subtle)]",
+        )}
+      >
+        {!dense && (
+          <span className="font-mono text-[10.5px] text-[var(--text-ghost)]">{time(call.at)}</span>
+        )}
+        <span
+          className={cn(
+            "truncate font-mono text-[11px]",
+            failed ? "text-[var(--status-error)]" : "text-[var(--status-info)]",
+          )}
+        >
+          {call.toolName ?? "Other"}
+        </span>
+        <span className="min-w-0 truncate font-mono text-[11px] text-[var(--text-tertiary)]">
+          {call.paths[0] ?? call.toolTitle ?? ""}
+        </span>
+        <ChevronRight
+          size={12}
+          className={cn("text-[var(--border-strong)] transition-transform", expanded && "rotate-90")}
+        />
+      </button>
+
+      {expanded && (
+        <div className="space-y-2.5 border-b border-[var(--border-subtle)] bg-[var(--bg-base)] px-3 py-3">
+          {call.paths.length > 0 && (
+            <p className="font-mono text-[11px] text-[var(--text-tertiary)]">
+              {call.paths.join("  ·  ")}
+            </p>
+          )}
+          {call.arguments && (
+            <Pre
+              label="Arguments"
+              text={call.arguments}
+              json
+              projectPath={projectPath}
+              blobRef={spilledRef(call.argumentsRef, call.arguments)}
+            />
+          )}
+          {call.resultBinary ? (
+            <p className="font-mono text-[11px] text-[var(--text-tertiary)]">
+              The result is binary and is not shown.
+            </p>
+          ) : (
+            call.result && (
+              <Pre
+                label="Result"
+                text={call.result}
+                path={call.paths[0]}
+                projectPath={projectPath}
+                blobRef={spilledRef(call.resultRef, call.result)}
+              />
+            )
+          )}
+          {!call.arguments && !call.result && !call.resultBinary && (
+            <p className="font-mono text-[11px] text-[var(--text-ghost)]">
+              Nothing else was recorded for this call.
+            </p>
+          )}
+        </div>
+      )}
+    </div>
+  );
+});
 
 // ── Checkpoint ──────────────────────────────────────────────────────────────
 
@@ -1704,6 +1829,14 @@ function CheckpointJump({
     );
   }, [checkpoints, query]);
 
+  /** Position in the FULL list — `#3` must mean the third Checkpoint of the
+   *  Session even when the search has narrowed what's shown. (Also drops the
+   *  `indexOf` inside the render map, which was quadratic.) */
+  const ordinal = useMemo(
+    () => new Map(checkpoints.map((c, i) => [c.id, i + 1])),
+    [checkpoints],
+  );
+
   return (
     <Popover.Root
       open={open}
@@ -1768,7 +1901,7 @@ function CheckpointJump({
                     </span>
                     <span className="flex items-center gap-1.5 font-mono text-[10.5px] text-[var(--text-ghost)]">
                       <span>
-                        #{checkpoints.indexOf(checkpoint) + 1 || i + 1} · {sha.slice(0, 7)}
+                        #{ordinal.get(checkpoint.id) ?? i + 1} · {sha.slice(0, 7)}
                       </span>
                       {changed > 0 && (
                         <>
@@ -2309,28 +2442,48 @@ function passes(
 /**
  * Free-text search over one entry.
  *
- * Deliberately searches the *fields*, not one concatenated haystack: a tool name
- * and a path are short and precise, and folding them into the body text would
- * let a match deep inside a 60 KB result outrank the call that names the file
- * being looked for. Payloads are searched too — a stack trace is exactly the
- * thing someone comes back to a Session to find — but a truncated entry can only
- * match on its preview, which is stated on the row rather than silently missed.
+ * The haystack — every searchable field lowercased and joined — is built ONCE
+ * per entry and cached in a WeakMap. Building it per keystroke was the cost
+ * that made search feel heavy: `arguments` and `result` previews run to 64 KB,
+ * a Session runs to hundreds of entries, and `toLowerCase()` over all of it
+ * allocated megabytes of transient strings for every character typed. The
+ * entry-sharing pass above is what makes the WeakMap effective across live
+ * polls: a reused entry object keeps its haystack.
+ *
+ * Fields are joined with `\n`, which a single-line search input can never
+ * contain, so a needle cannot falsely match across a field boundary. Payloads
+ * are searched too — a stack trace is exactly the thing someone comes back to
+ * a Session to find — but a truncated entry can only match on its preview,
+ * which is stated on the row rather than silently missed.
  */
+const haystacks = new WeakMap<TimelineEntry, string>();
+
+function haystack(entry: TimelineEntry): string {
+  let built = haystacks.get(entry);
+  if (built === undefined) {
+    built = [
+      entry.text,
+      entry.toolName,
+      entry.toolTitle,
+      entry.commitSubject,
+      entry.commitSha,
+      entry.branch,
+      entry.arguments,
+      entry.result,
+      ...entry.paths,
+      ...entry.files,
+    ]
+      .filter(Boolean)
+      .join("\n")
+      .toLowerCase();
+    haystacks.set(entry, built);
+  }
+  return built;
+}
+
 function matches(entry: TimelineEntry, needle: string): boolean {
   if (!needle) return true;
-  const has = (v: string | null) => !!v && v.toLowerCase().includes(needle);
-  return (
-    has(entry.text) ||
-    has(entry.toolName) ||
-    has(entry.toolTitle) ||
-    has(entry.commitSubject) ||
-    has(entry.commitSha) ||
-    has(entry.branch) ||
-    has(entry.arguments) ||
-    has(entry.result) ||
-    entry.paths.some((p) => p.toLowerCase().includes(needle)) ||
-    entry.files.some((f) => f.toLowerCase().includes(needle))
-  );
+  return haystack(entry).includes(needle);
 }
 
 /** `18:29 → 19:27`, the span under the duration metric. */

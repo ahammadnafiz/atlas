@@ -54,11 +54,6 @@ export const updater = {
   ignore: (version: string) => invoke<void>("update_ignore", { version }),
 };
 
-export const listenUpdateAvailable = (
-  handler: (e: UpdateAvailable) => void,
-): Promise<UnlistenFn> =>
-  listen<UpdateAvailable>("atlas:update-available", (e) => handler(e.payload));
-
 export const listenUpdateProgress = (
   handler: (e: UpdateProgress) => void,
 ): Promise<UnlistenFn> =>

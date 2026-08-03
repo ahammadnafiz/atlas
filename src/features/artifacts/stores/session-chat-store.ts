@@ -41,6 +41,14 @@ interface SessionChatThread {
   provider: string;
   model: string;
   messages: ChatMessage[];
+  /**
+   * Commit SHAs this thread grounds on. `null` = the whole Session.
+   *
+   * Per THREAD rather than per panel: a thread asking about one Checkpoint
+   * should still be about it when reopened tomorrow, and two threads about the
+   * same Session can legitimately be scoped differently.
+   */
+  checkpointScope: string[] | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -67,10 +75,13 @@ interface SessionChatState {
     /** Install the stream listener. Idempotent. */
     init: () => Promise<void>;
     /** Load this Session's thread list, opening the newest or a fresh one. */
-    open: (agentSessionId: string, projectPath: string) => Promise<void>;
+    /** `defaultScope` seeds a thread this call has to create — see `create`. */
+    open: (agentSessionId: string, projectPath: string, defaultScope?: string[] | null) => Promise<void>;
     select: (agentSessionId: string, threadId: string) => Promise<void>;
-    create: (agentSessionId: string, projectPath: string) => string;
-    remove: (agentSessionId: string, threadId: string) => Promise<void>;
+    /** `checkpointScope` seeds the thread's grounding — see the field's doc. */
+    create: (agentSessionId: string, projectPath: string, checkpointScope?: string[] | null) => string;
+    setCheckpointScope: (threadId: string, scope: string[] | null) => void;
+    remove: (agentSessionId: string, threadId: string, defaultScope?: string[] | null) => Promise<void>;
     setProvider: (threadId: string, provider: string) => void;
     setModel: (threadId: string, model: string) => void;
     send: (threadId: string, text: string) => Promise<void>;
@@ -105,6 +116,7 @@ function toWire(
     projectPath: t.projectPath,
     provider: t.provider,
     model: t.model,
+    checkpointScope: t.checkpointScope,
     createdAt: t.createdAt,
     updatedAt: t.updatedAt,
     messages: t.messages.map((m) => ({
@@ -127,6 +139,9 @@ function fromWire(w: SessionChatThreadWire): {
   }
   const thread: SessionChatThread = {
     ...w,
+    // Absent on threads written before scoping shipped — those grounded on the
+    // whole Session, so that is what they keep doing.
+    checkpointScope: w.checkpointScope ?? null,
     messages: w.messages.map((m) => ({
       id: m.id,
       role: m.role as ChatMessage["role"],
@@ -167,7 +182,7 @@ const useSessionChatStoreBase = create<SessionChatState>()((set, get) => ({
       await listenModelChat((e) => onEvent(set, get, e));
     },
 
-    open: async (agentSessionId, projectPath) => {
+    open: async (agentSessionId, projectPath, defaultScope = null) => {
       let metas: ThreadMeta[] = [];
       try {
         metas = await sessionChat.threadsList(agentSessionId);
@@ -181,7 +196,7 @@ const useSessionChatStoreBase = create<SessionChatState>()((set, get) => ({
       if (get().activeByAgent[agentSessionId]) return;
 
       if (metas.length === 0) {
-        get().actions.create(agentSessionId, projectPath);
+        get().actions.create(agentSessionId, projectPath, defaultScope);
         return;
       }
       await get().actions.select(agentSessionId, metas[0].id);
@@ -206,7 +221,7 @@ const useSessionChatStoreBase = create<SessionChatState>()((set, get) => ({
       }
     },
 
-    create: (agentSessionId, projectPath) => {
+    create: (agentSessionId, projectPath, checkpointScope = null) => {
       const id = uid();
       // Provider and model carry over from the thread just open: someone who
       // picked a model for this Session means it for the next question too.
@@ -219,6 +234,7 @@ const useSessionChatStoreBase = create<SessionChatState>()((set, get) => ({
         provider: prior?.provider ?? "",
         model: prior?.model ?? "",
         messages: [],
+        checkpointScope,
         createdAt: now(),
         updatedAt: now(),
       };
@@ -232,7 +248,19 @@ const useSessionChatStoreBase = create<SessionChatState>()((set, get) => ({
       return id;
     },
 
-    remove: async (agentSessionId, threadId) => {
+    setCheckpointScope: (threadId, scope) => {
+      const thread = get().threads[threadId];
+      if (!thread) return;
+      const next = { ...thread, checkpointScope: scope, updatedAt: now() };
+      set((st) => ({ threads: { ...st.threads, [threadId]: next } }));
+      // Only persist a thread that already exists on disk — an empty one is
+      // deliberately unsaved until its first question (see `create`).
+      if (next.messages.length > 0) {
+        void sessionChat.threadSave(toWire(next, get().sourcesByMsg)).catch(() => {});
+      }
+    },
+
+    remove: async (agentSessionId, threadId, defaultScope = null) => {
       await sessionChat.threadDelete(agentSessionId, threadId).catch(() => {});
       const wasActive = get().activeByAgent[agentSessionId] === threadId;
       const projectPath = get().threads[threadId]?.projectPath ?? "";
@@ -254,7 +282,7 @@ const useSessionChatStoreBase = create<SessionChatState>()((set, get) => ({
       // way back except closing and reopening it.
       if (!wasActive) return;
       if (metas.length > 0) await get().actions.select(agentSessionId, metas[0].id);
-      else get().actions.create(agentSessionId, projectPath);
+      else get().actions.create(agentSessionId, projectPath, defaultScope);
     },
 
     setProvider: (threadId, provider) =>
@@ -308,6 +336,7 @@ const useSessionChatStoreBase = create<SessionChatState>()((set, get) => ({
           thread.projectPath,
           thread.agentSessionId,
           trimmed,
+          thread.checkpointScope,
         );
         set((st) => ({ sourcesByMsg: { ...st.sourcesByMsg, [assistantMsg.id]: sources } }));
 

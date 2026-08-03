@@ -11,6 +11,7 @@
 // Geometry matches the Git Graph's fullscreen (`git-graph-panel.tsx`), so the
 // two "expand this into the whole window" surfaces behave identically.
 
+import { useEffect, useState } from "react";
 import * as Dialog from "@radix-ui/react-dialog";
 import { X } from "lucide-react";
 // Imported DIRECTLY, not lazily. This module is itself lazy-loaded by the chat,
@@ -29,15 +30,27 @@ export function GitDiffModal({
    *  the reader to pick makes them do work the caller already knows the answer
    *  to. */
   files,
+  initialFile,
+  textSources,
   title,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   repoPath: string;
   files: string[];
+  /** Which file to land on. Falls back to the first. */
+  initialFile?: string;
+  /** Before/after text per path — see `GitDiffPanel.textSources`. */
+  textSources?: Record<string, { old: string; new: string }>;
   title?: string;
 }) {
-  const first = files[0] ?? "";
+  const first = initialFile || files[0] || "";
+  // The modal owns which file is shown. The tree cannot use its default click
+  // behaviour here — that opens the standalone Git Diff module tab, which both
+  // left this modal stuck on one file and dropped a workbench tab behind it.
+  const [active, setActive] = useState(first);
+  // Reopening on a different file (or a different turn) must retarget.
+  useEffect(() => setActive(first), [first]);
   return (
     <Dialog.Root open={open} onOpenChange={onOpenChange}>
       <Dialog.Portal>
@@ -71,10 +84,12 @@ export function GitDiffModal({
                 something the reader never asked about. */}
             <GitDiffPanel
               repoPath={repoPath}
-              file={first}
+              file={active}
               staged={false}
               hidePicker
               only={files}
+              textSources={textSources}
+              onSelectFile={setActive}
             />
           </div>
         </Dialog.Content>

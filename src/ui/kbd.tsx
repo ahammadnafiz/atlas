@@ -27,7 +27,7 @@ function KbdGroup({ className, ...props }: React.ComponentProps<"div">) {
 }
 
 /** Split a string like "⌘⇧F" or "⌘," into individual key glyphs. */
-export function splitKeys(combo: string): string[] {
+function splitKeys(combo: string): string[] {
   // Modifier glyphs are single chars; non-modifier "keys" may be multi-char names like "Enter".
   // We just split codepoints — works because all our combos are single-char per slot.
   return Array.from(combo);

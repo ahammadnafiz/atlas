@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useWorkspaceGitStore, type GitSummary } from "../stores/workspace-git-store";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
@@ -53,7 +53,12 @@ const CHAT_H = 60;
 const CHAT_CARD = 54;
 const HEADER_H = 26;
 
-function WorkspaceRow({
+// Memoised: every git-summary resolution replaces the summaries map and
+// re-rendered EVERY visible row (each carrying a Radix dropdown tree). Props
+// are memo-friendly by construction — `ws` objects are only remapped on
+// workspace mutations, `summary` changes only for its own path, `groups` is
+// store-stable — so a background summary refresh now re-renders one row.
+const WorkspaceRow = memo(function WorkspaceRow({
   ws,
   active,
   summary,
@@ -269,7 +274,7 @@ function WorkspaceRow({
       </div>
     </div>
   );
-}
+});
 
 function GroupHeaderRow({
   group,

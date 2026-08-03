@@ -23,7 +23,7 @@ import { stripNextSteps } from "./next-steps";
 import { stripInjectedContext } from "./atlas-context";
 
 /** Thread title = the first user message, cleaned and clamped. */
-export function threadTitle(tabId: string): string {
+function threadTitle(tabId: string): string {
   const session = useChatStore.getState().sessions[tabId];
   const firstUser = session?.messages.find((m) => m.role === "user");
   const raw = stripNextSteps(
@@ -34,7 +34,7 @@ export function threadTitle(tabId: string): string {
   return raw.slice(0, 80) || "Agent chat";
 }
 
-export function buildThreadMarkdown(tabId: string): string | null {
+function buildThreadMarkdown(tabId: string): string | null {
   const session = useChatStore.getState().sessions[tabId];
   if (!session) return null;
   const lines: string[] = [`# ${threadTitle(tabId)}`, ""];

@@ -5,14 +5,6 @@ export type AgentType = "claude-code" | "codex" | "cersei" | "custom";
 /** Switchable (Atlas-shipped) agents — excludes the catch-all "custom". */
 export type SwitchableAgent = "claude-code" | "codex" | "cersei";
 
-/** Map a high-level agent type to the spawnable plugin id (registry.rs /
- *  atlas-cersei). "cersei" is Atlas's native in-process agent. */
-export const AGENT_PLUGIN_ID: Record<SwitchableAgent, string> = {
-  "claude-code": "claude-code-ts",
-  codex: "codex",
-  cersei: "cersei",
-};
-
 /** The coding agents Atlas ships, in switch order (for option+/). */
 export const SWITCHABLE_AGENTS: SwitchableAgent[] = ["claude-code", "codex", "cersei"];
 

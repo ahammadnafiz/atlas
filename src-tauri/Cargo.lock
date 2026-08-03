@@ -360,7 +360,6 @@ dependencies = [
  "atlas-embed",
  "atlas-gitdiff",
  "atlas-memory",
- "atlas-redact",
  "atlas-review",
  "atlas-terminal",
  "base64 0.21.7",
@@ -421,7 +420,6 @@ dependencies = [
  "async-trait",
  "atlas-acp",
  "tokio",
- "tracing",
  "uuid",
 ]
 

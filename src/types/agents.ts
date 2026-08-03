@@ -93,6 +93,10 @@ export interface SessionSnapshot {
    *  Claude Code / Codex model picker; empty when unsupported. */
   available_models: SessionModeInfo[];
   available_commands: unknown[];
+  /** Raw ACP `config_option_update` state — advertised config options and
+   *  their current values. No UI consumes this yet; mirrored so an in-agent
+   *  change (e.g. `/model`) is at least visible in the snapshot. */
+  config_options?: unknown[];
   /** Whether the agent's transport accepts image content blocks in prompts
    *  (`promptCapabilities.image`). Drives the composer's attach routing:
    *  true → picked/pasted images become inline base64 attachments; false →

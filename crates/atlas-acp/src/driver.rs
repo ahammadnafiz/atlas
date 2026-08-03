@@ -462,9 +462,19 @@ async fn run_driver(
             // with structured subprocess specs we can actually run.
             // Without this flag the adapter returns an empty auth-methods
             // list and `/login` has no way to launch the OAuth flow.
+            //
+            // `_meta.terminal_output: true` opts into LIVE command output:
+            // claude-agent-acp and codex-acp share this meta contract — a
+            // Bash-shaped tool_call carries `terminal_info` and its updates
+            // stream `terminal_output` / `terminal_exit` in `_meta`, which
+            // the apply layer folds into the tool call's visible result as
+            // it runs. Without the flag both adapters only deliver output
+            // once the command has finished. (Underscore vs. dash matches
+            // each adapter's key exactly — Zed advertises both spellings.)
             let mut caps = ClientCapabilities::default();
             let mut meta = Map::new();
             meta.insert("terminal-auth".into(), Value::Bool(true));
+            meta.insert("terminal_output".into(), Value::Bool(true));
             caps.meta = Some(meta);
 
             let init_result = connection

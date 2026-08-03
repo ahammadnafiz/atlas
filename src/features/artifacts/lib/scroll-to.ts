@@ -2,12 +2,13 @@
  * Animated scroll that survives a list whose height is still settling.
  *
  * `scrollIntoView({ behavior: "smooth" })` samples the target's position **once**
- * and animates to that number. Timeline rows carry `content-visibility: auto`,
- * so every row the scroll passes over is laid out for the first time *during*
- * the animation — each one replacing its 96px placeholder with its real height.
- * The single sampled offset is wrong by the time the animation reaches it, so
- * the browser lands somewhere else and the intervening rows are still blank when
- * it gets there.
+ * and animates to that number. A jump routinely grows the render window first,
+ * so the rows between here and the target are freshly mounted — markdown still
+ * resolving off the worker, clamps still measuring — and each one that settles
+ * moves the target. (Rows once carried `content-visibility: auto`, which made
+ * this worse; that is gone, but the settling-height problem is inherent to
+ * jumping into just-mounted content.) The single sampled offset is wrong by the
+ * time the animation reaches it, so the browser lands somewhere else.
  *
  * This re-reads the target every frame and eases toward wherever it *now* is, so
  * the correction is absorbed continuously instead of arriving as a jump at the

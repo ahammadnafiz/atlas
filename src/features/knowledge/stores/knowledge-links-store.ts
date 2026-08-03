@@ -98,7 +98,7 @@ export function useBacklinks(entryId: string | null): Backlink[] {
 
 /** Hook: live counts for the Properties strip's "References" row and
  *  any "N backlinks" badges. */
-export function useLinkCounts(entryId: string | null): LinkCounts {
+function useLinkCounts(entryId: string | null): LinkCounts {
   const projectPath = useKnowledgeLinksStore.use.projectPath();
   const rev = useKnowledgeLinksStore.use.rev();
   const [counts, setCounts] = useState<LinkCounts>({ backlinks: 0, forwardlinks: 0 });

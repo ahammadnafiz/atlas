@@ -21,6 +21,7 @@ import { AgentMark } from "@/components/agent-mark";
 import { ProviderModelPills } from "./provider-model-pills";
 import { loadCerseiEffort, loadCerseiCompress } from "../lib/cersei-model-pref";
 import { loadCachedAcpModels } from "../lib/acp-models-cache";
+import { modelLabel } from "../lib/model-label";
 // `ChatInput` pulls in CodeMirror (~870 KB) via `cm-mention-extension`.
 // We import it dynamically so the chunk is not in the initial preload set.
 // The import is kicked off at module-evaluation time (below, outside the
@@ -389,11 +390,6 @@ function AcpModePicker({ tabId }: { tabId: string }) {
  * dropup mirroring the mode picker. Hidden when the agent exposes no models or
  * for the native agent (which uses ProviderModelPills + its BYOK catalog).
  */
-/** Claude Code advertises its default model as "Recommended"; show "Default". */
-function modelLabel(m: { id: string; name: string }): string {
-  if (m.name.trim().toLowerCase() === "recommended" || m.id === "default") return "Default";
-  return m.name;
-}
 
 function AcpModelPicker({ tabId }: { tabId: string }) {
   const currentModel = useChatStore((s) => s.sessions[tabId]?.acpCurrentModel);

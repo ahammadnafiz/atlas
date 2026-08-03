@@ -19,6 +19,7 @@ import { useChatStore } from "@/features/chat/stores/chat-store";
 import { useTerminalStore } from "@/features/terminal/stores/terminal-store";
 import { useOrgStore } from "@/features/organisations/stores/org-store";
 import { isWorkspaceRunning } from "../lib/agent-activity";
+import { markFileIndexClosedFor } from "@/features/file-picker/lib/file-picker-api";
 
 /** The active org id, used to tag newly-created workspaces/groups so they
  *  belong to the org the user is currently in. Read lazily to avoid an
@@ -192,6 +193,10 @@ function teardownHot(id: string): void {
   }
   evictSnapshot(id);
   useLayoutStore.getState().actions.removeWorkspaceView(id);
+  // The picker's no-IPC fast path must stop vouching for an index that is
+  // about to be torn down.
+  const path = useWorkspaceStore.getState().workspaces.find((w) => w.id === id)?.path;
+  if (path) markFileIndexClosedFor(path);
   void invoke("fileindex_close_project", { workspaceId: id }).catch(() => {});
   void invoke("git_watch_stop", { workspaceId: id }).catch(() => {});
   void invoke("recent_files_close_project", { workspaceId: id }).catch(() => {});
@@ -369,7 +374,11 @@ export const useWorkspaceStore = createSelectors(
             // The snapshot is then taken AFTER the flush so it reflects the
             // just-saved state. `flushAll` swallows per-store errors, so a bad
             // flush can't block the switch.
-            await flushAll({ workspaceId: activeWorkspaceId, path: outgoingPath });
+            await flushAll({
+              workspaceId: activeWorkspaceId,
+              path: outgoingPath,
+              reason: "switch",
+            });
             captureSnapshot(activeWorkspaceId);
           }
 
