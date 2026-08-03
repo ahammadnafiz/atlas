@@ -2,7 +2,15 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches:
+      - main
+      # Version branches (0.2.5, 0.10.0, …). Not for the check itself — work
+      # lands here via PRs that were already checked — but so the branch owns a
+      # warm dependency cache. A pull request can restore caches from its base
+      # branch, and with no run ever having happened on a version branch there
+      # was nothing to restore: every contributor's first run rebuilt all 920
+      # crates from scratch, which is ~16 minutes on the app job versus ~2.
+      - '[0-9]+.[0-9]+.[0-9]+'
   pull_request:
 
 # A new push to the same branch makes the previous run's answer irrelevant.
