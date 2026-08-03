@@ -111,12 +111,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-      # Deliberately not cached. These jobs finish in 13–59s from cold, so a
-      # cache saves them almost nothing — but all jobs in the repo share a
-      # single 10 GB cache quota, and 14 dependency trees stored here would
-      # keep evicting the `app` job's cache, which is worth minutes. The whole
-      # budget is better spent there.
-      #
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/${{ matrix.crate }}
       # Several suites build real git repositories in a tempdir, and `git
       # commit` refuses to run without an identity. Set for every crate so
       # adding such a test to another crate doesn't fail mysteriously.
