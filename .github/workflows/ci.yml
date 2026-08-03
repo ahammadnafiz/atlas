@@ -14,6 +14,15 @@ concurrency:
 permissions:
   contents: read
 
+env:
+  # Incremental compilation only pays off across repeated local rebuilds; a CI
+  # job compiles once and throws the machine away, so it is pure overhead here.
+  CARGO_INCREMENTAL: 0
+  # `line-tables-only` rather than the default full debug info: it is most of
+  # the build-time and artifact-size saving while still giving panics real file
+  # and line numbers, which is the whole point of reading a failed CI log.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+
 jobs:
   frontend:
     name: frontend
@@ -102,9 +111,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: crates/${{ matrix.crate }}
+      # Deliberately not cached. These jobs finish in 13–59s from cold, so a
+      # cache saves them almost nothing — but all jobs in the repo share a
+      # single 10 GB cache quota, and 14 dependency trees stored here would
+      # keep evicting the `app` job's cache, which is worth minutes. The whole
+      # budget is better spent there.
+      #
       # Several suites build real git repositories in a tempdir, and `git
       # commit` refuses to run without an identity. Set for every crate so
       # adding such a test to another crate doesn't fail mysteriously.
