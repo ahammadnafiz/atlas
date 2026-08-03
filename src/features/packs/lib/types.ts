@@ -18,15 +18,6 @@ export type ComponentKind =
   | "rule"
   | "script";
 
-export const COMPONENT_KINDS: ComponentKind[] = [
-  "skill",
-  "agent",
-  "command",
-  "hook",
-  "rule",
-  "script",
-];
-
 /** One skills.sh search hit. `source` is a GitHub `owner/repo`. */
 export interface PackSearchHit {
   id: string;

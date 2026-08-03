@@ -347,14 +347,14 @@ export interface MentionRange {
 /** Insert a mention. The provided `from`/`to` is the slice of doc the
  *  shortform string already occupies — the caller is expected to have
  *  produced that text in the same transaction (see `insertMention`). */
-export const addMentionEffect = StateEffect.define<MentionRange>();
+const addMentionEffect = StateEffect.define<MentionRange>();
 
 /** Drop a mention by id without changing the doc. The doc text remains
  *  but loses chip rendering and atomic behavior. (We don't currently use
  *  this — kept for parity with `addMentionEffect`.) */
-export const removeMentionEffect = StateEffect.define<{ id: string }>();
+const removeMentionEffect = StateEffect.define<{ id: string }>();
 
-export const mentionField = StateField.define<MentionRange[]>({
+const mentionField = StateField.define<MentionRange[]>({
   create: () => [],
   update(value, tr) {
     // Map existing ranges through the doc changes first.

@@ -13,7 +13,7 @@ import {
 import type { DiffLineStatus } from "@/features/git/lib/git-diff-api";
 
 /** Push a fresh line-status snapshot into the gutter. */
-export const setDiffStatus = StateEffect.define<DiffLineStatus>();
+const setDiffStatus = StateEffect.define<DiffLineStatus>();
 
 class BarMarker extends GutterMarker {
   constructor(readonly cls: string) {

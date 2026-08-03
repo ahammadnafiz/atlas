@@ -17,7 +17,7 @@ export function getFilePathFromInput(
 }
 
 /** Tools that mutate files (Claude Code, Codex, native). */
-export const EDIT_TOOLS = new Set([
+const EDIT_TOOLS = new Set([
   "edit",
   "write",
   "multiedit",

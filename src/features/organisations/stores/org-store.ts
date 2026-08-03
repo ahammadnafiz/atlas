@@ -442,8 +442,3 @@ export const useOrgStore = createSelectors(
   })),
 );
 
-/** Convenience: the active `Organisation` record (or null). */
-export function activeOrganisation(): Organisation | null {
-  const { organisations, activeOrganisationId } = useOrgStore.getState();
-  return organisations.find((o) => o.id === activeOrganisationId) ?? null;
-}

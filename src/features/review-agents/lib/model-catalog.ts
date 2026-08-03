@@ -70,7 +70,7 @@ const NON_CODING = [
 ];
 
 /** Whether `id` looks like a usable text/coding model (vs an embedding/TTS/etc.). */
-export function isCodingModel(id: string): boolean {
+function isCodingModel(id: string): boolean {
   const lower = id.toLowerCase();
   return !NON_CODING.some((bad) => lower.includes(bad));
 }

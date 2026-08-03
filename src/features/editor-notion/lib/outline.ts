@@ -27,7 +27,7 @@ function slugify(text: string): string {
 
 /** Walk the doc once and emit headings — used by both the hook and any
  *  imperative callers that just want a snapshot. */
-export function extractOutline(editor: Editor): OutlineHeading[] {
+function extractOutline(editor: Editor): OutlineHeading[] {
   const out: OutlineHeading[] = [];
   const slugCount = new Map<string, number>();
   editor.state.doc.descendants((node, pos) => {

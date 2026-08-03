@@ -179,9 +179,3 @@ export const useMembersStore = createSelectors(
   }),
 );
 
-/** The cached roster for `orgId`, or an empty one. Never returns undefined so
- *  callers don't each re-implement the not-loaded-yet case. */
-export function rosterFor(orgId: string | null | undefined): OrgRoster {
-  if (!orgId) return EMPTY;
-  return useMembersStore.getState().byOrg[orgId] ?? EMPTY;
-}

@@ -71,7 +71,7 @@ function uniqueFontFamilies(families: string[]): string[] {
  * Build the terminal font-family string with a guaranteed native + generic
  * tail. Order matters: requested fonts → platform native → `monospace`.
  */
-export function buildTerminalFontFamily(primaryFont: string): string {
+function buildTerminalFontFamily(primaryFont: string): string {
   const requested = splitFontFamilyList(primaryFont).filter(
     (f) => !CSS_GENERIC_FONT_FAMILIES.has(f.toLowerCase()),
   );

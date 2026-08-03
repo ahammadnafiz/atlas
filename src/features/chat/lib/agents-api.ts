@@ -197,4 +197,3 @@ export function resetAgent(pluginId?: string): void {
 // Back-compat thin wrappers (default = Claude) for existing callers.
 export const ensureDefaultAgent = (): Promise<AgentInfo> => ensureAgent(DEFAULT_PLUGIN_ID);
 export const getDefaultAgentSync = (): AgentInfo | null => getAgentSync(DEFAULT_PLUGIN_ID);
-export const resetDefaultAgent = (): void => resetAgent(DEFAULT_PLUGIN_ID);

@@ -34,7 +34,7 @@ const STRIP =
   "bg-[var(--bg-tertiary)] px-3.5 pt-1.5 pb-5 text-[11px]";
 
 /** Checkpoints of one Session, newest first. */
-export function sessionCheckpoints(entries: TimelineEntry[]): TimelineEntry[] {
+function sessionCheckpoints(entries: TimelineEntry[]): TimelineEntry[] {
   return entries
     .filter((e) => e.kind === "checkpoint" && !!e.commitSha)
     .slice()

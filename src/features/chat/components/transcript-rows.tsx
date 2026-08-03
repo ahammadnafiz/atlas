@@ -32,7 +32,6 @@ import { StreamingMarkdown } from "./streaming-markdown";
 import { openDetail } from "../stores/detail-panel-store";
 import { openTurnDiff } from "../lib/open-turn-diff";
 import { canDrawDiagram } from "../lib/turn-actions";
-import { RowKind } from "../lib/turn-rows";
 import type {
   UserRow,
   ProseRow,
@@ -543,4 +542,3 @@ function FooterPill({
   );
 }
 
-export { RowKind };

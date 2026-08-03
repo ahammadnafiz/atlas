@@ -15,7 +15,7 @@ interface CoverPickerProps {
 
 /** Synthetic prefixes the renderer detects to paint a gradient instead
  *  of loading an image off disk. */
-export const GRADIENTS: Array<{ id: string; css: string; label: string }> = [
+const GRADIENTS: Array<{ id: string; css: string; label: string }> = [
   { id: "gradient:slate-1", label: "Slate fade", css: "linear-gradient(135deg, #1f1f1f, #2a2a2a 60%, #161616)" },
   { id: "gradient:warm-1", label: "Warm ember", css: "linear-gradient(135deg, #2a1d18, #382318 60%, #1d1411)" },
   { id: "gradient:moss-1", label: "Moss",        css: "linear-gradient(135deg, #1a2422, #1f2e2a 60%, #131c1a)" },
