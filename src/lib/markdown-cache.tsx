@@ -18,10 +18,19 @@ import MarkdownWorker from "./markdown.worker?worker";
 import "highlight.js/styles/github-dark.css";
 import { cn } from "./utils";
 
-const CACHE_MAX = 250;
 // Insertion-ordered Map → simple LRU via delete+set on hit. Bounded so a
 // thread of thousands of unique strings can't grow this unbounded.
+//
+// Sized in CHARACTERS, not entries. The old 250-entry bound predates block
+// splitting: one message used to be one entry, then became N blocks, and a
+// code-heavy thread blew through 250 entries while barely using any memory —
+// evicting exactly the settled blocks the cache exists to protect, so
+// scroll-back re-parsed everything. ~4 MB of source keys is a few thousand
+// typical blocks; the HTML roughly doubles that, still trivial for a desktop
+// webview.
+const CACHE_MAX_CHARS = 4_000_000;
 const cache = new Map<string, string>();
+let cacheChars = 0;
 
 // Blocks at or below this length parse synchronously on the main thread:
 // they're sub-millisecond and going async would flash empty content. Larger
@@ -38,10 +47,15 @@ function cacheGet(src: string): string | undefined {
 }
 
 function cacheSet(src: string, html: string): void {
+  const prev = cache.get(src);
+  if (prev !== undefined) cacheChars -= src.length + prev.length;
   cache.set(src, html);
-  if (cache.size > CACHE_MAX) {
+  cacheChars += src.length + html.length;
+  while (cacheChars > CACHE_MAX_CHARS && cache.size > 1) {
     const oldest = cache.keys().next().value;
-    if (oldest !== undefined) cache.delete(oldest);
+    if (oldest === undefined) break;
+    cacheChars -= oldest.length + (cache.get(oldest)?.length ?? 0);
+    cache.delete(oldest);
   }
 }
 
@@ -60,25 +74,36 @@ function renderToHtmlSync(src: string): string {
 let worker: Worker | null = null;
 let workerBroken = false;
 let seq = 0;
-const waiters = new Map<number, (html: string) => void>();
+// Waiters keep their SOURCE so a worker failure can settle them synchronously —
+// without it each in-flight block sat blank until its own 3s watchdog fired.
+const waiters = new Map<number, { source: string; finish: (html: string) => void }>();
 // Dedupe concurrent requests for the same source so two visible copies of an
 // identical message don't parse twice.
 const pending = new Map<string, Promise<string>>();
 
 function ensureWorker(): Worker | null {
-  if (worker || workerBroken) return worker;
+  // Order matters: once the watchdog (or onerror) marks the worker broken, hand
+  // back null even though `worker` is still non-null. Returning the dead worker
+  // here kept every later large block on the worker branch, where each one
+  // waited out the full 3s watchdog before falling back to a sync parse.
+  if (workerBroken) return null;
+  if (worker) return worker;
   try {
     worker = new MarkdownWorker();
     worker.onmessage = (e: MessageEvent<{ id: number; html: string }>) => {
-      const resolve = waiters.get(e.data.id);
-      if (resolve) {
+      const waiter = waiters.get(e.data.id);
+      if (waiter) {
         waiters.delete(e.data.id);
-        resolve(e.data.html);
+        waiter.finish(e.data.html);
       }
     };
     worker.onerror = () => {
-      // Reject in-flight waiters back to the sync path and stop using the worker.
+      // Stop using the worker AND settle everything in flight via the sync
+      // path right now, instead of letting each waiter eat its own watchdog.
       workerBroken = true;
+      const stranded = Array.from(waiters.values());
+      waiters.clear();
+      for (const w of stranded) w.finish(renderToHtmlSync(w.source));
     };
   } catch {
     workerBroken = true;
@@ -182,7 +207,7 @@ function parseLarge(source: string, priority: number): Promise<string> {
         source,
         priority,
         dispatch: () => {
-          waiters.set(id, finish);
+          waiters.set(id, { source, finish });
           // Watchdog: if the worker never answers (e.g. its script failed to
           // load asynchronously), fall back to a main-thread parse so the
           // message still renders instead of hanging blank.

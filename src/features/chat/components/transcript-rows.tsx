@@ -31,6 +31,7 @@ import { CachedMarkdown } from "@/lib/markdown-cache";
 import { StreamingMarkdown } from "./streaming-markdown";
 import { openDetail } from "../stores/detail-panel-store";
 import { openTurnDiff } from "../lib/open-turn-diff";
+import { canDrawDiagram } from "../lib/turn-actions";
 import { RowKind } from "../lib/turn-rows";
 import type {
   UserRow,
@@ -396,14 +397,15 @@ export const SeparatorRowView = memo(function SeparatorRowView({
 export const TurnFooterRowView = memo(function TurnFooterRowView({
   row,
   onSaveKb,
-  onDrawDiagram,
-  canDiagram,
+  onDiagram,
 }: {
   row: TurnFooterRow;
   onSaveKb: () => void;
-  onDrawDiagram: () => void;
-  canDiagram: boolean;
+  /** Stable across renders; the messageId binding happens in here so the memo
+   *  holds (an inline `() => onDiagram(id)` prop defeated it). */
+  onDiagram: (messageId: string) => void;
 }) {
+  const canDiagram = canDrawDiagram(row.files);
   // `row.files` is the first three; `row.allFiles` is everything. The overflow
   // line is a disclosure, not a dead count.
   const [showAll, setShowAll] = useState(false);
@@ -443,7 +445,7 @@ export const TurnFooterRowView = memo(function TurnFooterRowView({
                 icon={<Workflow size={11} />}
                 label="Diagram"
                 title="Draw a diagram of these changes"
-                onClick={onDrawDiagram}
+                onClick={() => onDiagram(row.messageId)}
               />
             )}
             {edits.length > 0 && (

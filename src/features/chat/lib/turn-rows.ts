@@ -316,12 +316,20 @@ export interface ProjectOptions {
 }
 
 /**
- * Project a thread into rows. Runs when the turn/part structure changes — not
- * per streaming chunk, and never per frame.
+ * Project a thread into rows.
+ *
+ * This DOES run per applied streaming batch — immer gives `messages` a new
+ * identity on every appended chunk — which is why `prev` matters: rows and
+ * turns that are field-identical to the previous projection are returned as
+ * the PREVIOUS objects, so the memo'd row views hold for every row except the
+ * ones that actually changed (typically just the streaming tail). Without the
+ * sharing pass, every row object was freshly allocated each frame and every
+ * mounted row re-rendered per chunk.
  */
 export function projectRows(
   messages: ChatMessage[],
   opts: ProjectOptions,
+  prev?: Projection | null,
 ): Projection {
   const rows: Row[] = [];
   const turns: Turn[] = [];
@@ -531,7 +539,53 @@ export function projectRows(
     if (rows[t.rowStart]) rows[t.rowStart].firstInTurn = true;
   }
 
+  // Structural sharing — must run AFTER the firstInTurn pass above, or a reused
+  // (shared) object could be mutated in place and the change would be invisible
+  // to a memo comparing identities.
+  if (prev) {
+    const prevRows = new Map<string, Row>();
+    for (const r of prev.rows) prevRows.set(r.id, r);
+    for (let i = 0; i < rows.length; i++) {
+      const old = prevRows.get(rows[i].id);
+      if (old && sameShallow(old, rows[i])) rows[i] = old;
+    }
+    const prevTurns = new Map<string, Turn>();
+    for (const t of prev.turns) prevTurns.set(t.id, t);
+    for (let i = 0; i < turns.length; i++) {
+      const old = prevTurns.get(turns[i].id);
+      if (old && sameShallow(old, turns[i])) turns[i] = old;
+    }
+  }
+
   return { rows, turns };
+}
+
+/**
+ * One-level equality for row/turn records. Arrays compare element-by-identity —
+ * `TurnFooterRow.files` is re-`slice`d every projection, but its ELEMENTS are
+ * the stable `turnSummary.files` objects frozen at turn end, so identity per
+ * element is exactly the right test.
+ */
+function sameShallow(a: object, b: object): boolean {
+  const ka = Object.keys(a);
+  if (ka.length !== Object.keys(b).length) return false;
+  for (const k of ka) {
+    const va = (a as Record<string, unknown>)[k];
+    const vb = (b as Record<string, unknown>)[k];
+    if (va === vb) continue;
+    if (Array.isArray(va) && Array.isArray(vb) && va.length === vb.length) {
+      let eq = true;
+      for (let i = 0; i < va.length; i++) {
+        if (va[i] !== vb[i]) {
+          eq = false;
+          break;
+        }
+      }
+      if (eq) continue;
+    }
+    return false;
+  }
+  return true;
 }
 
 /** Faint "N ago" divider marking a real pause between turns. */

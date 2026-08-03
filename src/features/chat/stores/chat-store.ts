@@ -1538,6 +1538,16 @@ function applyDeltaToDraft(s: ChatDraft, env: AgentDelta): void {
     }
     case "turn_failed": {
       if (isStaleTurn(session, env.turn_seq)) return;
+      // Sweep live tool calls to failed — turn_finished and the bare terminal
+      // status both have this guard (no spinner outlives its turn), and this was
+      // the one terminal without it. Rust usually pairs TurnFailed with a
+      // Status(error) whose sweep covers it, but the view-side guard exists
+      // precisely because a paired delta can be lost or raced.
+      for (const msg of session.messages) {
+        for (const tc of msg.toolCalls) {
+          if (tc.status === "pending" || tc.status === "running") tc.status = "failed";
+        }
+      }
       // Don't hardcode "ACP error" — the native Atlas (cersei) agent is
       // in-process and shares this error delta, so its provider errors (e.g. a
       // Gemini HTTP 400) were being mislabeled as ACP failures. Use a neutral

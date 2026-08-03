@@ -38,10 +38,10 @@ import type { ChatMessage } from "@/types/agent";
 import { AGENT_LABEL, type SwitchableAgent } from "@/types/agent";
 import { AgentIcons } from "@/components/agent-icons";
 import { AtlasIcon } from "@/components/atlas-icon";
-import { projectRows, RowKind, type Row } from "../lib/turn-rows";
+import { projectRows, RowKind, type Projection, type Row } from "../lib/turn-rows";
 import { useTranscriptScroll } from "../lib/use-transcript-scroll";
 import { useChatStore } from "../stores/chat-store";
-import { saveThreadToKb, drawDiagram, canDrawDiagram } from "../lib/turn-actions";
+import { saveThreadToKb, drawDiagram } from "../lib/turn-actions";
 import { cn } from "@/lib/utils";
 import { GradualBlur } from "@/components/gradual-blur";
 import {
@@ -77,6 +77,12 @@ const IDLE_CHUNK = 120;
  *  below it, a whole thread is comparable to what the Session timeline already
  *  renders happily. */
 const MAX_IDLE_FILL = 4000;
+
+/** Writing this to `scrollTop` clamps to the real maximum without ever reading
+ *  `scrollHeight` — reading it forces a synchronous layout, and the live-edge
+ *  follow runs on every streaming frame, which made that read the one forced
+ *  reflow in an otherwise read-free scroll path. */
+const SCROLL_BOTTOM = 1 << 30;
 
 /** How far the header's blur band ramps BELOW the bar. Content must clear this
  *  too, or the first message renders permanently blurred. */
@@ -194,10 +200,19 @@ export const Transcript = forwardRef<TranscriptHandle, TranscriptProps>(
       });
     }, []);
 
-    const projection = useMemo(
-      () => projectRows(messages, { expanded, expandedTurns, streaming: isStreaming }),
-      [messages, expanded, expandedTurns, isStreaming],
-    );
+    // Previous projection, threaded back in for structural sharing: rows that
+    // didn't change come back as the SAME objects, so the memo'd row views hold
+    // per streaming frame instead of re-rendering the whole mounted window.
+    const prevProjectionRef = useRef<Projection | null>(null);
+    const projection = useMemo(() => {
+      const next = projectRows(
+        messages,
+        { expanded, expandedTurns, streaming: isStreaming },
+        prevProjectionRef.current,
+      );
+      prevProjectionRef.current = next;
+      return next;
+    }, [messages, expanded, expandedTurns, isStreaming]);
     const rows: Row[] = projection.rows;
 
     // ── Is the live turn still silent? ───────────────────────────────────
@@ -296,21 +311,36 @@ export const Transcript = forwardRef<TranscriptHandle, TranscriptProps>(
 
     const captureGrowAnchor = useCallback(() => {
       const el = scrollRef.current;
-      if (!el) return;
+      const content = contentRef.current;
+      if (!el || !content) return;
       const top = el.scrollTop;
-      let best: { rowId: string; offset: number } | null = null;
-      for (const node of el.querySelectorAll<HTMLElement>("[data-row-id]")) {
-        const delta = node.offsetTop - top;
-        // First row whose top is at or below the viewport top — the one the
-        // reader's eye is actually anchored on.
-        if (delta >= 0) {
-          best = { rowId: node.dataset.rowId ?? "", offset: delta };
-          break;
+      // Binary search the content's direct children for the first row whose top
+      // is at or below the viewport top — the row the reader's eye is anchored
+      // on. Children are in document order so `offsetTop` is monotonic. This
+      // runs on every idle-fill step; the old querySelectorAll walk visited
+      // every row above the viewport per step, which compounds to O(rows²/chunk)
+      // while filling a long thread.
+      const kids = content.children;
+      let lo = 0;
+      let hi = kids.length - 1;
+      let found: HTMLElement | null = null;
+      while (lo <= hi) {
+        const mid = (lo + hi) >> 1;
+        const node = kids[mid];
+        if (!(node instanceof HTMLElement)) break;
+        if (node.offsetTop - top >= 0) {
+          found = node;
+          hi = mid - 1;
+        } else {
+          // Row straddling the top edge — the fallback if nothing sits below.
+          if (!found) found = node;
+          lo = mid + 1;
         }
-        // Fall back to the row straddling the top edge.
-        best = { rowId: node.dataset.rowId ?? "", offset: delta };
       }
-      growAnchorRow.current = best;
+      growAnchorRow.current =
+        found && found.dataset.rowId !== undefined
+          ? { rowId: found.dataset.rowId, offset: found.offsetTop - top }
+          : null;
     }, []);
 
     const { more, onScroll, invalidate, atEndRef, growPending } = useTranscriptScroll({
@@ -479,11 +509,15 @@ export const Transcript = forwardRef<TranscriptHandle, TranscriptProps>(
         ? tail.text.length
         : 0;
 
-    useEffect(() => {
+    // Layout effect, not effect: running after paint let each append paint one
+    // frame at the old position before the correction landed — a per-frame
+    // micro-jitter at the live edge. In the same frame, the correction is
+    // invisible.
+    useLayoutEffect(() => {
       const el = scrollRef.current;
       if (!el) return;
       if (atEndRef.current) {
-        el.scrollTop = el.scrollHeight;
+        el.scrollTop = SCROLL_BOTTOM;
         lastSeenLen.current = rows.length;
         setNewCount((c) => (c === 0 ? c : 0));
       } else {
@@ -528,7 +562,7 @@ export const Transcript = forwardRef<TranscriptHandle, TranscriptProps>(
     const scrollToBottom = useCallback(() => {
       const el = scrollRef.current;
       if (!el) return;
-      el.scrollTop = el.scrollHeight;
+      el.scrollTop = SCROLL_BOTTOM;
       lastSeenLen.current = rowsRef.current.length;
       setNewCount(0);
     }, []);
@@ -698,14 +732,9 @@ function RowView({
     case RowKind.Separator:
       return <SeparatorRowView row={row} />;
     case RowKind.TurnFooter:
-      return (
-        <TurnFooterRowView
-          row={row}
-          onSaveKb={onSaveKb}
-          onDrawDiagram={() => onDiagram(row.messageId)}
-          canDiagram={canDrawDiagram(row.files)}
-        />
-      );
+      // `onDiagram` is passed through untouched — binding `row.messageId` here
+      // made a fresh closure per render and defeated the memo on footer rows.
+      return <TurnFooterRowView row={row} onSaveKb={onSaveKb} onDiagram={onDiagram} />;
     default:
       return null;
   }
