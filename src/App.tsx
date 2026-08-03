@@ -980,7 +980,12 @@ export function App() {
       void invoke("mention_cache_clear").catch(() => {});
       return;
     }
-    markFileIndexClosed();
+    // Deliberately NOT `markFileIndexClosed()` here: switching projects keeps
+    // every hot workspace's Rust index resident (`fileindex_open_project` is
+    // idempotent for a live one), so previously-confirmed roots stay valid —
+    // clearing them made the first Cmd+P/@ after every switch pay a status
+    // round-trip. Roots are forgotten where indexes actually die: project
+    // close (above) and workspace teardown (`markFileIndexClosedFor`).
     const workspaceId = activeWorkspaceId();
     void openFileIndex(currentProject.path);
     // Git watcher: emits `atlas:git-changed` on commit / checkout /

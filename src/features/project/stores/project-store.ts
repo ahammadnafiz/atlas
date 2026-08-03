@@ -193,10 +193,21 @@ export async function flushAppStateSave(): Promise<void> {
   );
 }
 
-// The workspace list + active id must be durable before any workspace switch
-// or app quit, so register it with the flush coordinator. Always writes (the
-// active id / list changed) — it's a single cheap app-data-dir write.
-registerFlush("app-state", () => flushAppStateSave());
+// The workspace list + active id must be durable on quit/close, so register it
+// with the flush coordinator. On a SWITCH the write is fired without being
+// awaited: it held a full IPC + disk round-trip on the critical path of every
+// switch, for a payload that (a) is about to change again the moment the
+// switch commits, and (b) is re-saved by the switch's own
+// `scheduleAppStateSave()` 500ms later. Losing it in a crash costs workspace
+// -list metadata only — never user content, which is what the awaited
+// KB/editor flushes protect.
+registerFlush("app-state", (ctx) => {
+  if (ctx.reason === "switch") {
+    void flushAppStateSave();
+    return Promise.resolve();
+  }
+  return flushAppStateSave();
+});
 
 // Dedup gate: the persist hash last written to disk per workspace. If the
 // workspace's snapshot hash is unchanged since the last write, we skip the
@@ -245,12 +256,16 @@ function maybeEnsureAtlasGitignore(path: string, settings: AppSettings): void {
  * of the bunch.
  */
 export async function loadProjectStores(path: string): Promise<void> {
+  // Panel-data loaders run UNAWAITED: each renders its own loading state, and
+  // nothing after this function needs their results — awaiting them only held
+  // the cold switch's settle (and its seed snapshot) hostage to the slowest
+  // IPC of the batch. The awaited pair below is the actual critical path:
+  // tabs/splits (first paint of the center panel) and the KB meta bind (cheap;
+  // the @-/~ mention picker shows raw note-ids without it).
+  void useExplorerStore.getState().actions.openFolder(path).catch((e) => console.error("Explorer failed:", e));
+  void useGitStore.getState().actions.loadStatus(path).catch((e) => console.error("Git failed:", e));
+  void useSessionStore.getState().actions.loadSession(path).catch((e) => console.error("Session load failed:", e));
   await Promise.all([
-    useExplorerStore.getState().actions.openFolder(path).catch((e) => console.error("Explorer failed:", e)),
-    useGitStore.getState().actions.loadStatus(path).catch((e) => console.error("Git failed:", e)),
-    useSessionStore.getState().actions.loadSession(path).catch((e) => console.error("Session load failed:", e)),
-    // Only the KB META bind is on the critical path — it's cheap and the @-/~
-    // mention picker needs it for page-header titles + emoji from `_meta.json`.
     useKnowledgeMetaStore.getState().actions.bind(path).catch((e) => console.error("Knowledge bind failed:", e)),
     useLayoutStore.getState().actions.loadEditorState(path).catch((e) => console.error("Editor state load failed:", e)),
   ]);
