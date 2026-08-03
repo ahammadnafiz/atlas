@@ -13,7 +13,7 @@
 //  3. Rows never subscribe to the chat store or the detail-panel store. Data
 //     arrives as props; actions are fired imperatively via `getState()`.
 
-import { memo, useCallback } from "react";
+import { memo, useCallback, useState } from "react";
 import {
   Check,
   X,
@@ -24,8 +24,10 @@ import {
   FileText,
   Bookmark,
   Workflow,
+  Code2,
   Copy,
   CornerUpLeft,
+  ChevronDown,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { copyText } from "@/lib/clipboard";
@@ -69,7 +71,10 @@ export const UserRowView = memo(function UserRowView({
   onToggleExpand: (id: string) => void;
 }) {
   return (
-    <Column className="flex justify-end pt-2.5 pb-1.5">
+    // Generous space BELOW the prompt: the gap is what separates one exchange
+    // from the next, and a tight one made the agent's reply read as a
+    // continuation of the user's own message.
+    <Column className="flex justify-end pt-6 pb-5">
       <div className="flex max-w-[80%] flex-col items-end">
         <div
           className="rounded-2xl rounded-br-md bg-[var(--accent-primary-muted)] px-3.5 py-2 text-[14px] leading-[22px] text-[var(--text-primary)] select-text"
@@ -132,31 +137,41 @@ function ExpandToggle({
 export const ProseRowView = memo(function ProseRowView({
   row,
   agentLabel,
+  agentIcon,
   priority,
 }: {
   row: ProseRow;
   agentLabel: string;
+  agentIcon: React.ReactNode;
   /** Position in the thread — newest parses first. See `CachedMarkdown`. */
   priority: number;
 }) {
   return (
     <Column className="py-[3px]">
+      {/* Identity on the left (glyph + which model wrote this), timestamp
+          pushed right. The agent's NAME is dropped: the glyph already says it,
+          and it was the least useful token in a line that has to compete with
+          the prose underneath it. */}
       {row.showHeader && (
         <div className="flex h-[22px] items-center gap-2">
-          <span className="text-[11px] font-semibold uppercase tracking-wide text-[var(--text-secondary)]">
-            {agentLabel}
+          <span
+            className="grid size-4 shrink-0 place-items-center"
+            title={agentLabel}
+            aria-label={agentLabel}
+          >
+            {agentIcon}
           </span>
-          <span className="font-mono text-[10px] text-[var(--text-tertiary)]">
+          {row.model && (
+            <span className="min-w-0 truncate font-mono text-[10px] text-[var(--text-tertiary)]">
+              {row.model}
+            </span>
+          )}
+          <span className="ml-auto shrink-0 font-mono text-[10px] text-[var(--text-tertiary)]">
             {new Date(row.timestamp).toLocaleTimeString([], {
               hour: "2-digit",
               minute: "2-digit",
             })}
           </span>
-          {row.model && (
-            <span className="ml-auto shrink-0 rounded-full border border-[var(--border-default)] bg-[var(--bg-elevated)] px-1.5 py-px font-mono text-[9px] text-[var(--text-tertiary)]">
-              {row.model}
-            </span>
-          )}
         </div>
       )}
       {/* Settled prose goes through the plain cached renderer: its root IS
@@ -234,6 +249,15 @@ function StateGlyph({ state }: { state: MarkerState }) {
   return <Circle size={9} className="text-[var(--text-tertiary)]" />;
 }
 
+/**
+ * One tool call: a single muted line, and nothing else.
+ *
+ * Deliberately NOT expandable. An inline disclosure per marker meant a
+ * tool-heavy turn carried dozens of collapsed panels, each one more layout the
+ * scroller had to reason about — and expanding one changed the height of the
+ * document under the reader. Detail belongs in the side panel, which is what
+ * the trailing chevron opens. One row, one height, forever.
+ */
 export const MarkerRowView = memo(function MarkerRowView({
   row,
   tabId,
@@ -259,7 +283,7 @@ export const MarkerRowView = memo(function MarkerRowView({
           clickable && "cursor-pointer hover:text-[var(--text-secondary)]",
           row.state === "running" && "atlas-marker-running",
         )}
-        title={clickable ? `${row.verb} ${row.detail}` : undefined}
+        title={clickable ? `${row.verb} ${row.detail} — open in side panel` : undefined}
       >
         <span className="flex w-3 shrink-0 justify-center">
           <StateGlyph state={row.state} />
@@ -273,43 +297,73 @@ export const MarkerRowView = memo(function MarkerRowView({
         {(row.added > 0 || row.removed > 0) && (
           <span className="ml-auto shrink-0 font-mono text-[10px] tabular-nums">
             {row.added > 0 && (
-              <span className="text-[var(--status-success)]">+{row.added}</span>
+              <span className="text-[var(--diff-added-text)]">+{row.added}</span>
             )}
             {row.removed > 0 && (
               <span className="ml-1 text-[var(--status-error)]">−{row.removed}</span>
             )}
           </span>
         )}
+        {clickable && (
+          <ChevronRight
+            size={11}
+            className={cn("shrink-0", !row.added && !row.removed && "ml-auto")}
+          />
+        )}
       </div>
     </Column>
   );
 });
 
-// ── Marker group ───────────────────────────────────────────────────────────
-
+/**
+ * The folded tool-call block — the Session timeline's "Show tool calls" applied
+ * to a turn. Two lines: a summary of what happened, and the disclosure.
+ */
 export const MarkerGroupRowView = memo(function MarkerGroupRowView({
   row,
-  onExpandGroup,
+  onExpandTurn,
 }: {
   row: MarkerGroupRow;
-  onExpandGroup: (id: string) => void;
+  onExpandTurn: (turnId: string) => void;
 }) {
   return (
-    <Column>
-      <button
-        type="button"
-        onClick={() => onExpandGroup(row.id)}
-        className="flex h-[26px] w-full items-center gap-2 text-left text-[11px] text-[var(--text-tertiary)] hover:text-[var(--text-secondary)] cursor-pointer transition-colors"
-      >
-        <ChevronRight size={11} />
-        <span>{row.label}</span>
-        {row.running && (
-          <Circle
-            size={8}
-            className="atlas-marker-running fill-[var(--accent-primary)] text-[var(--accent-primary)]"
-          />
+    <Column className="py-1.5">
+      <div className="flex items-baseline gap-2 text-[11px]">
+        <span className="font-medium text-[var(--text-secondary)]">Tool calls</span>
+        {row.duration && (
+          <span className="font-mono text-[10px] text-[var(--text-tertiary)]">
+            {row.duration}
+          </span>
         )}
-      </button>
+        <span className="font-mono text-[10px] text-[var(--text-tertiary)]">
+          {row.count} {row.count === 1 ? "call" : "calls"}
+        </span>
+        {row.modified > 0 && (
+          <span className="font-mono text-[10px] text-[var(--text-tertiary)]">
+            {row.modified} modified
+          </span>
+        )}
+        {row.added > 0 && (
+          <span className="font-mono text-[10px] text-[var(--diff-added-text)]">
+            +{row.added}
+          </span>
+        )}
+      </div>
+      {/* While the turn runs the markers below are live progress, so there is
+          nothing to disclose — the control only appears once they fold. */}
+      {!row.running && (
+        <button
+          type="button"
+          onClick={() => onExpandTurn(row.turnId)}
+          className="mt-0.5 flex cursor-pointer items-center gap-1 text-[11px] text-[var(--text-tertiary)] transition-colors hover:text-[var(--text-secondary)]"
+        >
+          {row.open ? "Hide tool calls" : "Show tool calls"}
+          <ChevronRight
+            size={11}
+            className={cn("transition-transform", row.open && "rotate-90")}
+          />
+        </button>
+      )}
     </Column>
   );
 });
@@ -347,62 +401,66 @@ export const TurnFooterRowView = memo(function TurnFooterRowView({
   onDrawDiagram: () => void;
   canDiagram: boolean;
 }) {
-  const edits = row.files.filter((f) => f.kind === "edit");
+  // `row.files` is the first three; `row.allFiles` is everything. The overflow
+  // line is a disclosure, not a dead count.
+  const [showAll, setShowAll] = useState(false);
+  const files = showAll ? row.allFiles : row.files;
+  const edits = row.allFiles.filter((f) => f.kind === "edit");
   const added = edits.reduce((s, f) => s + f.added, 0);
   const removed = edits.reduce((s, f) => s + f.removed, 0);
   const label =
     edits.length > 0
       ? `${edits.length} file${edits.length === 1 ? "" : "s"} changed`
-      : `${row.files.length} file${row.files.length === 1 ? "" : "s"} read`;
+      : `${row.allFiles.length} file${row.allFiles.length === 1 ? "" : "s"} read`;
 
   return (
-    <Column className="pb-2">
-      <div className="rounded-lg border border-[var(--border-default)] bg-[var(--bg-secondary)]">
-        <div className="flex h-[34px] items-center gap-2 px-3">
-          <span className="text-[11px] font-medium text-[var(--text-primary)]">
-            {label}
-          </span>
+    <Column className="pb-3">
+      {/* Full measure width, lifted off the background so it reads as the
+          turn's result rather than another paragraph. Paths show basename only:
+          the leading directories are identical on every row and were eating the
+          width. */}
+      <div className="overflow-hidden rounded-xl border border-white/[0.09] bg-white/[0.035]">
+        <div className="flex h-[30px] items-center gap-2 px-3">
+          <span className="text-[11px] font-medium text-[var(--text-primary)]">{label}</span>
           {(added > 0 || removed > 0) && (
             <span className="font-mono text-[10px] tabular-nums">
-              {added > 0 && <span className="text-[var(--status-success)]">+{added}</span>}
-              {removed > 0 && (
-                <span className="ml-1 text-[var(--status-error)]">−{removed}</span>
-              )}
+              {added > 0 && <span className="text-[var(--diff-added-text)]">+{added}</span>}
+              {removed > 0 && <span className="ml-1 text-[var(--status-error)]">−{removed}</span>}
             </span>
           )}
-          <div className="ml-auto flex items-center gap-0.5">
-            <FooterAction title="Save thread to knowledge base" onClick={onSaveKb}>
-              <Bookmark size={12} />
-            </FooterAction>
+          <div className="ml-auto flex items-center gap-1.5">
+            <FooterPill
+              icon={<Bookmark size={11} />}
+              label="Save"
+              title="Save this thread to the knowledge base"
+              onClick={onSaveKb}
+            />
             {canDiagram && (
-              <FooterAction title="Draw a diagram of these changes" onClick={onDrawDiagram}>
-                <Workflow size={12} />
-              </FooterAction>
+              <FooterPill
+                icon={<Workflow size={11} />}
+                label="Diagram"
+                title="Draw a diagram of these changes"
+                onClick={onDrawDiagram}
+              />
             )}
             {edits.length > 0 && (
-              <button
-                type="button"
+              <FooterPill
+                icon={<Code2 size={11} />}
+                label="Show changes"
                 onClick={() => openDetail(tabId, { kind: "diff", turnId: row.turnId })}
-                className="ml-1 flex h-[22px] items-center gap-1 rounded-md border border-[var(--accent-primary)]/40 bg-[var(--accent-primary-muted)] px-2 text-[10px] font-medium text-[var(--accent-primary)] hover:bg-[var(--accent-primary)]/20 cursor-pointer transition-colors"
-              >
-                Show changes
-              </button>
+              />
             )}
           </div>
         </div>
-        <div className="border-t border-[var(--border-subtle)] px-3 py-1">
-          {row.files.map((f) => (
-            <div
-              key={f.path}
-              className="flex h-[22px] items-center gap-2 text-[11px]"
-              title={f.path}
-            >
+        <div className="border-t border-white/[0.06] px-3 py-1">
+          {files.map((f) => (
+            <div key={f.path} className="flex h-[22px] items-center gap-2 text-[11px]" title={f.path}>
               <span
                 className={cn(
                   "w-3 shrink-0 text-center font-mono text-[10px] font-semibold",
                   f.kind === "edit"
                     ? f.created
-                      ? "text-[var(--status-success)]"
+                      ? "text-[var(--diff-added-text)]"
                       : "text-[#e0af68]"
                     : "text-[var(--text-tertiary)]",
                 )}
@@ -410,13 +468,11 @@ export const TurnFooterRowView = memo(function TurnFooterRowView({
                 {f.kind === "edit" ? (f.created ? "A" : "M") : "R"}
               </span>
               <span className="min-w-0 flex-1 truncate font-mono text-[var(--text-secondary)]">
-                {f.path}
+                {baseName(f.path)}
               </span>
               {f.kind === "edit" && (f.added > 0 || f.removed > 0) && (
                 <span className="shrink-0 font-mono text-[10px] tabular-nums">
-                  {f.added > 0 && (
-                    <span className="text-[var(--status-success)]">+{f.added}</span>
-                  )}
+                  {f.added > 0 && <span className="text-[var(--diff-added-text)]">+{f.added}</span>}
                   {f.removed > 0 && (
                     <span className="ml-1 text-[var(--status-error)]">−{f.removed}</span>
                   )}
@@ -425,15 +481,61 @@ export const TurnFooterRowView = memo(function TurnFooterRowView({
             </div>
           ))}
           {row.overflow > 0 && (
-            <div className="flex h-[18px] items-center text-[10px] text-[var(--text-tertiary)]">
-              +{row.overflow} more
-            </div>
+            <button
+              type="button"
+              onClick={() => setShowAll((v) => !v)}
+              className="flex h-[20px] cursor-pointer items-center gap-1 text-[10px] text-[var(--text-tertiary)] transition-colors hover:text-[var(--text-secondary)]"
+            >
+              <ChevronDown
+                size={10}
+                className={cn("transition-transform", showAll && "rotate-180")}
+              />
+              {showAll ? "Show fewer" : `+${row.overflow} more`}
+            </button>
           )}
         </div>
       </div>
     </Column>
   );
 });
+
+/** Last path segment — the directories repeat on every row and cost width. */
+function baseName(p: string): string {
+  const i = p.lastIndexOf("/");
+  return i >= 0 ? p.slice(i + 1) : p;
+}
+
+function FooterPill({
+  icon,
+  label,
+  onClick,
+  primary,
+  title,
+}: {
+  icon: React.ReactNode;
+  label: string;
+  onClick: () => void;
+  primary?: boolean;
+  title?: string;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      title={title ?? label}
+      className={cn(
+        "inline-flex h-[20px] cursor-pointer items-center gap-1 rounded-full border px-2",
+        "text-[10px] font-medium leading-none transition-colors",
+        primary
+          ? "border-[var(--accent-primary)]/40 bg-[var(--accent-primary-muted)] text-[var(--accent-primary)] hover:bg-[var(--accent-primary)]/20"
+          : "border-white/[0.12] bg-white/[0.04] text-[var(--text-secondary)] hover:bg-white/[0.09] hover:text-[var(--text-primary)]",
+      )}
+    >
+      {icon}
+      {label}
+    </button>
+  );
+}
 
 function FooterAction({
   children,

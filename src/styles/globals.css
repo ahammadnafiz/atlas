@@ -1216,22 +1216,31 @@
 .atlas-prose strong { font-weight: 600; }
 .atlas-prose em { font-style: italic; }
 
-/* Tables are capped and scroll internally so a wide/tall table can never blow
-   a row's predicted height (M.tableHeader / M.tableRow / M.tableMaxRows). */
+/* `display: block` was here (to make the table scroll internally, back when row
+   heights had to be predicted). It also stops the element being a TABLE: block
+   boxes don't do table layout, so `width: 100%` no longer distributes across
+   columns, cells collapse to their content and the whole thing renders ragged
+   and clipped. Heights are measured now, not predicted, so the cap and the
+   scroller are both unnecessary — this is a plain table again.
+   Wide tables wrap inside cells (see `overflow-wrap` below) rather than
+   scrolling, which is the right trade in a 760px reading measure. */
 .atlas-prose table {
   width: 100%;
   border-collapse: collapse;
+  table-layout: auto;
   font-size: 12px;
   border: 1px solid var(--border-default);
   border-radius: 6px;
-  display: block;
-  max-height: 381px; /* tableHeader + tableMaxRows * tableRow */
-  overflow: auto;
+  overflow: hidden;
+}
+.atlas-prose th,
+.atlas-prose td {
+  overflow-wrap: anywhere;
+  word-break: normal;
 }
 .atlas-prose thead { background: var(--bg-elevated); }
 .atlas-prose th {
-  height: 33px;
-  padding: 0 12px;
+  padding: 8px 12px;
   text-align: left;
   font-size: 11px;
   font-weight: 600;
@@ -1239,8 +1248,8 @@
   border-bottom: 1px solid var(--border-default);
 }
 .atlas-prose td {
-  height: 29px;
-  padding: 0 12px;
+  padding: 7px 12px;
+  vertical-align: top;
   border-bottom: 1px solid var(--border-subtle);
 }
 

@@ -37,6 +37,8 @@ import {
 import { Sparkles } from "lucide-react";
 import type { ChatMessage } from "@/types/agent";
 import { AGENT_LABEL, type SwitchableAgent } from "@/types/agent";
+import { AgentIcons } from "@/components/agent-icons";
+import { AtlasIcon } from "@/components/atlas-icon";
 import { projectRows, RowKind, type Row } from "../lib/turn-rows";
 import { useTranscriptScroll } from "../lib/use-transcript-scroll";
 import { useChatStore } from "../stores/chat-store";
@@ -78,6 +80,10 @@ const IDLE_CHUNK = 120;
  *  renders happily. */
 const MAX_IDLE_FILL = 4000;
 
+/** How far the header's blur band ramps BELOW the bar. Content must clear this
+ *  too, or the first message renders permanently blurred. */
+const TOP_BLUR_RAMP = 34;
+
 /** Gap left above an anchored row, so it doesn't sit flush against the top. */
 const ANCHOR_GAP = 24;
 
@@ -90,6 +96,15 @@ const STICKY_SETTLE_MS = 4000;
 function switchable(agentType: string | undefined): SwitchableAgent {
   return agentType === "codex" || agentType === "cersei" ? agentType : "claude-code";
 }
+
+/** Resolved ONCE per thread and handed to every row as a stable element — a
+ *  session's agent never changes mid-thread, so deriving this per row would be
+ *  pure per-row cost in the scroll path. */
+const AGENT_ICON: Record<SwitchableAgent, React.ReactNode> = {
+  codex: <AgentIcons.Codex className="size-3.5 text-[var(--text-secondary)]" />,
+  cersei: <AtlasIcon size={14} />,
+  "claude-code": <AgentIcons.Claude className="size-3.5 text-[var(--text-secondary)]" />,
+};
 
 export interface TranscriptHandle {
   scrollToBottom: () => void;
@@ -145,9 +160,23 @@ export const Transcript = forwardRef<TranscriptHandle, TranscriptProps>(
     const scrollRef = useRef<HTMLDivElement>(null);
     const contentRef = useRef<HTMLDivElement>(null);
     const cacheKey = `${tabId}:${acpSessionId}`;
-    const agentLabel = AGENT_LABEL[switchable(agentType)];
+    const agent = switchable(agentType);
+    const agentLabel = AGENT_LABEL[agent];
+    const agentIcon = AGENT_ICON[agent];
 
     const [expanded, setExpanded] = useState<ReadonlySet<string>>(() => new Set());
+    /** Turns whose tool-call block the reader has opened. */
+    const [expandedTurns, setExpandedTurns] = useState<ReadonlySet<string>>(
+      () => new Set(),
+    );
+    const toggleTurn = useCallback((turnId: string) => {
+      setExpandedTurns((prev) => {
+        const next = new Set(prev);
+        if (next.has(turnId)) next.delete(turnId);
+        else next.add(turnId);
+        return next;
+      });
+    }, []);
     const toggleExpand = useCallback((id: string) => {
       setExpanded((prev) => {
         const next = new Set(prev);
@@ -158,8 +187,8 @@ export const Transcript = forwardRef<TranscriptHandle, TranscriptProps>(
     }, []);
 
     const projection = useMemo(
-      () => projectRows(messages, { expanded, streaming: isStreaming }),
-      [messages, expanded, isStreaming],
+      () => projectRows(messages, { expanded, expandedTurns, streaming: isStreaming }),
+      [messages, expanded, expandedTurns, isStreaming],
     );
     const rows: Row[] = projection.rows;
 
@@ -481,7 +510,13 @@ export const Transcript = forwardRef<TranscriptHandle, TranscriptProps>(
           onScroll={onScroll}
           className="atlas-transcript h-full overflow-y-auto hide-scrollbar [overflow-anchor:none]"
         >
-          <div ref={contentRef} style={topInset ? { paddingTop: topInset } : undefined}>
+          {/* Pad past the ENTIRE blur band, not just the bar. Padding by the
+              header height alone left the first message sitting inside the
+              band's ramp, permanently half-blurred. */}
+          <div
+            ref={contentRef}
+            style={topInset ? { paddingTop: topInset + TOP_BLUR_RAMP + 12 } : undefined}
+          >
             {rows.length === 0 && !isStreaming && (
               <div className="flex h-full items-center justify-center text-[11px] text-[var(--text-tertiary)]">
                 No messages yet.
@@ -493,6 +528,8 @@ export const Transcript = forwardRef<TranscriptHandle, TranscriptProps>(
                   row={row}
                   tabId={tabId}
                   agentLabel={agentLabel}
+                  agentIcon={agentIcon}
+                  onExpandTurn={toggleTurn}
                   // Absolute position in the thread, so the newest messages —
                   // the ones on screen after a history load — are parsed first.
                   // Index within `visible` would shift as the window grows.
@@ -514,7 +551,7 @@ export const Transcript = forwardRef<TranscriptHandle, TranscriptProps>(
             plus a short ramp below it. */}
         <GradualBlur
           position="top"
-          height={`${topInset + 34}px`}
+          height={`${topInset + TOP_BLUR_RAMP}px`}
           strength={2.1}
           layers={5}
           // Mostly-opaque behind the bar itself, ramping to clear below it.
@@ -547,16 +584,20 @@ function RowView({
   row,
   tabId,
   agentLabel,
+  agentIcon,
   priority,
   onToggleExpand,
+  onExpandTurn,
   onSaveKb,
   onDiagram,
 }: {
   row: Row;
   tabId: string;
   agentLabel: string;
+  agentIcon: React.ReactNode;
   priority: number;
   onToggleExpand: (id: string) => void;
+  onExpandTurn: (turnId: string) => void;
   onSaveKb: () => void;
   onDiagram: (messageId: string) => void;
 }) {
@@ -564,13 +605,20 @@ function RowView({
     case RowKind.User:
       return <UserRowView row={row} onToggleExpand={onToggleExpand} />;
     case RowKind.Prose:
-      return <ProseRowView row={row} agentLabel={agentLabel} priority={priority} />;
+      return (
+        <ProseRowView
+          row={row}
+          agentLabel={agentLabel}
+          agentIcon={agentIcon}
+          priority={priority}
+        />
+      );
     case RowKind.Thinking:
       return <ThinkingRowView row={row} onToggleExpand={onToggleExpand} />;
     case RowKind.Marker:
       return <MarkerRowView row={row} tabId={tabId} />;
     case RowKind.MarkerGroup:
-      return <MarkerGroupRowView row={row} onExpandGroup={onToggleExpand} />;
+      return <MarkerGroupRowView row={row} onExpandTurn={onExpandTurn} />;
     case RowKind.Separator:
       return <SeparatorRowView row={row} />;
     case RowKind.TurnFooter:

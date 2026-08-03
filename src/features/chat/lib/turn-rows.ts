@@ -98,12 +98,16 @@ export interface MarkerRow extends RowBase {
 
 export interface MarkerGroupRow extends RowBase {
   kind: typeof RowKind.MarkerGroup;
-  label: string;
+  /** How many tool calls the block stands for. */
   count: number;
-  /** Row ids this group stands in for. Expanding removes this row and splices
-   *  those back in — a row-COUNT change, which the virtualizer handles exactly.
-   *  Row growth is what lurches; row insertion does not. */
-  memberIds: string[];
+  /** Distinct files edited by those calls. */
+  modified: number;
+  /** Lines added across them. */
+  added: number;
+  /** Wall time of the turn, pre-formatted; null when too short to be worth it. */
+  duration: string | null;
+  open: boolean;
+  /** The turn is still running, so the markers below are live progress. */
   running: boolean;
 }
 
@@ -114,8 +118,11 @@ export interface SeparatorRow extends RowBase {
 
 export interface TurnFooterRow extends RowBase {
   kind: typeof RowKind.TurnFooter;
+  /** The first few, shown collapsed. */
   files: TurnFile[];
-  /** Files beyond the three we render inline. */
+  /** Everything — the overflow disclosure renders from this. */
+  allFiles: TurnFile[];
+  /** How many `allFiles` holds beyond `files`. */
   overflow: number;
   repoAtTurn: boolean;
   /** Message id, so the footer can reach usage/suggestions/contextUsage. */
@@ -170,6 +177,31 @@ export interface Projection {
   turnIdx: Uint32Array;
   /** Filled in by the height pass, not here. */
   heights: Uint16Array;
+}
+
+/**
+ * Tool calls that are the agent talking to ITSELF — planning, task bookkeeping,
+ * scheduling. They produce no artifact the reader can inspect and no change to
+ * the project, so a run of five `TaskUpdate` lines is pure noise between two
+ * paragraphs of prose. Dropped at projection time so they never cost a row.
+ */
+const INTERNAL_TOOLS = new Set([
+  "exitplanmode",
+  "todowrite",
+  "taskcreate",
+  "taskupdate",
+  "taskget",
+  "tasklist",
+  "taskoutput",
+  "taskstop",
+  "schedulewakeup",
+  "reportfindings",
+  "updateplan",
+  "plan",
+]);
+
+function isInternalTool(tc: ToolCallDisplay): boolean {
+  return INTERNAL_TOOLS.has(tc.toolName.trim().toLowerCase());
 }
 
 // ── Marker labelling ───────────────────────────────────────────────────────
@@ -292,6 +324,8 @@ export interface ProjectOptions {
   expanded: ReadonlySet<string>;
   /** The trailing assistant message is live. */
   streaming: boolean;
+  /** Turns whose tool-call block the reader has opened. */
+  expandedTurns: ReadonlySet<string>;
 }
 
 /**
@@ -374,6 +408,8 @@ export function projectRows(
     const rowStart = rows.length;
 
     const markers: MarkerRow[] = [];
+    /** Row index the folded markers are spliced back into when expanded. */
+    let markerAnchor = rows.length;
     let toolCount = 0;
     let footerMsg: ChatMessage | null = null;
     let headerShown = false;
@@ -387,6 +423,8 @@ export function projectRows(
         continue;
       }
 
+      // First content row of the turn marks where markers belong.
+      if (markers.length === 0) markerAnchor = rows.length;
       if (msg.thinking && msg.thinking.trim()) {
         rows.push({
           kind: RowKind.Thinking,
@@ -400,11 +438,10 @@ export function projectRows(
       }
 
       for (const tc of msg.toolCalls) {
+        if (isInternalTool(tc)) continue;
         toolCount += 1;
-        const mk = markerFor(tc, turnId, false);
-        markers.push(mk);
+        markers.push(markerFor(tc, turnId, false));
         if (tc.status === "failed") sawError = true;
-        rows.push(mk);
       }
 
       const prose = stripNextSteps(msg.content ?? "").trim();
@@ -428,18 +465,44 @@ export function projectRows(
       i += 1;
     }
 
-    // Duration separator, when we can derive one from the turn's span.
+    // ── Tool calls: one folded block, not N loose rows ───────────────────
+    //
+    // A tool-heavy turn produces dozens of markers between two paragraphs of
+    // prose. Left inline they dominate the thread, and — because each was
+    // individually expandable — they made scrolling pay for content nobody had
+    // asked to see. So they collapse into a single labelled block, exactly like
+    // the Session timeline's "Show tool calls". Nothing here expands in place:
+    // detail is the side panel's job.
+    //
+    // While the turn is LIVE the markers stay visible; that is the progress
+    // report. They fold the moment it settles and becomes history.
+    const turnIsLive = opts.streaming && i > lastIdx;
+    const groupOpen = turnIsLive || opts.expandedTurns.has(turnId);
+
     const startTs = new Date(messages[turnFirstIdx].timestamp).getTime();
     const endTs = new Date(messages[Math.max(turnFirstIdx, i - 1)].timestamp).getTime();
     const span = endTs - startTs;
-    if (span > 5000 && toolCount > 0) {
-      rows.push({
-        kind: RowKind.Separator,
-        id: `ds:${turnId}`,
+
+    if (markers.length > 0) {
+      const modified = new Set(
+        markers.filter((m) => m.opens === "diff").map((m) => m.detail),
+      ).size;
+      const addedTotal = markers.reduce((n, m) => n + m.added, 0);
+      const group: MarkerGroupRow = {
+        kind: RowKind.MarkerGroup,
+        id: `mg:${turnId}`,
         turnId,
         firstInTurn: false,
-        label: `Worked for ${fmtDuration(span)}`,
-      });
+        count: markers.length,
+        modified,
+        added: addedTotal,
+        duration: span > 1000 ? fmtDuration(span) : null,
+        open: groupOpen,
+        running: turnIsLive,
+      };
+      // The block sits where the tools ran; its members follow it when open, so
+      // expanding reveals them in the order they happened.
+      rows.splice(markerAnchor, 0, group, ...(groupOpen ? markers : []));
     }
 
     if (footerMsg?.turnSummary) {
@@ -450,6 +513,7 @@ export function projectRows(
         turnId,
         firstInTurn: false,
         files: files.slice(0, 3),
+        allFiles: files,
         overflow: Math.max(0, files.length - 3),
         repoAtTurn: footerMsg.turnSummary.repoAtTurn,
         messageId: footerMsg.id,

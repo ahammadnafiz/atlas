@@ -115,7 +115,7 @@
 
   /* === Diff — monochromatic === */
   --diff-added-bg: rgba(77, 77, 77, 0.08);
-  --diff-added-text: #4d4d4d;
+  --diff-added-text: #3fb950;
   --diff-removed-bg: rgba(119, 119, 119, 0.08);
   --diff-removed-text: #777777;
   --diff-modified-bg: rgba(192, 192, 192, 0.08);
