@@ -39,6 +39,15 @@ import { cn } from "@/lib/utils";
  */
 const HIGHLIGHT_LIMIT = 2_000;
 
+/**
+ * Lines MOUNTED before the block asks. The highlight cap alone was not enough:
+ * `Show full` fetches an entire spilled blob and this component then mounted a
+ * div per line — tens of thousands of elements built in one synchronous commit
+ * inside a 420px scroller, which is a multi-second hitch on the click. The tail
+ * button keeps the whole payload one click away; Copy always carries all of it.
+ */
+const RENDER_LIMIT = 2_000;
+
 /** One rendered row: its own number, its diff sign, and its code. */
 interface Line {
   /** The number to print in the gutter, or `null` when the payload has none. */
@@ -112,11 +121,19 @@ export function CodeBlock({
 }) {
   const parsed = useMemo(() => parse(text), [text]);
   const lang = language ?? (path ? getLanguage(path) : "");
+  const [showAll, setShowAll] = useState(false);
+  // A different payload is a different block — restart capped.
+  useEffect(() => setShowAll(false), [text]);
 
   const added = parsed.lines.filter((l) => l.sign === "add").length;
   const removed = parsed.lines.filter((l) => l.sign === "del").length;
   const gutter = parsed.numbered || parsed.diff;
   const colour = parsed.lines.length <= HIGHLIGHT_LIMIT;
+  const lines =
+    showAll || parsed.lines.length <= RENDER_LIMIT
+      ? parsed.lines
+      : parsed.lines.slice(0, RENDER_LIMIT);
+  const capped = parsed.lines.length - lines.length;
 
   return (
     <div
@@ -148,7 +165,7 @@ export function CodeBlock({
       </div>
 
       <div className="hide-scrollbar max-h-[420px] overflow-auto py-1">
-        {parsed.lines.map((line, i) => (
+        {lines.map((line, i) => (
           <div
             key={i}
             className={cn(
@@ -180,6 +197,15 @@ export function CodeBlock({
             <Code content={line.code} language={lang} colour={colour} />
           </div>
         ))}
+        {capped > 0 && (
+          <button
+            type="button"
+            onClick={() => setShowAll(true)}
+            className="flex h-8 w-full cursor-pointer items-center justify-center font-mono text-[11px] text-[var(--text-tertiary)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
+          >
+            Show remaining {capped.toLocaleString()} lines
+          </button>
+        )}
       </div>
     </div>
   );
