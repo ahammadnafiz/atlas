@@ -40,7 +40,8 @@ import { cn } from "@/lib/utils";
 import { timeAgo } from "@/lib/time-ago";
 
 import { useSessionChatStore, UNTITLED } from "../stores/session-chat-store";
-import type { SessionDetail as Detail } from "../types";
+import type { SessionDetail as Detail, TimelineEntry } from "../types";
+import { CheckpointScopePicker, defaultScope } from "./checkpoint-scope-picker";
 import { SessionChatMessage } from "./session-chat-message";
 import { AgentGlyph } from "./session-list";
 
@@ -75,8 +76,23 @@ export function SessionChatPanel({
   const streaming = useSessionChatStore.use.streaming();
   const sourcesByMsg = useSessionChatStore.use.sourcesByMsg();
   const errors = useSessionChatStore.use.errors();
-  const { init, open, select, create, remove, setProvider, setModel, send, stop } =
-    useSessionChatStore.use.actions();
+  const {
+    init,
+    open,
+    select,
+    create,
+    remove,
+    setProvider,
+    setModel,
+    setCheckpointScope,
+    send,
+    stop,
+  } = useSessionChatStore.use.actions();
+
+  // A new thread starts scoped to the latest Checkpoint — the commit someone
+  // almost always means when they open a chat about a Session they just watched
+  // finish. Sessions without Checkpoints get the whole timeline.
+  const newThreadScope = () => defaultScope(detail.entries);
 
   const byokKeys = useByokStore.use.keys();
   const byokLoaded = useByokStore.use.loaded();
@@ -92,7 +108,7 @@ export function SessionChatPanel({
   }, [init, byokLoaded, loadByok]);
 
   useEffect(() => {
-    void open(sessionId, projectPath);
+    void open(sessionId, projectPath, defaultScope(detail.entries));
   }, [open, sessionId, projectPath]);
 
   /** Only used to decide whether any provider is set up at all — the picker
@@ -150,8 +166,8 @@ export function SessionChatPanel({
           metas={metas}
           activeId={activeId}
           onSelect={(id) => void select(sessionId, id)}
-          onNew={() => create(sessionId, projectPath)}
-          onDelete={(id) => void remove(sessionId, id)}
+          onNew={() => create(sessionId, projectPath, newThreadScope())}
+          onDelete={(id) => void remove(sessionId, id, newThreadScope())}
         />
         <div className="flex-1" />
         {/* Which agent recorded the Session being discussed — the chat is about
@@ -211,11 +227,13 @@ export function SessionChatPanel({
       {configured.length > 0 && thread && (
         <Composer
           thread={thread}
+          entries={detail.entries}
           running={running}
           onSend={(text) => void send(thread.id, text)}
           onStop={() => stop(thread.id)}
           onProvider={(p) => setProvider(thread.id, p)}
           onModel={(m) => setModel(thread.id, m)}
+          onScope={(scope) => setCheckpointScope(thread.id, scope)}
         />
       )}
     </div>
@@ -473,18 +491,22 @@ function Starters({ disabled, onPick }: { disabled: boolean; onPick: (question: 
 
 function Composer({
   thread,
+  entries,
   running,
   onSend,
   onStop,
   onProvider,
   onModel,
+  onScope,
 }: {
-  thread: { provider: string; model: string };
+  thread: { provider: string; model: string; checkpointScope: string[] | null };
+  entries: TimelineEntry[];
   running: boolean;
   onSend: (text: string) => void;
   onStop: () => void;
   onProvider: (id: string) => void;
   onModel: (id: string) => void;
+  onScope: (scope: string[] | null) => void;
 }) {
   const inputRef = useRef<ChatInputHandle>(null);
   const [hasText, setHasText] = useState(false);
@@ -504,7 +526,18 @@ function Composer({
 
   return (
     <div className="shrink-0 p-3">
-      <div className="overflow-hidden rounded-xl border border-[var(--border-default)] bg-[var(--bg-secondary)] shadow-[0_8px_24px_rgba(0,0,0,0.35)] focus-within:border-[var(--border-focus)]">
+      {/* Tucked header stating what the NEXT question will read. It sits
+          BEHIND the box below (`z-0` vs `z-10`) with only its curved top
+          showing — the same construction as Memory ▸ Chat's codebase strip. */}
+      <CheckpointScopePicker
+        entries={entries}
+        scope={thread.checkpointScope}
+        onChange={onScope}
+      />
+      {/* `relative z-10` is load-bearing: the strip above is positioned, and
+          positioned elements paint over non-positioned siblings regardless of
+          DOM order — without this the strip would cover the composer. */}
+      <div className="relative z-10 overflow-hidden rounded-xl border border-[var(--border-default)] bg-[var(--bg-secondary)] shadow-[0_8px_24px_rgba(0,0,0,0.35)] focus-within:border-[var(--border-focus)]">
         <ChatInput
           ref={inputRef}
           // Fixed, not conditional: `ChatInput` reads its placeholder when the

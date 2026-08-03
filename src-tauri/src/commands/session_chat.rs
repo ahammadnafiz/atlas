@@ -93,11 +93,15 @@ pub struct RetrieveResult {
 // ── Command ──────────────────────────────────────────────────────────────────
 
 /// Assemble the grounded prompt for one question about one Session.
+///
+/// `checkpoints` holds commit SHAs to scope the answer to; `None` or empty
+/// grounds on the whole Session.
 #[tauri::command]
 pub async fn session_chat_retrieve(
     project_path: String,
     session_id: String,
     query: String,
+    checkpoints: Option<Vec<String>>,
 ) -> Result<RetrieveResult, String> {
     if query.trim().is_empty() {
         return Err("empty query".into());
@@ -106,23 +110,104 @@ pub async fn session_chat_retrieve(
     // Reuse the viewer's own read model rather than querying the store here.
     // The detail is what the user is looking at, so grounding on anything else
     // would let the answer and the screen disagree.
-    let detail = super::capture::artifacts_session(project_path.clone(), session_id)
+    let mut detail = super::capture::artifacts_session(project_path.clone(), session_id)
         .await?
         .ok_or("session not found")?;
 
+    // Scope BEFORE building. Every layer below (the brief, exact hits, ranked
+    // entries, the character budget) reads `detail.entries`, so filtering here
+    // scopes all of them at once — and none of them need to know that scoping
+    // exists.
+    let scope = checkpoints.unwrap_or_default();
+    let scoped = if scope.is_empty() {
+        None
+    } else {
+        let total = count_checkpoints(&detail);
+        detail.entries = scope_to_checkpoints(&detail.entries, &scope);
+        Some((scope, total))
+    };
+
     let root = std::path::PathBuf::from(&project_path);
-    tauri::async_runtime::spawn_blocking(move || build(&detail, &root, &query))
+    tauri::async_runtime::spawn_blocking(move || build(&detail, &root, &query, scoped.as_ref()))
         .await
         .map_err(|e| e.to_string())
 }
 
-fn build(detail: &SessionDetail, root: &Path, query: &str) -> RetrieveResult {
+fn count_checkpoints(detail: &SessionDetail) -> usize {
+    detail
+        .entries
+        .iter()
+        .filter(|e| matches!(e.kind, EntryKind::Checkpoint))
+        .count()
+}
+
+/// Keep only the entries belonging to the selected Checkpoints.
+///
+/// A Checkpoint's SPAN is the run of entries after the previous Checkpoint up to
+/// and including it — the prompts, tool calls and responses that produced the
+/// commit. Taking the Checkpoint entry alone would give the model a diffstat and
+/// nothing else, which answers "what files changed" but never "why", and the
+/// second question is the one people scope a chat to ask.
+///
+/// Entries arrive ordered, so this is one pass: accumulate a run, and when a
+/// Checkpoint closes it, keep the run if that Checkpoint was selected.
+fn scope_to_checkpoints(entries: &[TimelineEntry], shas: &[String]) -> Vec<TimelineEntry> {
+    let selected: HashSet<&str> = shas.iter().map(|s| s.as_str()).collect();
+    let mut out: Vec<TimelineEntry> = Vec::new();
+    let mut run: Vec<TimelineEntry> = Vec::new();
+
+    for entry in entries {
+        let is_checkpoint = matches!(entry.kind, EntryKind::Checkpoint);
+        run.push(entry.clone());
+        if !is_checkpoint {
+            continue;
+        }
+        let keep = entry
+            .commit_sha
+            .as_deref()
+            .is_some_and(|sha| selected.contains(sha));
+        if keep {
+            out.append(&mut run);
+        } else {
+            run.clear();
+        }
+    }
+    // Trailing entries after the last Checkpoint belong to no span and are
+    // dropped: they are work that has not been committed yet, and the reader
+    // asked about specific commits.
+    out
+}
+
+/// `scope` is `(selected shas, total Checkpoints in the Session)` when the
+/// caller narrowed the record, and `None` when it did not.
+fn build(
+    detail: &SessionDetail,
+    root: &Path,
+    query: &str,
+    scope: Option<&(Vec<String>, usize)>,
+) -> RetrieveResult {
     let mut sources: Vec<SourceRef> = Vec::new();
     let mut out = String::with_capacity(MAX_PROMPT_CHARS / 2);
 
     out.push_str(PREAMBLE);
     out.push_str("\n\n");
     out.push_str(&brief(detail, &mut sources));
+
+    // Say so explicitly. The preamble promises the answer is grounded in "the
+    // record below"; if that record is a slice of the Session, a model that
+    // does not know it will read absence as "it never happened" and state that
+    // as fact.
+    if let Some((shas, total)) = scope {
+        let short: Vec<String> = shas.iter().map(|s| s.chars().take(7).collect()).collect();
+        out.push_str(&format!(
+            "\n> Scope: this record covers {} of {} Checkpoint(s) in the Session — {}. \
+             Work outside those commits is NOT included; if the question is about it, say the \
+             selected Checkpoints do not cover it rather than answering from silence.\n\n",
+            shas.len(),
+            total,
+            short.join(", "),
+        ));
+    }
 
     // Layer 2 before layer 3, and measured against the budget, so an exact hit
     // is never crowded out by a merely-plausible one.

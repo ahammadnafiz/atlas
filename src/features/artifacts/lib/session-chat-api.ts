@@ -44,6 +44,12 @@ export interface SessionChatThreadWire {
   provider: string;
   model: string;
   messages: StoredMessage[];
+  /**
+   * Commit SHAs this thread is scoped to. `null`/absent = the whole Session.
+   * Persisted so reopening a thread about one Checkpoint stays about it;
+   * threads written before scoping shipped have no field and read as full.
+   */
+  checkpointScope?: string[] | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -55,8 +61,23 @@ export interface ThreadMeta {
 }
 
 export const sessionChat = {
-  retrieve: (projectPath: string, sessionId: string, query: string) =>
-    invoke<RetrieveResult>("session_chat_retrieve", { projectPath, sessionId, query }),
+  /**
+   * `checkpoints` scopes the grounding to those commits' spans — the work that
+   * produced them, not just their diffstats. Empty/undefined grounds on the
+   * whole Session, which is what every thread did before scoping existed.
+   */
+  retrieve: (
+    projectPath: string,
+    sessionId: string,
+    query: string,
+    checkpoints?: string[] | null,
+  ) =>
+    invoke<RetrieveResult>("session_chat_retrieve", {
+      projectPath,
+      sessionId,
+      query,
+      checkpoints: checkpoints?.length ? checkpoints : null,
+    }),
 
   threadsList: (agentSessionId: string) =>
     invoke<ThreadMeta[]>("session_chat_threads_list", { agentSessionId }),
