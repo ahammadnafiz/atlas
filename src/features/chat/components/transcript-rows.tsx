@@ -61,9 +61,12 @@ function Column({
 
 export const UserRowView = memo(function UserRowView({
   row,
+  priority,
   onToggleExpand,
 }: {
   row: UserRow;
+  /** Position in the thread — newest parses first. See `CachedMarkdown`. */
+  priority: number;
   onToggleExpand: (id: string) => void;
 }) {
   return (
@@ -72,20 +75,24 @@ export const UserRowView = memo(function UserRowView({
     // continuation of the user's own message.
     <Column className="flex justify-end pt-6 pb-5">
       <div className="flex max-w-[80%] flex-col items-end">
+        {/* The prompt is markdown too. It is written in the same composer that
+            accepts fences and lists, and rendering it as flat text collapsed
+            every newline — a pasted snippet came back as one run-on paragraph.
+            Same renderer as the agent's prose so a quoted block looks identical
+            on both sides of the thread; only the type scale differs.
+
+            Clamped by HEIGHT rather than `-webkit-line-clamp`: line-clamp needs
+            inline content, and the moment the bubble holds block elements
+            (paragraphs, a list, a fence) it stops clamping at all. */}
         <div
-          className="rounded-2xl rounded-br-md bg-[var(--accent-primary-muted)] px-3.5 py-2 text-[14px] leading-[22px] text-[var(--text-primary)] select-text"
+          className="atlas-prose atlas-prose--user rounded-2xl rounded-br-md bg-[var(--accent-primary-muted)] px-3.5 py-2 select-text"
           style={
             row.expanded
               ? undefined
-              : {
-                  display: "-webkit-box",
-                  WebkitBoxOrient: "vertical",
-                  WebkitLineClamp: M.userMaxLines,
-                  overflow: "hidden",
-                }
+              : { maxHeight: M.userMaxLines * M.userLineHeight, overflow: "hidden" }
           }
         >
-          {row.text}
+          <CachedMarkdown source={row.text} unstyled priority={priority} />
         </div>
         {row.contextBlocks > 0 && (
           <button

@@ -22,6 +22,7 @@ import type {
 import { splitAtlasContext } from "../lib/atlas-context";
 import { loadCachedAcpModes, saveCachedAcpModes } from "../lib/acp-modes-cache";
 import { loadCachedAcpModels, saveCachedAcpModels } from "../lib/acp-models-cache";
+import { resolveModelLabel } from "../lib/model-label";
 import {
   loadCachedContextUsage,
   saveCachedContextUsage,
@@ -1250,13 +1251,25 @@ type ChatDraft = ChatState & ChatActions;
  *  at render time from live session state is what leaked labels across agents
  *  (a later model/agent switch relabeled the whole thread). */
 function stampProducingModel(
-  session: { acpCurrentModel?: string },
+  session: {
+    acpCurrentModel?: string;
+    acpAvailableModels?: SessionModeInfo[];
+    agentType?: string;
+  },
   msg: ChatMessage,
 ): ChatMessage {
   // `session.model` is intentionally NOT a fallback — it's set to "" at
   // creation and never written after, so `acpCurrentModel` is the only real
   // source of the producing model.
-  const m = session.acpCurrentModel;
+  //
+  // Stamped as the DISPLAY NAME, resolved here rather than in the row: rows
+  // can't read session state without relabelling history on a later switch,
+  // and the raw id is a wire token ("default") that means nothing to a reader.
+  const m = resolveModelLabel(
+    session.acpCurrentModel,
+    session.agentType,
+    session.acpAvailableModels,
+  );
   if (m) msg.model = m;
   return msg;
 }
@@ -1431,7 +1444,11 @@ function applyDeltaToDraft(s: ChatDraft, env: AgentDelta): void {
       // badge must be a historical fact per message — deriving it from live
       // session state relabels the whole thread when the session's model or
       // agent changes later (the "Claude messages labeled Gemini" leak).
-      const producingModel = session.acpCurrentModel;
+      const producingModel = resolveModelLabel(
+        session.acpCurrentModel,
+        session.agentType,
+        session.acpAvailableModels,
+      );
       if (producingModel) {
         for (let i = lastUserIdx + 1; i < session.messages.length; i++) {
           const m = session.messages[i];

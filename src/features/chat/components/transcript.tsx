@@ -34,7 +34,6 @@ import {
   useRef,
   useState,
 } from "react";
-import { Sparkles } from "lucide-react";
 import type { ChatMessage } from "@/types/agent";
 import { AGENT_LABEL, type SwitchableAgent } from "@/types/agent";
 import { AgentIcons } from "@/components/agent-icons";
@@ -86,6 +85,11 @@ const TOP_BLUR_RAMP = 34;
 /** Gap left above an anchored row, so it doesn't sit flush against the top. */
 const ANCHOR_GAP = 24;
 
+/** Breathing room between the last row and the composer. Applied as content
+ *  padding rather than a spacer element so it scrolls with the thread and the
+ *  bottom fade still has live content to dissolve into. */
+const BOTTOM_GAP = 28;
+
 /** How long the sticky anchor keeps correcting after a load. Long enough for a
  *  screenful of markdown to finish parsing, short enough that it can never be
  *  mistaken for the transcript refusing to scroll. Any input releases it
@@ -132,20 +136,25 @@ interface Saved {
 }
 const savedScroll = new Map<string, Saved>();
 
-/** Shown while the turn is running but nothing has been emitted yet. */
+/**
+ * Shown while a turn is live but has produced nothing to render yet: the ACP
+ * round-trip, the model's first tokens, the beat before the first tool call.
+ * Without it the transcript sits completely unchanged after send, which reads
+ * as the message having been dropped.
+ *
+ * A text label rather than a spinner or bouncing dots — see the shimmer's note
+ * in `globals.css`. It occupies a row of prose-height so its arrival and
+ * departure don't jolt the thread it sits under.
+ */
 function WorkingIndicator() {
   return (
-    <div className="mx-auto flex w-full max-w-[760px] items-center gap-2 px-6 py-3">
-      <Sparkles size={13} className="animate-pulse text-[var(--text-secondary)]" />
-      <span className="text-[12px] text-[var(--text-secondary)]">Thinking</span>
-      <span className="flex items-center gap-0.5">
-        {[0, 1, 2].map((i) => (
-          <span
-            key={i}
-            className="h-1 w-1 animate-bounce rounded-full bg-[var(--text-tertiary)]"
-            style={{ animationDelay: `${i * 150}ms` }}
-          />
-        ))}
+    <div className="mx-auto w-full max-w-[760px] px-6 pt-2 pb-3">
+      <span
+        role="status"
+        aria-live="polite"
+        className="atlas-thinking-shimmer text-[13px] leading-[22px] font-medium"
+      >
+        Thinking…
       </span>
     </div>
   );
@@ -191,6 +200,15 @@ export const Transcript = forwardRef<TranscriptHandle, TranscriptProps>(
     );
     const rows: Row[] = projection.rows;
 
+    // ── Is the live turn still silent? ───────────────────────────────────
+    // A streaming assistant message only becomes a turn once it emits at least
+    // one row, so "the thread does not end in an assistant turn while streaming"
+    // is exactly the window between hitting send and the first thing appearing.
+    // Derived from the projection rather than tracked separately, so it cannot
+    // drift out of step with what is actually on screen.
+    const lastTurn = projection.turns[projection.turns.length - 1];
+    const working = isStreaming && (!lastTurn || lastTurn.role !== "assistant");
+
     // ── The window ───────────────────────────────────────────────────────
     // Anchored by START INDEX, not by a count back from the end. A count would
     // slide the window forward as the agent streams, dropping rows off the top
@@ -199,12 +217,33 @@ export const Transcript = forwardRef<TranscriptHandle, TranscriptProps>(
       Math.max(0, rows.length - WINDOW_INITIAL),
     );
 
-    // Clamp: a projection that SHRINKS (role filter, session reset)
-    // can leave `startIndex` past the end, and `slice` past the end returns []
-    // — an empty transcript with no error anywhere.
-    const safeStart = Math.min(startIndex, Math.max(0, rows.length - 1));
+    // A projection that SHRINKS — "New chat" resetting the session in place, a
+    // workspace switch dropping history, a role filter — leaves `startIndex`
+    // pointing into a thread that no longer exists. Every other writer only ever
+    // moves the start DOWN (growth, jump-to-message) or sets it to this floor, so
+    // a start above the floor is unreachable except by a shrink: that is the
+    // signal, and it is exact.
+    //
+    // Snapping back to a full window is the whole fix. Clamping to `rows.length
+    // - 1` (what this did before) turned the empty slice into a transcript
+    // showing exactly ONE row — nothing above it, nothing below the fold, so the
+    // jump-to-bottom pill stayed hidden too. That reads as "the thread stopped
+    // updating mid-turn", and it clears the moment anything remounts the
+    // component (switching project and back), which is what made it look like a
+    // stuck agent rather than a windowing bug.
+    const windowFloor = Math.max(0, rows.length - WINDOW_INITIAL);
+    const stale = startIndex > windowFloor;
+    const safeStart = stale ? windowFloor : startIndex;
     const visible = useMemo(() => rows.slice(safeStart), [rows, safeStart]);
     const canGrow = safeStart > 0;
+
+    // Fold the correction back into state. Rendering from `safeStart` alone
+    // would leave `startIndex` stale, and the idle fill keys off `startIndex` —
+    // it would spend its slices walking a value that no longer refers to
+    // anything, never reaching 0, so the window would stop filling.
+    useEffect(() => {
+      if (stale) setStartIndex(safeStart);
+    }, [stale, safeStart]);
 
     const onGrow = useCallback(() => {
       growPendingRef.current = true;
@@ -450,7 +489,10 @@ export const Transcript = forwardRef<TranscriptHandle, TranscriptProps>(
       } else {
         setNewCount(Math.max(0, rows.length - lastSeenLen.current));
       }
-    }, [rows.length, tailLen, atEndRef]);
+      // `working` is in the deps because the indicator mounting and unmounting
+      // changes the document height without changing the row count — a reader
+      // sitting at the live edge would otherwise drift off it.
+    }, [rows.length, tailLen, working, atEndRef]);
 
     // Clear the unseen count once the reader catches up.
     useEffect(() => {
@@ -544,7 +586,10 @@ export const Transcript = forwardRef<TranscriptHandle, TranscriptProps>(
               band's ramp, permanently half-blurred. */}
           <div
             ref={contentRef}
-            style={topInset ? { paddingTop: topInset + TOP_BLUR_RAMP + 12 } : undefined}
+            style={{
+              paddingTop: topInset ? topInset + TOP_BLUR_RAMP + 12 : undefined,
+              paddingBottom: BOTTOM_GAP,
+            }}
           >
             {rows.length === 0 && !isStreaming && (
               <div className="flex h-full items-center justify-center text-[11px] text-[var(--text-tertiary)]">
@@ -569,7 +614,7 @@ export const Transcript = forwardRef<TranscriptHandle, TranscriptProps>(
                 />
               </div>
             ))}
-            {isStreaming && rows.length === 0 && <WorkingIndicator />}
+            {working && <WorkingIndicator />}
           </div>
         </div>
 
@@ -632,7 +677,9 @@ function RowView({
 }) {
   switch (row.kind) {
     case RowKind.User:
-      return <UserRowView row={row} onToggleExpand={onToggleExpand} />;
+      return (
+        <UserRowView row={row} priority={priority} onToggleExpand={onToggleExpand} />
+      );
     case RowKind.Prose:
       return (
         <ProseRowView
