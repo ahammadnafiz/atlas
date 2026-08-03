@@ -1144,29 +1144,34 @@
        width-dependent and unpredictable.                                     */
 
 .atlas-prose {
-  font-size: 14px;
-  line-height: 22px;
+  /* 13px/21px, down from 14px/22px: at the reading measure this is the size the
+     eye settles at, and the extra leading buys back the density the smaller
+     glyphs would otherwise cost. */
+  font-size: 13px;
+  line-height: 21px;
   color: var(--text-primary);
   word-break: break-word;
   overflow-wrap: anywhere;
 }
-/* Uniform 8px inter-block gap via margin-top only — no bottom margins, so
-   there is no margin collapsing to reason about (M.blockGap). */
-.atlas-prose > * { margin: 8px 0 0; }
+/* Uniform inter-block gap via margin-top only — no bottom margins, so there is
+   no margin collapsing to reason about. 12px rather than 8px: paragraphs that
+   nearly touch read as one wall of text, and the whole point of the measure is
+   that it can be skimmed. */
+.atlas-prose > * { margin: 12px 0 0; }
 .atlas-prose > :first-child { margin-top: 0; }
 
-.atlas-prose p { line-height: 22px; }
-.atlas-prose h1 { font-size: 16px; line-height: 24px; font-weight: 600; margin-top: 12px; }
+.atlas-prose p { line-height: 21px; }
+.atlas-prose h1 { font-size: 15px; line-height: 23px; font-weight: 600; margin-top: 18px; }
 .atlas-prose h2,
 .atlas-prose h3,
 .atlas-prose h4,
 .atlas-prose h5,
-.atlas-prose h6 { font-size: 14px; line-height: 20px; font-weight: 600; margin-top: 12px; }
+.atlas-prose h6 { font-size: 13px; line-height: 20px; font-weight: 600; margin-top: 18px; }
 
 .atlas-prose ul { list-style-type: disc; padding-left: 20px; }
 .atlas-prose ol { list-style-type: decimal; padding-left: 20px; }
-.atlas-prose li { line-height: 22px; }
-.atlas-prose li + li { margin-top: 2px; }
+.atlas-prose li { line-height: 21px; }
+.atlas-prose li + li { margin-top: 4px; }
 
 .atlas-prose blockquote {
   border-left: 2px solid var(--border-default);
@@ -1264,7 +1269,7 @@
 
 /* Marker rows: one line, muted, never wraps. */
 .atlas-marker {
-  height: 24px;
+  height: 26px;
   display: flex;
   align-items: center;
   gap: 8px;

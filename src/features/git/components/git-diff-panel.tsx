@@ -77,6 +77,11 @@ interface GitDiffPanelProps {
   staged?: boolean;
   /** When set, the diff for this file at a specific commit (via `git show`). */
   commit?: string | null;
+  /** Hide the tree's commit/branch picker — see `ChangedFilesTree.hidePicker`. */
+  hidePicker?: boolean;
+  /** Restrict the tree to these repo-relative paths — see
+   *  `ChangedFilesTree.only`. */
+  only?: string[];
 }
 
 function sideBg(side: DiffSide | null, isLeft: boolean): string | undefined {
@@ -283,6 +288,8 @@ export function GitDiffPanel({
   file = "",
   staged = false,
   commit = null,
+  hidePicker = false,
+  only,
 }: GitDiffPanelProps) {
   const storeRepo = useGitStore.use.repoPath();
   const repoPath = repoPathProp || storeRepo || "";
@@ -434,7 +441,14 @@ export function GitDiffPanel({
         onCollapse={() => setTreeCollapsed(true)}
         onExpand={() => setTreeCollapsed(false)}
       >
-        <ChangedFilesTree repoPath={repoPath} staged={staged} currentFile={file} commit={commit} />
+        <ChangedFilesTree
+          repoPath={repoPath}
+          staged={staged}
+          currentFile={file}
+          commit={commit}
+          hidePicker={hidePicker}
+          only={only}
+        />
       </Panel>
       <PanelResizeHandle className="w-px bg-border-default hover:bg-accent data-[resize-handle-active]:bg-accent transition-colors cursor-col-resize" />
 

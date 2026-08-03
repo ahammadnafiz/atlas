@@ -1,5 +1,4 @@
-// Right-hand detail panel: the one place diffs, tool arguments and tool output
-// are rendered.
+// Right-hand detail panel: tool arguments and tool output.
 //
 // This is the other half of the perf story. Inline expanding diff blocks were
 // the single largest source of unpredictable row height in the old transcript —
@@ -11,15 +10,14 @@
 // not re-render a single transcript row. Panel state lives in its own store and
 // rows only ever write to it imperatively.
 //
-// Diffs are still computed straight from the tool call's ARGUMENTS (Claude Code
-// `Edit` → old_string/new_string, `Write` → content, `MultiEdit` → edits[]) —
-// no file read, no backend round-trip. Only the render location changed.
+// Diffs are NOT here. A turn's changes open `GitDiffModal` — the real
+// side-by-side viewer at full-window size. Two code panes plus a gutter do not
+// fit in a 460px column, so every attempt to host a diff here ended either with
+// clipped lines or with the whole box scrolling sideways.
 
 import { useCallback, useMemo, useRef, useEffect } from "react";
-import { ChevronRight, FileDiff, TerminalSquare, Copy } from "lucide-react";
-import { cn } from "@/lib/utils";
+import { ChevronRight, TerminalSquare, Copy } from "lucide-react";
 import { copyText } from "@/lib/clipboard";
-import { openFile } from "@/lib/open-file";
 import type { ChatMessage, ToolCallDisplay } from "@/types/agent";
 import {
   useDetailPanelStore,
@@ -27,122 +25,17 @@ import {
   DETAIL_MAX_WIDTH,
   type PanelTarget,
 } from "../stores/detail-panel-store";
-import { getEditParts, getFilePathFromInput, type EditPart } from "../lib/tool-files";
-
-// ── Diff rendering (moved verbatim from message-item, minus the inline shell) ─
-
-interface DiffRow {
-  type: "context" | "add" | "remove";
-  text: string;
-}
-
-const DIFF_CONTEXT = 3;
-
-function diffRows(oldStr: string, neu: string): DiffRow[] {
-  const o = oldStr.split("\n");
-  const n = neu.split("\n");
-  let start = 0;
-  while (start < o.length && start < n.length && o[start] === n[start]) start++;
-  let eo = o.length;
-  let en = n.length;
-  while (eo > start && en > start && o[eo - 1] === n[en - 1]) {
-    eo--;
-    en--;
-  }
-  const rows: DiffRow[] = [];
-  for (const t of o.slice(Math.max(start - DIFF_CONTEXT, 0), start))
-    rows.push({ type: "context", text: t });
-  for (let i = start; i < eo; i++) rows.push({ type: "remove", text: o[i] });
-  for (let i = start; i < en; i++) rows.push({ type: "add", text: n[i] });
-  for (const t of o.slice(eo, Math.min(eo + DIFF_CONTEXT, o.length)))
-    rows.push({ type: "context", text: t });
-  return rows;
-}
-
-function DiffBlock({ parts, path }: { parts: EditPart[]; path: string | null }) {
-  const rows = useMemo(() => parts.map((p) => diffRows(p.old, p.neu)), [parts]);
-  const added = rows.flat().filter((r) => r.type === "add").length;
-  const removed = rows.flat().filter((r) => r.type === "remove").length;
-
-  return (
-    <div className="border-b border-[var(--border-subtle)]">
-      <div className="sticky top-0 z-10 flex items-center gap-2 border-b border-[var(--border-default)] bg-[var(--bg-elevated)] px-3 py-1.5">
-        <FileDiff size={11} className="shrink-0 text-[var(--text-tertiary)]" />
-        <button
-          type="button"
-          onClick={() => path && void openFile(path)}
-          disabled={!path}
-          className={cn(
-            "min-w-0 flex-1 truncate text-left font-mono text-[11px] text-[var(--text-secondary)]",
-            path && "cursor-pointer hover:text-[var(--text-primary)]",
-          )}
-          title={path ?? undefined}
-        >
-          {path ?? "(inline edit)"}
-        </button>
-        <span className="shrink-0 font-mono text-[10px] tabular-nums">
-          {added > 0 && <span className="text-[var(--status-success)]">+{added}</span>}
-          {removed > 0 && (
-            <span className="ml-1 text-[var(--status-error)]">−{removed}</span>
-          )}
-        </span>
-      </div>
-      {rows.map((part, i) => (
-        <div key={i}>
-          {rows.length > 1 && (
-            <div className="bg-[var(--bg-base)] px-3 py-1 text-[9px] uppercase tracking-wider text-[var(--text-tertiary)]">
-              Edit {i + 1}
-            </div>
-          )}
-          {part.map((r, j) => (
-            <div
-              key={j}
-              className={cn(
-                "flex font-mono text-[11px] leading-[18px]",
-                r.type === "context" && "text-[var(--text-tertiary)]",
-              )}
-              style={{
-                background:
-                  r.type === "add"
-                    ? "var(--diff-add-line-bg)"
-                    : r.type === "remove"
-                      ? "var(--diff-remove-line-bg)"
-                      : undefined,
-              }}
-            >
-              <span className="w-4 shrink-0 select-none text-center text-[var(--text-tertiary)]">
-                {r.type === "add" ? "+" : r.type === "remove" ? "−" : ""}
-              </span>
-              <span className="flex-1 whitespace-pre-wrap break-words pr-2 select-text">
-                {r.text || " "}
-              </span>
-            </div>
-          ))}
-        </div>
-      ))}
-    </div>
-  );
-}
 
 // ── Panel ──────────────────────────────────────────────────────────────────
 
 /** Every tool call in the thread, flat — the panel addresses them by id. */
 function useToolCalls(messages: ChatMessage[]) {
   return useMemo(() => {
-    const byId = new Map<string, { tc: ToolCallDisplay; turnId: string }>();
-    const byTurn = new Map<string, ToolCallDisplay[]>();
-    let currentTurn = "";
+    const byId = new Map<string, ToolCallDisplay>();
     for (const m of messages) {
-      if (m.role === "user") currentTurn = "";
-      if (m.role === "assistant" && !currentTurn) currentTurn = `t:${m.id}`;
-      for (const tc of m.toolCalls) {
-        byId.set(tc.id, { tc, turnId: currentTurn });
-        const list = byTurn.get(currentTurn) ?? [];
-        list.push(tc);
-        byTurn.set(currentTurn, list);
-      }
+      for (const tc of m.toolCalls) byId.set(tc.id, tc);
     }
-    return { byId, byTurn };
+    return byId;
   }, [messages]);
 }
 
@@ -156,7 +49,7 @@ export function DetailPanel({
   const target = useDetailPanelStore((s) => s.targets[tabId] ?? null);
   const width = useDetailPanelStore((s) => s.width);
   const { close, setWidth } = useDetailPanelStore.use.actions();
-  const { byId, byTurn } = useToolCalls(messages);
+  const byId = useToolCalls(messages);
 
   const onClose = useCallback(() => close(tabId), [close, tabId]);
 
@@ -207,7 +100,7 @@ export function DetailPanel({
         className="absolute -left-px top-0 z-10 h-full w-px cursor-col-resize bg-border-default transition-colors hover:bg-accent"
         title="Drag to resize"
       />
-      <PanelBody target={target} byId={byId} byTurn={byTurn} onClose={onClose} />
+      <PanelBody target={target} byId={byId} onClose={onClose} />
     </div>
   );
 }
@@ -215,48 +108,13 @@ export function DetailPanel({
 function PanelBody({
   target,
   byId,
-  byTurn,
   onClose,
 }: {
   target: NonNullable<PanelTarget>;
-  byId: Map<string, { tc: ToolCallDisplay; turnId: string }>;
-  byTurn: Map<string, ToolCallDisplay[]>;
+  byId: Map<string, ToolCallDisplay>;
   onClose: () => void;
 }) {
-  if (target.kind === "diff") {
-    // A single edit, or every edit in the turn when opened from the footer.
-    const calls = target.toolCallId
-      ? [byId.get(target.toolCallId)?.tc].filter((t): t is ToolCallDisplay => !!t)
-      : (byTurn.get(target.turnId) ?? []);
-    const edits = calls
-      .map((tc) => ({
-        tc,
-        parts: getEditParts(tc.toolName, tc.arguments ?? {}),
-        path: getFilePathFromInput(tc.arguments ?? {}),
-      }))
-      .filter((e) => e.parts.length > 0);
-
-    return (
-      <>
-        <Header
-          icon={<FileDiff size={11} className="text-[var(--text-tertiary)]" />}
-          title="Changes"
-          count={edits.length}
-          onClose={onClose}
-        />
-        <div className="flex-1 overflow-auto hide-scrollbar">
-          {edits.length === 0 ? (
-            <Empty>No file edits in this turn.</Empty>
-          ) : (
-            edits.map((e) => <DiffBlock key={e.tc.id} parts={e.parts} path={e.path} />)
-          )}
-        </div>
-      </>
-    );
-  }
-
-  const entry = byId.get(target.toolCallId);
-  const tc = entry?.tc;
+  const tc = byId.get(target.toolCallId);
   const output = tc?.result ?? "";
 
   return (

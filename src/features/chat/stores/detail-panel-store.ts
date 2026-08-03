@@ -11,8 +11,16 @@
 import { create } from "zustand";
 import { createSelectors } from "@/lib/create-selectors";
 
+/**
+ * The sidebar handles TOOL OUTPUT only.
+ *
+ * Diffs used to live here too, and it never worked: a 460px column cannot hold
+ * two code panes and a gutter, so the diff had to be reduced to a unified list
+ * with clipped lines — which is what three rounds of horizontal-scrolling
+ * fixes were chasing. Changes now open `GitDiffModal`, the real side-by-side
+ * viewer, at full-window size.
+ */
 export type PanelTarget =
-  | { kind: "diff"; turnId: string; toolCallId?: string; path?: string }
   | { kind: "tool"; toolCallId: string }
   | { kind: "output"; toolCallId: string }
   | null;
@@ -39,9 +47,6 @@ const DEFAULT_WIDTH = 460;
 function sameTarget(a: PanelTarget, b: PanelTarget): boolean {
   if (!a || !b) return false;
   if (a.kind !== b.kind) return false;
-  if (a.kind === "diff" && b.kind === "diff") {
-    return a.turnId === b.turnId && a.toolCallId === b.toolCallId && a.path === b.path;
-  }
   if ((a.kind === "tool" || a.kind === "output") && (b.kind === "tool" || b.kind === "output")) {
     return a.toolCallId === b.toolCallId;
   }

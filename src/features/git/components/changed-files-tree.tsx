@@ -132,6 +132,14 @@ interface ChangedFilesTreeProps {
   /** When set, the tree lists the files changed by this commit (commit-browse
    *  mode) instead of the working tree; the picker at the top switches it. */
   commit?: string | null;
+  /** Hide the commit/branch picker. The agent-chat diff modal shows the changes
+   *  a TURN made — browsing to another commit from there would be answering a
+   *  question nobody asked, and would silently retarget the diff. */
+  hidePicker?: boolean;
+  /** When set, list ONLY these (repo-relative) paths. The chat's modal scopes
+   *  the tree to what a single turn touched; without it the tree answers a
+   *  different question — everything dirty in the repo. */
+  only?: string[];
 }
 
 interface DirNode {
@@ -249,7 +257,10 @@ export const ChangedFilesTree = memo(function ChangedFilesTree({
   staged,
   currentFile,
   commit = null,
+  hidePicker = false,
+  only,
 }: ChangedFilesTreeProps) {
+  const onlySet = useMemo(() => (only ? new Set(only) : null), [only]);
   const files = useGitStore.use.files();
   const log = useGitStore.use.log();
   const branch = useGitStore.use.branch();
@@ -283,15 +294,16 @@ export const ChangedFilesTree = memo(function ChangedFilesTree({
       : files
           .filter((f) => f.staged === staged)
           .map((f) => ({ path: f.path, status: f.status }));
-    const scoped = source.filter((f) =>
-      seen.has(f.path) ? false : (seen.add(f.path), true),
-    );
+    const scoped = source
+      // Turn scope, when the caller supplied one.
+      .filter((f) => !onlySet || onlySet.has(f.path))
+      .filter((f) => (seen.has(f.path) ? false : (seen.add(f.path), true)));
     // Ensure the open file is present even if the store hasn't caught up.
     if (currentFile && !seen.has(currentFile)) {
       scoped.push({ path: currentFile, status: "M" });
     }
     return buildTree(scoped);
-  }, [files, staged, currentFile, commit, commitFilesQuery.data]);
+  }, [files, staged, currentFile, commit, commitFilesQuery.data, onlySet]);
 
   const rows = useMemo(
     () => flatten(tree, collapsed, 0),
@@ -318,7 +330,9 @@ export const ChangedFilesTree = memo(function ChangedFilesTree({
     <div className="flex h-full w-full flex-col border-r border-[var(--border-default)] bg-[var(--bg-secondary)]">
       <div className="flex h-8 shrink-0 items-center gap-1.5 border-b border-[var(--border-default)] px-2">
         <GitCommit size={12} className="shrink-0 text-[var(--text-tertiary)]" />
-        <CommitPicker commit={commit} branch={branch} log={log} onPick={onPickCommit} />
+        {!hidePicker && (
+          <CommitPicker commit={commit} branch={branch} log={log} onPick={onPickCommit} />
+        )}
         <span className="shrink-0 text-[10px] tabular-nums text-[var(--text-tertiary)]">
           {rows.filter((r) => !r.node.isDir).length}
         </span>

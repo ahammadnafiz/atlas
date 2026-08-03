@@ -46,8 +46,12 @@ export interface TranscriptScroll {
   /** Is the reader following the live edge right now? Ref, not state — the
    *  follow effect reads it without re-rendering anything. */
   atEndRef: RefObject<boolean>;
-  /** Distance-from-bottom captured just before a grow, for re-anchoring. */
-  growAnchor: RefObject<number | null>;
+  /** Set true just before a grow; the caller captures its own row anchor and
+   *  clears this once it has re-anchored. */
+  growPending: RefObject<boolean>;
+  /** Fired immediately before the row set grows, so the caller can record which
+   *  row the reader is looking at. */
+  onBeforeGrow?: () => void;
 }
 
 export function useTranscriptScroll({
@@ -55,6 +59,7 @@ export function useTranscriptScroll({
   contentRef,
   canGrow,
   onGrow,
+  onBeforeGrow,
   onContentResize,
 }: {
   scrollRef: RefObject<HTMLElement | null>;
@@ -63,6 +68,8 @@ export function useTranscriptScroll({
   /** Whether there is any history left to reveal above. */
   canGrow: boolean;
   onGrow: () => void;
+  /** Called just before `onGrow`, while the OLD row set is still on screen. */
+  onBeforeGrow?: () => void;
   /** Content changed size — the caller may want to re-hold a scroll anchor.
    *  Runs BEFORE the re-sample so the sample sees the corrected position. */
   onContentResize?: () => void;
@@ -74,7 +81,7 @@ export function useTranscriptScroll({
   /** Cached geometry. Valid until the content resizes. */
   const metrics = useRef({ scrollHeight: 0, clientHeight: 0 });
   const atEndRef = useRef(true);
-  const growAnchor = useRef<number | null>(null);
+  const growPending = useRef(false);
 
   // Held in refs so the scroll callback never has to be rebuilt — a new handler
   // identity per render means React detaching and re-attaching the listener,
@@ -83,6 +90,8 @@ export function useTranscriptScroll({
   growable.current = canGrow;
   const grow = useRef(onGrow);
   grow.current = onGrow;
+  const beforeGrow = useRef(onBeforeGrow);
+  beforeGrow.current = onBeforeGrow;
   const resized = useRef(onContentResize);
   resized.current = onContentResize;
 
@@ -108,23 +117,22 @@ export function useTranscriptScroll({
     const { scrollHeight, clientHeight } = metrics.current;
     const fromBottom = scrollHeight - top - clientHeight;
 
-    // Grow upward well before the reader reaches the top. Capture the invariant
-    // first: prepending rows changes `scrollHeight` but leaves the distance from
-    // the bottom alone, so that is what the caller restores against.
+    // Grow upward well before the reader reaches the top.
     //
-    // Read `scrollHeight` LIVE here rather than trusting the cache. Everywhere
-    // else the cached value is fine — being a frame stale only misjudges a fade
-    // — but this number is what the scroll position is rebuilt from, and a stale
-    // one lands the reader somewhere they weren't. Growing is rare, so the one
-    // forced layout costs nothing measurable.
+    // The caller records WHICH ROW the reader is looking at (`onBeforeGrow`),
+    // not a distance. Distance-from-bottom was the obvious invariant and it is
+    // wrong here: the rows being prepended are freshly mounted, so their
+    // markdown is still resolving from placeholder to formatted for several
+    // frames AFTER the re-anchor runs. Every one of those height changes moves
+    // the bottom, and the position drifts — which is the upward creep during a
+    // history load. A row's `offsetTop` is immune: whatever happens above it,
+    // putting that row back under the same pixel is exact.
     //
-    // `growAnchor === null` also acts as "no grow in flight". Without it a fast
-    // scroll fires grow again on the next frame — before React has committed the
-    // previous one — each call overwriting the anchor with a position measured
-    // against rows that are about to change, so the re-anchor restores against a
-    // number that was never true.
-    if (growable.current && top <= GROW_MARGIN && growAnchor.current === null) {
-      growAnchor.current = el.scrollHeight - top;
+    // `growPending` also means "no grow in flight": without it a fast scroll
+    // fires grow again next frame, before React has committed the previous one.
+    if (growable.current && top <= GROW_MARGIN && !growPending.current) {
+      growPending.current = true;
+      beforeGrow.current?.();
       grow.current();
     }
 
@@ -171,7 +179,7 @@ export function useTranscriptScroll({
   );
 
   return useMemo(
-    () => ({ more, onScroll, invalidate, atEndRef, growAnchor }),
+    () => ({ more, onScroll, invalidate, atEndRef, growPending }),
     [more, onScroll, invalidate],
   );
 }

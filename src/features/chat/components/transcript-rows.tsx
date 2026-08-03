@@ -34,6 +34,7 @@ import { copyText } from "@/lib/clipboard";
 import { CachedMarkdown } from "@/lib/markdown-cache";
 import { StreamingMarkdown } from "./streaming-markdown";
 import { openDetail } from "../stores/detail-panel-store";
+import { openTurnDiff } from "../lib/open-turn-diff";
 import { RowKind } from "../lib/turn-rows";
 import type {
   UserRow,
@@ -147,7 +148,7 @@ export const ProseRowView = memo(function ProseRowView({
   priority: number;
 }) {
   return (
-    <Column className="py-[3px]">
+    <Column className="py-2">
       {/* Identity on the left (glyph + which model wrote this), timestamp
           pushed right. The agent's NAME is dropped: the glyph already says it,
           and it was the least useful token in a line that has to compete with
@@ -268,11 +269,12 @@ export const MarkerRowView = memo(function MarkerRowView({
   const clickable = row.opens !== "none";
   const onClick = useCallback(() => {
     if (row.opens === "diff") {
-      openDetail(tabId, { kind: "diff", turnId: row.turnId, toolCallId: row.toolCallId });
+      // Changes get the real viewer, not the sidebar.
+      openTurnDiff(row.path ? [row.path] : []);
     } else if (row.opens === "output") {
       openDetail(tabId, { kind: "output", toolCallId: row.toolCallId });
     }
-  }, [row.opens, row.turnId, row.toolCallId, tabId]);
+  }, [row.opens, row.path, row.toolCallId, tabId]);
 
   return (
     <Column>
@@ -327,7 +329,7 @@ export const MarkerGroupRowView = memo(function MarkerGroupRowView({
   onExpandTurn: (turnId: string) => void;
 }) {
   return (
-    <Column className="py-1.5">
+    <Column className="py-3">
       <div className="flex items-baseline gap-2 text-[11px]">
         <span className="font-medium text-[var(--text-secondary)]">Tool calls</span>
         {row.duration && (
@@ -390,13 +392,11 @@ export const SeparatorRowView = memo(function SeparatorRowView({
 
 export const TurnFooterRowView = memo(function TurnFooterRowView({
   row,
-  tabId,
   onSaveKb,
   onDrawDiagram,
   canDiagram,
 }: {
   row: TurnFooterRow;
-  tabId: string;
   onSaveKb: () => void;
   onDrawDiagram: () => void;
   canDiagram: boolean;
@@ -414,13 +414,13 @@ export const TurnFooterRowView = memo(function TurnFooterRowView({
       : `${row.allFiles.length} file${row.allFiles.length === 1 ? "" : "s"} read`;
 
   return (
-    <Column className="pb-3">
+    <Column className="pb-5 pt-2">
       {/* Full measure width, lifted off the background so it reads as the
           turn's result rather than another paragraph. Paths show basename only:
           the leading directories are identical on every row and were eating the
           width. */}
       <div className="overflow-hidden rounded-xl border border-white/[0.09] bg-white/[0.035]">
-        <div className="flex h-[30px] items-center gap-2 px-3">
+        <div className="flex h-[34px] items-center gap-2 px-3.5">
           <span className="text-[11px] font-medium text-[var(--text-primary)]">{label}</span>
           {(added > 0 || removed > 0) && (
             <span className="font-mono text-[10px] tabular-nums">
@@ -447,14 +447,16 @@ export const TurnFooterRowView = memo(function TurnFooterRowView({
               <FooterPill
                 icon={<Code2 size={11} />}
                 label="Show changes"
-                onClick={() => openDetail(tabId, { kind: "diff", turnId: row.turnId })}
+                // Every file this turn edited — the tree is scoped to them and
+                // the first opens straight away.
+                onClick={() => openTurnDiff(edits.map((f) => f.path))}
               />
             )}
           </div>
         </div>
-        <div className="border-t border-white/[0.06] px-3 py-1">
+        <div className="border-t border-white/[0.06] px-3.5 py-2">
           {files.map((f) => (
-            <div key={f.path} className="flex h-[22px] items-center gap-2 text-[11px]" title={f.path}>
+            <div key={f.path} className="flex h-[24px] items-center gap-2 text-[11px]" title={f.path}>
               <span
                 className={cn(
                   "w-3 shrink-0 text-center font-mono text-[10px] font-semibold",

@@ -91,6 +91,9 @@ export interface MarkerRow extends RowBase {
   state: MarkerState;
   toolCallId: string;
   opens: MarkerDetail;
+  /** Full path for edit markers — `detail` is shortened for display, and the
+   *  diff viewer needs the real one. */
+  path?: string;
   /** Only set for edit markers, so the row can show `+n −m` inline. */
   added: number;
   removed: number;
@@ -276,6 +279,7 @@ function markerFor(tc: ToolCallDisplay, turnId: string, first: boolean): MarkerR
     state,
     toolCallId: tc.id,
     opens,
+    path: path ?? undefined,
     added,
     removed,
   };

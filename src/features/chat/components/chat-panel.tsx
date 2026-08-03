@@ -19,6 +19,11 @@ import { MessageInput } from "./message-input";
 import { SessionSidebar } from "./session-sidebar";
 import { ChatHeader } from "./chat-header";
 import { openNewAgentChat } from "../lib/open-agent-session";
+import {
+  OPEN_TURN_DIFF_EVENT,
+  toRepoRelative,
+  type TurnDiffRequest,
+} from "../lib/open-turn-diff";
 
 /** Height the floating header occupies — the transcript pads its content by
  *  this much so the first row clears the bar. Must match `ChatHeader`'s bar. */
@@ -56,6 +61,13 @@ import type { TranscriptHandle } from "./transcript";
 // module header for why that's a perf decision as much as a UX one.
 const DetailPanel = lazy(() =>
   import("./detail-panel").then((m) => ({ default: m.DetailPanel })),
+);
+// Full-screen side-by-side diff for a turn's changes. Lazy: it pulls the
+// virtualizer + the diff-highlight worker, and most sessions never open it.
+const GitDiffModal = lazy(() =>
+  import("@/features/git/components/git-diff-modal").then((m) => ({
+    default: m.GitDiffModal,
+  })),
 );
 import {
   Sparkles,
@@ -139,6 +151,44 @@ export function ChatPanel({ tabId }: ChatPanelProps) {
   const [plansPanelOpen, setPlansPanelOpen] = useState(false);
   // Narrow boolean — changes only when the detail panel opens or closes.
   const detailOpen = useDetailPanelStore((s) => !!s.targets[tabId]);
+
+  // Full-screen diff. Driven by a window event rather than a prop chain so a row
+  // opening it re-renders nothing in the transcript.
+  const [diffFiles, setDiffFiles] = useState<string[] | null>(null);
+  useEffect(() => {
+    const onOpen = (e: Event) => {
+      const detail = (e as CustomEvent<TurnDiffRequest>).detail;
+      const repo = useProjectStore.getState().currentProject?.path ?? "";
+      // Tool calls report absolute paths; git speaks repo-relative ones.
+      setDiffFiles((detail?.files ?? []).map((f) => toRepoRelative(f, repo)));
+    };
+    window.addEventListener(OPEN_TURN_DIFF_EVENT, onOpen);
+    return () => window.removeEventListener(OPEN_TURN_DIFF_EVENT, onOpen);
+  }, []);
+
+  // Warm everything the diff modal needs while the reader is idle, so opening
+  // it is a paint rather than a fetch: the chunk itself (which now pulls the
+  // panel with it), and the syntax-highlight worker — WebKit suspends idle
+  // workers, and a cold one costs a round trip on the first highlighted file.
+  useEffect(() => {
+    const w = window as Window & {
+      requestIdleCallback?: (cb: () => void, o?: { timeout?: number }) => number;
+    };
+    const load = () => {
+      void import("@/features/git/components/git-diff-modal");
+      void import("@/features/git/lib/diff-highlight-cache").then((m) =>
+        m.warmDiffHighlightWorker?.(),
+      );
+    };
+    // Short timeout: this competes with nothing the reader can see, and waiting
+    // four seconds meant an early click still paid full price.
+    if (typeof w.requestIdleCallback === "function") {
+      w.requestIdleCallback(load, { timeout: 1200 });
+    } else {
+      const t = window.setTimeout(load, 800);
+      return () => window.clearTimeout(t);
+    }
+  }, []);
   // Cmd+F find — scoped to this pane + tab (see usePaneFind).
   const [searchPaletteOpen, setSearchPaletteOpen] = usePaneFind(tabId);
   const rootRef = useRef<HTMLDivElement>(null);
@@ -809,6 +859,22 @@ export function ChatPanel({ tabId }: ChatPanelProps) {
       {detailOpen && (
         <Suspense fallback={null}>
           <DetailPanel tabId={tabId} messages={session.messages} />
+        </Suspense>
+      )}
+
+      {diffFiles !== null && diffFiles.length > 0 && (
+        <Suspense fallback={null}>
+          <GitDiffModal
+            open
+            onOpenChange={(o) => !o && setDiffFiles(null)}
+            repoPath={useProjectStore.getState().currentProject?.path ?? ""}
+            files={diffFiles}
+            title={
+              diffFiles.length === 1
+                ? (diffFiles[0].split("/").pop() ?? "Changes")
+                : `${diffFiles.length} files changed`
+            }
+          />
         </Suspense>
       )}
 

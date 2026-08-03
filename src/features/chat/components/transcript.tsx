@@ -248,11 +248,39 @@ export const Transcript = forwardRef<TranscriptHandle, TranscriptProps>(
       if (Math.abs(el.scrollTop - target) > 1) el.scrollTop = target;
     }, []);
 
-    const { more, onScroll, invalidate, atEndRef, growAnchor } = useTranscriptScroll({
+    /**
+     * Row the reader is looking at when a grow starts, plus how far below the
+     * viewport top it sat. Restoring against THIS rather than a distance from
+     * the bottom is what stops the thread creeping upward while newly-prepended
+     * markdown resolves — see the note in `use-transcript-scroll.ts`.
+     */
+    const growAnchorRow = useRef<{ rowId: string; offset: number } | null>(null);
+
+    const captureGrowAnchor = useCallback(() => {
+      const el = scrollRef.current;
+      if (!el) return;
+      const top = el.scrollTop;
+      let best: { rowId: string; offset: number } | null = null;
+      for (const node of el.querySelectorAll<HTMLElement>("[data-row-id]")) {
+        const delta = node.offsetTop - top;
+        // First row whose top is at or below the viewport top — the one the
+        // reader's eye is actually anchored on.
+        if (delta >= 0) {
+          best = { rowId: node.dataset.rowId ?? "", offset: delta };
+          break;
+        }
+        // Fall back to the row straddling the top edge.
+        best = { rowId: node.dataset.rowId ?? "", offset: delta };
+      }
+      growAnchorRow.current = best;
+    }, []);
+
+    const { more, onScroll, invalidate, atEndRef, growPending } = useTranscriptScroll({
       scrollRef,
       contentRef,
       canGrow,
       onGrow,
+      onBeforeGrow: captureGrowAnchor,
       onContentResize,
     });
 
@@ -291,9 +319,9 @@ export const Transcript = forwardRef<TranscriptHandle, TranscriptProps>(
         timer = null;
         // A scroll-triggered grow is already in flight — let it land first, or
         // the two overwrite each other's anchor.
-        if (growAnchor.current !== null) return;
-        const el = scrollRef.current;
-        if (el) growAnchor.current = el.scrollHeight - el.scrollTop;
+        if (growPending.current) return;
+        growPending.current = true;
+        captureGrowAnchor();
         growPendingRef.current = true;
         setStartIndex((i) => Math.max(0, i - IDLE_CHUNK));
       };
@@ -311,21 +339,23 @@ export const Transcript = forwardRef<TranscriptHandle, TranscriptProps>(
       };
       // Re-runs on each `startIndex` change, which is what drives the loop
       // forward one chunk per idle slice until the window covers everything.
-    }, [startIndex, rows.length, growAnchor]);
-    // Re-anchor after growing upward. Prepended rows push everything below them
-    // down by their combined height, so a reader who was mid-history would jump.
-    // Distance from the BOTTOM is the invariant a prepend leaves untouched, so
-    // restoring against it puts them back exactly. Layout effect, so the
-    // correction lands in the same frame and is never seen.
+    }, [startIndex, rows.length, growPending, captureGrowAnchor]);
+    // Re-anchor after growing upward: put the recorded row back under the same
+    // pixel. Layout effect, so the correction lands in the same frame and is
+    // never seen.
     useLayoutEffect(() => {
       const el = scrollRef.current;
-      const anchor = growAnchor.current;
-      if (!el || anchor === null) return;
-      el.scrollTop = el.scrollHeight - anchor;
-      growAnchor.current = null;
+      const anchor = growAnchorRow.current;
+      if (!el || !anchor) return;
+      const node = el.querySelector<HTMLElement>(
+        `[data-row-id="${CSS.escape(anchor.rowId)}"]`,
+      );
+      if (node) el.scrollTop = Math.max(0, node.offsetTop - anchor.offset);
+      growAnchorRow.current = null;
+      growPending.current = false;
       growPendingRef.current = false;
       invalidate();
-    }, [startIndex, growAnchor, invalidate]);
+    }, [startIndex, growPending, invalidate]);
 
     // ── Session switch: reset the window, land on the last user turn ─────
     /** A row id to bring to the top of the viewport once it has rendered. */
@@ -625,7 +655,6 @@ function RowView({
       return (
         <TurnFooterRowView
           row={row}
-          tabId={tabId}
           onSaveKb={onSaveKb}
           onDrawDiagram={() => onDiagram(row.messageId)}
           canDiagram={canDrawDiagram(row.files)}
