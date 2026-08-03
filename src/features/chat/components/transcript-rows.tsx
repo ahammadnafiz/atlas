@@ -74,7 +74,13 @@ export const UserRowView = memo(function UserRowView({
     // from the next, and a tight one made the agent's reply read as a
     // continuation of the user's own message.
     <Column className="flex justify-end pt-6 pb-5">
-      <div className="flex max-w-[80%] flex-col items-end">
+      {/* `min-w-0` on both flex levels, `max-w-full` on the bubble: a pasted
+          code block is `white-space: pre` (unwrappable), and a flex item's
+          automatic minimum size floors at that intrinsic width — the pre's own
+          `overflow-x: auto` cannot save an ancestor that refuses to shrink, so
+          a long paste dragged the whole bubble past the viewport edge. With
+          the chain capped, the fence scrolls horizontally INSIDE the bubble. */}
+      <div className="flex min-w-0 max-w-[80%] flex-col items-end">
         {/* The prompt is markdown too. It is written in the same composer that
             accepts fences and lists, and rendering it as flat text collapsed
             every newline — a pasted snippet came back as one run-on paragraph.
@@ -85,7 +91,7 @@ export const UserRowView = memo(function UserRowView({
             inline content, and the moment the bubble holds block elements
             (paragraphs, a list, a fence) it stops clamping at all. */}
         <div
-          className="atlas-prose atlas-prose--user rounded-2xl rounded-br-md bg-[var(--accent-primary-muted)] px-3.5 py-2 select-text"
+          className="atlas-prose atlas-prose--user min-w-0 max-w-full rounded-2xl rounded-br-md bg-[var(--accent-primary-muted)] px-3.5 py-2 select-text"
           style={
             row.expanded
               ? undefined
